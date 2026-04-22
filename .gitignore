@@ -1,0 +1,34 @@
+# Secrets (any subtree)
+.env
+**/.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Node
+node_modules/
+
+# IDE / local
+.idea/
+.vscode/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Mia tech workspace — volatile (seed markdown stays tracked)
+ai-tech/workspace/memory/
+ai-tech/workspace/cron/
+ai-tech/workspace/**/history.jsonl
+ai-tech/workspace/sessions/

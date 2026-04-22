@@ -1,0 +1,80 @@
+[
+  {
+    "name": "confluence_search",
+    "server": "atlassian",
+    "description": "Search Confluence pages by keyword or phrase. Returns matching page titles, spaces, excerpts and links.",
+    "tags": ["confluence", "docs", "search", "pages", "knowledge", "specs", "runbook"]
+  },
+  {
+    "name": "confluence_get_page",
+    "server": "atlassian",
+    "description": "Fetch the full text content of a Confluence page by its ID. Use after confluence_search to read a specific page.",
+    "tags": ["confluence", "docs", "read", "page", "content", "specs", "runbook"]
+  },
+  {
+    "name": "confluence_get_page_children",
+    "server": "atlassian",
+    "description": "List child pages of a Confluence page by its ID. Useful for navigating page hierarchies.",
+    "tags": ["confluence", "docs", "children", "hierarchy", "navigation"]
+  },
+  {
+    "name": "confluence_get_space_page_tree",
+    "server": "atlassian",
+    "description": "Get the full page tree for a Confluence space. Use to discover documentation structure.",
+    "tags": ["confluence", "docs", "space", "tree", "hierarchy", "navigation"]
+  },
+  {
+    "name": "jira_search",
+    "server": "atlassian",
+    "description": "Search Jira issues using JQL (Jira Query Language). Use for finding bugs, tasks, stories, epics, or sprint status.",
+    "tags": ["jira", "issues", "bugs", "tasks", "tickets", "search", "sprint", "backlog", "jql"]
+  },
+  {
+    "name": "jira_get_issue",
+    "server": "atlassian",
+    "description": "Get full details of a Jira issue by its key (e.g. PROJ-123), including description, status, assignee, comments.",
+    "tags": ["jira", "issue", "details", "bugs", "tasks", "tickets"]
+  },
+  {
+    "name": "jira_get_project_issues",
+    "server": "atlassian",
+    "description": "List all issues in a Jira project by project key. Use to see all work items in a project.",
+    "tags": ["jira", "project", "issues", "list", "backlog"]
+  },
+  {
+    "name": "jira_get_all_projects",
+    "server": "atlassian",
+    "description": "List all accessible Jira projects with their keys, names and types.",
+    "tags": ["jira", "projects", "list", "overview"]
+  },
+  {
+    "name": "jira_get_agile_boards",
+    "server": "atlassian",
+    "description": "List all Jira agile boards (Scrum or Kanban). Use to find sprint boards.",
+    "tags": ["jira", "boards", "agile", "scrum", "kanban", "sprint"]
+  },
+  {
+    "name": "jira_get_sprints_from_board",
+    "server": "atlassian",
+    "description": "List sprints for a Jira board. Use to find active or past sprint IDs.",
+    "tags": ["jira", "sprints", "board", "agile", "scrum"]
+  },
+  {
+    "name": "jira_get_sprint_issues",
+    "server": "atlassian",
+    "description": "Get all issues in a specific Jira sprint by sprint ID.",
+    "tags": ["jira", "sprint", "issues", "agile", "scrum"]
+  },
+  {
+    "name": "test_run",
+    "server": "pytest_runner",
+    "description": "Execute a pytest test suite (file or directory) and return structured results including pass/fail counts and failure details. Supports modes: once, smoke, stress, regression.",
+    "tags": ["testing", "pytest", "api", "run", "execute", "smoke", "stress", "regression", "automation"]
+  },
+  {
+    "name": "test_run_result",
+    "server": "pytest_runner",
+    "description": "Retrieve the full result of a previous test run by its run_id. Use after test_run() to fetch stored results.",
+    "tags": ["testing", "pytest", "results", "history", "run_id"]
+  }
+]
