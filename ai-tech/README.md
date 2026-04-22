@@ -36,3 +36,7 @@ Flags: `--validate-only`, `--skip-install`, `--no-workspace-init`, `--quiet-pip`
 - **`restrictToWorkspace`** — set in `config/config.json` (**true** = file tools limited to the workspace; **false** = may read monorepo siblings). Prefer writing long-lived notes under `workspace/agent/`.
 - **MCP:** `registry`, `pytest_runner`, remote **GitHub** MCP (needs `GITHUB_TOKEN` or GitHub App env vars).
 - **`exec`:** enabled (timeout 180s) for `git`, `pytest`, package managers, etc.
+
+## Related deployment (same monorepo)
+
+- **Mia BA** — [../ai-ba/README.md](../ai-ba/README.md): **business analysis** assistant; default gateway **18793** (`ai-ba/`).

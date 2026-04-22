@@ -32,3 +32,9 @@ ai-tech/workspace/memory/
 ai-tech/workspace/cron/
 ai-tech/workspace/**/history.jsonl
 ai-tech/workspace/sessions/
+
+# Mia BA workspace — volatile
+ai-ba/workspace/memory/
+ai-ba/workspace/cron/
+ai-ba/workspace/**/history.jsonl
+ai-ba/workspace/sessions/
