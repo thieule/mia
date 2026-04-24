@@ -1,0 +1,8 @@
+{
+  "mia-pm": { "workspace": "ai-pm/workspace" },
+  "mia-dev": { "workspace": "ai-dev/workspace" },
+  "mia-ba": { "workspace": "ai-ba/workspace" },
+  "mia-tech": { "workspace": "ai-tech/workspace" },
+  "mia-qc": { "workspace": "ai-qc/workspace" },
+  "mia-devops": { "workspace": "ai-devops/workspace" }
+}

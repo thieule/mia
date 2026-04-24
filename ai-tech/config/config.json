@@ -10,6 +10,9 @@
   "providers": {
     "openrouter": {
       "apiKey": "${OPENROUTER_API_KEY}"
+    },
+    "gemini": {
+      "apiKey": ""
     }
   },
   "channels": {
@@ -60,7 +63,7 @@
       "github": {
         "url": "${GITHUB_MCP_URL}",
         "headers": {
-          "Authorization": "${GITHUB_MCP_AUTH_HEADER}"
+          "Authorization": "${GITHUB_TOKEN}"
         }
       }
     }

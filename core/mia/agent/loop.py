@@ -152,6 +152,7 @@ class AgentLoop:
         session_ttl_minutes: int = 0,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        working_queue_config: Any | None = None,
     ):
         from mia.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -216,6 +217,7 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        self._working_queue_config = working_queue_config
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -278,6 +280,11 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        wq = getattr(self, "_working_queue_config", None)
+        if wq and getattr(wq, "tool_enabled", True):
+            from mia.agent.tools.working_queue import WorkingQueueSubmitTool
+
+            self.tools.register(WorkingQueueSubmitTool(self.workspace, wq))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""

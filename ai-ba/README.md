@@ -1,5 +1,7 @@
 # Mia BA
 
+**Tên gọi chính thức:** **Mia BA** (M + BA in hoa). Thư mục triển khai: `ai-ba/`.
+
 Standalone deployment for **Mia BA** — a **business analysis** assistant: requirements, user stories, acceptance criteria, process and data flows (Mermaid), stakeholder comms, gap analysis, prioritisation, and **research** via web + GitHub MCP when configured.
 
 Uses the same **mia** package as other deployments (`../core`), **separate gateway** (default port **18793**), **separate workspace** (`workspace/`), and optional **Discord** bot token `DISCORD_BOT_TOKEN_MIA_BA`.
@@ -41,3 +43,6 @@ Flags: `--validate-only`, `--skip-install`, `--no-workspace-init`, `--quiet-pip`
 ## Related deployment
 
 - **Mia tech** (`../ai-tech/`) — engineering / code-focused line; default gateway **18792**.
+- **Mia DevOps** (`../ai-devops/`) — deploy, infra, CI/CD; default gateway **18794**.
+- **Mia QC** (`../ai-qc/`) — test API, UI/E2E, QC; default gateway **18795**.
+- **Mia PM** (`../ai-pm/`) — dự án, ưu tiên, lịch, rủi ro, báo cáo; default gateway **18797**.

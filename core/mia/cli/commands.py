@@ -592,6 +592,7 @@ def serve(
         timezone=runtime_config.agents.defaults.timezone,
         unified_session=runtime_config.agents.defaults.unified_session,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
+        working_queue_config=runtime_config.working_queue,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -685,6 +686,7 @@ def gateway(
         timezone=config.agents.defaults.timezone,
         unified_session=config.agents.defaults.unified_session,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        working_queue_config=config.working_queue,
     )
 
     # Set cron callback (needs agent)
@@ -808,6 +810,36 @@ def gateway(
         timezone=config.agents.defaults.timezone,
     )
 
+    from mia.working_queue.service import WorkingQueueService
+    from mia.working_queue.store import WorkingQueueStore
+
+    wq_cfg = config.working_queue
+    wq_store = WorkingQueueStore(config.workspace_path / wq_cfg.subdir)
+
+    async def on_working_queue_notify(response: str) -> None:
+        from mia.bus.events import OutboundMessage
+
+        channel, chat_id = _pick_heartbeat_target()
+        if channel == "cli":
+            return
+        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+
+    working_queue = WorkingQueueService(
+        workspace=config.workspace_path,
+        store=wq_store,
+        agent=agent,
+        provider=provider,
+        model=agent.model,
+        interval_s=wq_cfg.interval_s,
+        enabled=wq_cfg.enabled,
+        max_tasks_per_tick=wq_cfg.max_tasks_per_tick,
+        notify_on_complete=wq_cfg.notify_on_complete,
+        keep_recent_session_messages=wq_cfg.keep_recent_session_messages,
+        on_notify=on_working_queue_notify,
+        pick_bus_target=_pick_heartbeat_target,
+        notify_on_complete_kinds=wq_cfg.notify_on_complete_kinds,
+    )
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -818,6 +850,13 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    if wq_cfg.enabled:
+        console.print(
+            f"[green]✓[/green] Working queue: {wq_store.base} (every {wq_cfg.interval_s}s, "
+            f"max {wq_cfg.max_tasks_per_tick}/tick)"
+        )
+    else:
+        console.print("[dim]— Working queue poller: off (set workingQueue.enabled: true in config to enable)[/dim]")
 
     # Register Dream system job (always-on, idempotent on restart)
     dream_cfg = config.agents.defaults.dream
@@ -838,6 +877,7 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+            await working_queue.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -851,6 +891,7 @@ def gateway(
             console.print(traceback.format_exc())
         finally:
             await agent.close_mcp()
+            working_queue.stop()
             heartbeat.stop()
             cron.stop()
             agent.stop()
@@ -918,6 +959,7 @@ def agent(
         timezone=config.agents.defaults.timezone,
         unified_session=config.agents.defaults.unified_session,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        working_queue_config=config.working_queue,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

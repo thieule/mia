@@ -1,0 +1,49 @@
+# Tu .../projects/<id>/workflows/ len a-agents: 4 cap .. (workflows->myapp->projects->workflow-runtime->a-agents)
+
+name: project-pipeline
+version: 1
+
+agent_profiles:
+  pm:
+    config: ../../../../ai-pm/config/config.json
+    env: ../../../../ai-pm/.env
+  ba:
+    config: ../../../../ai-ba/config/config.json
+    env: ../../../../ai-ba/.env
+  tech:
+    config: ../../../../ai-tech/config/config.json
+    env: ../../../../ai-tech/.env
+  dev:
+    config: ../../../../ai-dev/config/config.json
+    env: ../../../../ai-dev/.env
+  qc:
+    config: ../../../../ai-qc/config/config.json
+    env: ../../../../ai-qc/.env
+
+session:
+  mode: per_step
+
+steps:
+  - id: step-ba
+    role: ba
+    include_previous: false
+    prompt: |
+      (BA) Tu yeu cau khach: tom tat va liet ke chuc nang chinh.
+      === KHACH ===
+      {{customer_request}}
+
+  - id: step-tech
+    role: tech
+    include_previous: true
+    prompt: |
+      (Tech) Dua tren phan tich BA, ghi 3 diem thiet ke ngan.
+      === BA ===
+      {{previous_output}}
+
+  - id: step-qc
+    role: qc
+    include_previous: true
+    prompt: |
+      (QC) Ghi 3 test case chinh.
+      === TRUOC DO ===
+      {{previous_output}}

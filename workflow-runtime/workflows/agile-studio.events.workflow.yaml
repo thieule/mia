@@ -1,0 +1,84 @@
+name: agile-studio-event-lifecycle
+version: 1
+description: >
+  Event-driven lifecycle from Agile Studio. Runtime consumes story/project events,
+  routes to the right AI role, and enqueues actions into each agent working_queue.
+
+routing:
+  defaultAgentId: pm
+  # Rules are matched top-down. First match wins.
+  rules:
+    # PO creates project / idea discussion with BA
+    - id: project-created-to-ba
+      when:
+        eventType: project.created
+      dispatch:
+        agentId: ba
+        itemKind: task
+        action: "Khởi tạo tài liệu ý tưởng và làm rõ scope với PO."
+
+    - id: project-idea-chat-to-ba
+      when:
+        eventType: project.idea.updated
+      dispatch:
+        agentId: ba
+        itemKind: task
+        action: "Tổng hợp trao đổi PO-BA, cập nhật tài liệu ý tưởng và đề xuất story."
+
+    # Story created (requested behavior: push to dev AI initially)
+    - id: story-created-to-dev
+      when:
+        eventType: story.created
+      dispatch:
+        agentId: dev
+        itemKind: task
+        action: "Triage story mới, nêu ảnh hưởng triển khai và chuẩn bị bước thực thi."
+
+    # PO review in icebox: reject -> BA rework loop
+    - id: story-rejected-in-icebox-to-ba
+      when:
+        eventType: story.status_changed
+        statusIn: [icebox_rejected, rejected]
+      dispatch:
+        agentId: ba
+        itemKind: task
+        action: "PO reject: cập nhật/viết lại story theo feedback, chuẩn bị review lại."
+
+    # PO approves and moves to backlog -> trigger Tech assessment
+    - id: story-approved-to-tech
+      when:
+        eventType: story.status_changed
+        statusIn: [backlog, approved_backlog]
+      dispatch:
+        agentId: tech
+        itemKind: task
+        action: "Đọc tài liệu dự án + story, đưa nhận định kỹ thuật để PO phản hồi/chốt."
+
+    # Tech finishes design
+    - id: tech-design-done
+      when:
+        eventType: design.status_changed
+        statusIn: [done, completed]
+      dispatch:
+        agentId: tech
+        itemKind: task
+        action: "Hoàn tất tài liệu thiết kế, chuẩn bị chiến lược phân bổ story theo năng lực member."
+
+    # Story moved to current + assign member -> dev starts build
+    - id: story-moved-current-to-dev
+      when:
+        eventType: story.status_changed
+        statusIn: [current, in_progress]
+      dispatch:
+        agentId: dev
+        itemKind: task
+        action: "Story đã vào current/assigned: bắt đầu build tính năng theo design + context dự án."
+
+    # Non-blocking updates can stay as notifications for PM
+    - id: generic-story-updates-to-pm-notify
+      when:
+        eventType: story.updated
+      dispatch:
+        agentId: pm
+        itemKind: notification
+        action: "Theo dõi thay đổi story và cập nhật tiến độ/rủi ro ở góc PM."

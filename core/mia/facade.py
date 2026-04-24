@@ -83,6 +83,7 @@ class Mia:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             session_ttl_minutes=defaults.session_ttl_minutes,
+            working_queue_config=config.working_queue,
         )
         return cls(loop)
 

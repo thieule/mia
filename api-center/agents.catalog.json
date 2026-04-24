@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "agents": {
+    "pm": {
+      "alias": "mia-pm",
+      "displayName": "Mia PM",
+      "role": "Project / product management",
+      "description": "Charter, milestones, RACI, risk log, status and stakeholder communications."
+    },
+    "dev": {
+      "alias": "mia-dev",
+      "displayName": "Mia dev",
+      "role": "Software implementation",
+      "description": "Code changes, tests, refactors, and delivery."
+    },
+    "tech": {
+      "alias": "mia-tech",
+      "displayName": "Mia tech",
+      "role": "Architecture & design",
+      "description": "Technical analysis, design docs, and trade-off decisions."
+    },
+    "ba": {
+      "alias": "mia-ba",
+      "displayName": "Mia BA",
+      "role": "Business analysis",
+      "description": "Requirements, stories, acceptance criteria."
+    },
+    "qc": {
+      "alias": "mia-qc",
+      "displayName": "Mia QC",
+      "role": "Quality / testing",
+      "description": "Test plan, test cases, quality gate recommendations."
+    },
+    "devops": {
+      "alias": "mia-devops",
+      "displayName": "Mia DevOps",
+      "role": "Platform / DevOps",
+      "description": "CI/CD, infrastructure, and operations."
+    }
+  }
+}

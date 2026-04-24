@@ -1,0 +1,71 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "./workspace",
+      "model": "${OPENROUTER_MODEL}",
+      "provider": "openrouter",
+      "timezone": "UTC"
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "${OPENROUTER_API_KEY}"
+    },
+    "gemini": {
+      "apiKey": ""
+    }
+  },
+  "channels": {
+    "discord": {
+      "enabled": false,
+      "token": "${DISCORD_BOT_TOKEN_MIA_DEVOPS}",
+      "allowFrom": ["*"],
+      "adminUserIds": ["${DISCORD_ADMIN_USER_IDS}"],
+      "groupPolicy": "open",
+      "streaming": true,
+      "intents": 37377,
+      "readReceiptEmoji": "👀",
+      "workingEmoji": "🚀",
+      "workingEmojiDelay": 2.0
+    }
+  },
+  "gateway": {
+    "port": 18794
+  },
+  "tools": {
+    "restrictToWorkspace": false,
+    "exec": {
+      "enable": true,
+      "timeout": 300
+    },
+    "web": {
+      "enable": true,
+      "search": {
+        "provider": "brave"
+      }
+    },
+    "mcpServers": {
+      "registry": {
+        "command": "python",
+        "args": ["../ai-tools/registry/server.py"],
+        "env": {
+          "AI_TOOL_SECRET": "${AI_TOOL_SECRET}"
+        }
+      },
+      "pytest_runner": {
+        "command": "python",
+        "args": ["../ai-tools/servers/pytest_runner/server.py"],
+        "env": {
+          "AI_TOOL_SECRET": "${AI_TOOL_SECRET}",
+          "TEST_RUNS_PATH": "${TEST_RUNS_PATH_MIA_DEVOPS}"
+        }
+      },
+      "github": {
+        "url": "${GITHUB_MCP_URL}",
+        "headers": {
+          "Authorization": "${GITHUB_MCP_AUTH_HEADER}"
+        }
+      }
+    }
+  }
+}

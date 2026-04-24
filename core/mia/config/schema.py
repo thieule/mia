@@ -1,9 +1,10 @@
 """Configuration schema using Pydantic."""
 
+import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -140,6 +141,28 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
 
 
+class WorkingQueueConfig(Base):
+    """File-based working queue: JSON tasks under ``<workspace>/working_queue/`` per agent instance."""
+
+    enabled: bool = False
+    tool_enabled: bool = True
+    interval_s: int = 20
+    subdir: str = "working_queue"
+    max_tasks_per_tick: int = 1
+    notify_on_complete: bool = True
+    notify_on_complete_kinds: list[str] = Field(
+        default_factory=lambda: ["task"],
+        description=(
+            "item_kind values (task, notification) that may forward completion to an external channel when "
+            "notifyOnComplete is true. Default: task only."
+        ),
+    )
+    keep_recent_session_messages: int = 24
+    # Absolute paths of other agents' *workspace* dirs (where sessions/ lives) that may receive handoff
+    # via ``working_queue_submit`` (e.g. a sibling ``…/ai-tech/workspace`` in a monorepo).
+    handoff_allow_workspace_roots: list[str] = Field(default_factory=list)
+
+
 class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
@@ -216,6 +239,10 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    working_queue: WorkingQueueConfig = Field(
+        default_factory=WorkingQueueConfig,
+        validation_alias=AliasChoices("workingQueue", "working_queue"),
+    )
 
     @property
     def workspace_path(self) -> Path:
@@ -316,5 +343,21 @@ class Config(BaseSettings):
             if spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:
                 return spec.default_api_base
         return None
+
+    @model_validator(mode="after")
+    def _hydrate_gemini_api_key_from_env(self) -> Self:
+        """Use Google AI Studio / Gemini keys from the process env when JSON omits them.
+
+        Supported env names (first non-empty wins): GEMINI_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY,
+        GOOGLE_API_KEY. Matches how Google documents the Generative Language API.
+        """
+        if (self.providers.gemini.api_key or "").strip():
+            return self
+        for env_name in ("GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"):
+            val = os.environ.get(env_name, "").strip()
+            if val:
+                self.providers.gemini.api_key = val
+                break
+        return self
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")

@@ -137,6 +137,9 @@ def load_dotenv(path: Path) -> None:
     os.environ.setdefault("GITHUB_APP_PRIVATE_KEY_B64", "")
     os.environ.setdefault("GITHUB_APP_PRIVATE_KEY", "")
     os.environ.setdefault("GITHUB_APP_PRIVATE_KEY_PATH", "")
+    # Optional; config.json can reference ${GEMINI_API_KEY} / ${GEMINI_MODEL} like OpenRouter.
+    os.environ.setdefault("GEMINI_API_KEY", "")
+    os.environ.setdefault("GEMINI_MODEL", "gemini-2.0-flash")
     if not os.environ.get("GITHUB_MCP_AUTH_HEADER"):
         app_header = _build_github_app_auth_header()
         if app_header:

@@ -1,0 +1,40 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "./workspace",
+      "model": "${OPENROUTER_MODEL}",
+      "provider": "openrouter",
+      "timezone": "UTC"
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "${OPENROUTER_API_KEY}"
+    },
+    "gemini": {
+      "apiKey": ""
+    }
+  },
+  "channels": {
+    "discord": {
+      "enabled": false
+    }
+  },
+  "gateway": {
+    "port": 18880
+  },
+  "tools": {
+    "restrictToWorkspace": true,
+    "exec": {
+      "enable": true,
+      "timeout": 180
+    },
+    "web": {
+      "enable": true,
+      "search": {
+        "provider": "brave"
+      }
+    },
+    "mcpServers": {}
+  }
+}

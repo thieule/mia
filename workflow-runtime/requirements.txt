@@ -1,0 +1,6 @@
+# pip install -r requirements.txt
+# Installs mia from ../core (includes tiktoken and all mia dependencies).
+-e ../core
+pyyaml>=6.0
+# Webhook `working_queue_webhook.py` (OpenAI API extra vẫn tùy chọn khi cài mia tối thiểu)
+aiohttp>=3.9.0,<4.0.0

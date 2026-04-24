@@ -38,3 +38,15 @@ ai-ba/workspace/memory/
 ai-ba/workspace/cron/
 ai-ba/workspace/**/history.jsonl
 ai-ba/workspace/sessions/
+
+# Mia DevOps workspace — volatile
+ai-devops/workspace/memory/
+ai-devops/workspace/cron/
+ai-devops/workspace/**/history.jsonl
+ai-devops/workspace/sessions/
+
+# Mia QC workspace — volatile
+ai-qc/workspace/memory/
+ai-qc/workspace/cron/
+ai-qc/workspace/**/history.jsonl
+ai-qc/workspace/sessions/

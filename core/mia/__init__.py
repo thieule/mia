@@ -27,6 +27,17 @@ def _resolve_version() -> str:
 __version__ = _resolve_version()
 __logo__ = "🐈"
 
-from mia.facade import Mia, RunResult
+# Lazy: avoid pulling tiktoken/AgentLoop when callers only need mia.config.*, etc.
+def __getattr__(name: str):
+    if name == "Mia":
+        from mia.facade import Mia as _Mia
+
+        return _Mia
+    if name == "RunResult":
+        from mia.facade import RunResult as _RunResult
+
+        return _RunResult
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = ["Mia", "RunResult"]

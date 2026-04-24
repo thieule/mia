@@ -1,0 +1,152 @@
+# Mẫu pipeline: PM (kickoff) -> BA -> Tech/Design -> Dev (code) -> QC
+# Chạy: main.py -c <config mac dinh> --env <.env> -w workflows/dev-lifecycle.example.yaml --request "…"
+# Mỗi `role` khớp một mục trong `agent_profiles` (config + .env) — workspace/model theo từng deploy (ai-pm = Mia PM, ai-dev = Mia dev).
+
+name: dev-lifecycle
+version: 1
+description: >
+  Chuỗi vai trò: mỗi bước dùng config mia tương ứng (ai-ba, ai-tech, ai-dev, ai-qc) nếu đủ file .env.
+
+# Đường dẫn tính từ thư mục file yaml (workflows/).
+# Mỗi mục có thể thêm: workspace: ../../ai-ba/workspace (nếu không đặt, tự suy từ .../config/config.json)
+agent_profiles:
+  ba:
+    config: ../../ai-ba/config/config.json
+    env: ../../ai-ba/.env
+  tech:
+    config: ../../ai-tech/config/config.json
+    env: ../../ai-tech/.env
+  dev:
+    config: ../../ai-dev/config/config.json
+    env: ../../ai-dev/.env
+  pm:
+    config: ../../ai-pm/config/config.json
+    env: ../../ai-pm/.env
+  qc:
+    config: ../../ai-qc/config/config.json
+    env: ../../ai-qc/.env
+
+# execution.mode: inline = chạy Mia trong cùng process (runtime).
+#   queue = ghi từng bước vào <agent>/workspace/working_queue/pending, chờ done/ (cần mỗi agent chạy gateway, workingQueue.enabled).
+#   Ghi đè: --execution-mode inline|queue
+# execution:
+#   mode: queue
+#   pollIntervalS: 2
+#   maxWaitPerStepS: 3600
+#   stateDir: workspace/workflow_runs
+#   workingQueueSubdir: working_queue
+
+# Phê duyệt con người (tùy chọn): sau mỗi bước AI, runtime tạo thư mục
+#   workspace/approvals/<run_id>/<step_id>/
+# Tạo file `decision.json` để duyệt: { "action": "approve" } hoặc
+#   { "action": "reject", "feedback": "…" } — AI cùng role sẽ chạy lại với phản hồi, rồi lại chờ duyệt.
+# (Chỉ bật nếu thêm `human_approval` dưới từng bước, hoặc mặc định ở human_approval_defaults.)
+# human_approval_defaults:
+#   approver_label: "Reviewer"
+#   poll_interval_s: 2
+#   max_reject_loops: 10
+#   approval_root: workspace/approvals
+
+# Cách tách phiên: per_step = mỗi bước một session (cần truyền dữ liệu qua include_previous);
+# shared_chain = cùng một hội thoại (model nhớ cả bước trước, prompt vẫn có sẵn trích xuất).
+session:
+  mode: per_step
+  # mode: shared_chain
+  # shared_id: "single-thread"
+
+steps:
+  - id: pm-kickoff
+    role: pm
+    title: PM — charter, lịch, RACI, rủi ro & cadence báo cáo
+    include_previous: false
+    human_approval:
+      approver_label: "Product Owner / Steering"
+    prompt: |
+      Bạn đóng vai **Mia PM** (quản lý dự án / sản phẩm). Chỉ trả lời bằng tiếng Việt, cấu trúc rõ.
+      Từ yêu cầu / ý tưởng dưới đây, hãy soạn **bản kickoff tối thiểu** gồm:
+      - **Mục tiêu & phạm vi** (in / out of scope ngắn)
+      - **Milestone / giai đoạn** (3–5 mốc, có thể ước lượng relativa)
+      - **RACI hoặc danh sách vai trò** (ai chịu trách nhiệm gì — dạng tài liệu, không thay HR)
+      - **3–5 rủi ro** + hướng giảm thiểu
+      - **Cadence báo cáo** đề xuất (vd hàng tuần) và **1 mẫu nội dung status** 5 dòng
+
+      === YÊU CẦU / Ý TƯỞNG ===
+      {{customer_request}}
+
+  - id: ba-features
+    role: ba
+    title: Phân tích nghiệp vụ — liệt kê chức năng
+    include_previous: true
+    human_approval:
+      approver_label: "Product Owner / PM"
+    prompt: |
+      Bạn đóng vai **Business Analyst**. Chỉ trả lời bằng tiếng Việt, cấu trúc rõ.
+      Bám theo phạm vi & ưu tiên đã nêu trong bản kickoff **PM** (nếu có) và từ yêu cầu khách hàng, hãy:
+      - Tóm tắt 2–3 câu
+      - Liệt kê **các chức năng** (user story cấp cao), đánh số
+      - Ghi **giả thuyết** / **câu hỏi cần làm rõ** nếu thiếu thông tin
+
+      === BẢN KICKOFF PM (BƯỚC TRƯỚC) ===
+      {{previous_output}}
+
+      === YÊU CẦU KHÁCH HÀNG ===
+      {{customer_request}}
+
+  - id: tech-design
+    role: tech
+    # tương đương: agent: tech  (tham chiếu agent_profiles.tech)
+    title: Phân tích kỹ thuật — tài liệu thiết kế gọn
+    include_previous: true
+    human_approval:
+      approver_label: "Tech Lead / Architect"
+    prompt: |
+      Bạn đóng vai **Tech/Architect** (Mia tech). Cùng workspace với bước trước, nhưng đang bước tách session.
+      Dựa trên đầu ra **BA** và yêu cầu gốc, hãy đưa ra tài liệu thiết kế **ngắn** gồm:
+      - Các thành phần cần có (services/modules)
+      - Mối hệ thống (API, DB) nếu cần
+      - 3–5 rủi ro kỹ thuật hoặc điểm cần thống nhất
+      (Chưa cần chạm file trừ khi thấy cần — nếu đọc/ghi file, giữ trong workspace dự án.)
+
+      === YÊU CẦU GỐC ===
+      {{customer_request}}
+
+      === ĐẦU RA BA (BƯỚC TRƯỚC) ===
+      {{previous_output}}
+
+  - id: implement-hint
+    role: dev
+    title: Hướng dẫn triển khai (code) — tối thiểu
+    include_previous: true
+    human_approval:
+      approver_label: "Engineering Lead / Dev"
+    prompt: |
+      Bạn đóng vai **lập trình viên (Mia dev)** trong cùng pipeline. Từ thiết kế và bối cảnh, hãy:
+      - Đưa **thứ tự commit/hạng mục** công việc
+      - Ghi **tên file/module** gợi ý
+      - Nêu 1 hướng **test đơn vị** tối thiểu
+      (Không tự tạo cả repo nếu chưa được yêu cầu; ưu tiên ngắn, có thể bổ sung công cụ ở lượt tương tác sau.)
+
+      === BỐI CẢNH (YÊU CẦU + THIẾT KẾ) ===
+      [Gốc]
+      {{customer_request}}
+      [BA + Tech trên]
+      {{previous_output}}
+
+  - id: qc-test-plan
+    role: qc
+    title: QC — kế hoạch kiểm thử
+    include_previous: true
+    human_approval:
+      approver_label: "QA Lead / Release manager"
+    prompt: |
+      Bạn đóng vai **QC/Tester** (Mia QC). Từ toàn bộ bối cảnh, hãy:
+      - Liệt kê **các trường hợp thử (smoke + 2 edge cases)**
+      - Ghi **công cụ** (vd pytest, nếu repo có) — không cần chạy nếu chưa lệnh
+      - 1 câu **kỹ năng out-of-scope** để tách nếu cần
+
+      === TỔNG HỢP (YÊU CẦU ĐẾN HIỆN TẠI) ===
+      [Khách hàng]
+      {{customer_request}}
+
+      [Đầu ra bước gần nhất (Dev)]
+      {{previous_output}}

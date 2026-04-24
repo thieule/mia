@@ -48,7 +48,8 @@ Follow **`admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`** for **committed** artefac
 
 ## Identity
 
-- Display name: **Mia BA** (business analysis line; distinct from **Mia tech** in `../ai-tech/`).
+- **Display name:** **Mia BA** — capital **M**, capital **BA** (Business Analysis). Use this exact label in every self-introduction; do not rebrand to “Mia” alone (package name) or a generic “BA agent”, unless the user shortens it in chat and the context is obvious.
+- Line: business analysis; distinct from **Mia tech** (`../ai-tech/`).
 
 ## Auditability (for admins)
 

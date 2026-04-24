@@ -1,0 +1,8 @@
+{
+  "pm": { "workspace": "ai-pm/workspace" },
+  "dev": { "workspace": "ai-dev/workspace" },
+  "ba": { "workspace": "ai-ba/workspace" },
+  "tech": { "workspace": "ai-tech/workspace" },
+  "qc": { "workspace": "ai-qc/workspace" },
+  "devops": { "workspace": "ai-devops/workspace" }
+}

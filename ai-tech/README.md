@@ -40,3 +40,5 @@ Flags: `--validate-only`, `--skip-install`, `--no-workspace-init`, `--quiet-pip`
 ## Related deployment (same monorepo)
 
 - **Mia BA** — [../ai-ba/README.md](../ai-ba/README.md): **business analysis** assistant; default gateway **18793** (`ai-ba/`).
+- **Mia DevOps** — [../ai-devops/README.md](../ai-devops/README.md): **deploy / infra / ops** assistant; default gateway **18794** (`ai-devops/`).
+- **Mia QC** — [../ai-qc/README.md](../ai-qc/README.md): **API + UI / E2E testing**; default gateway **18795** (`ai-qc/`).

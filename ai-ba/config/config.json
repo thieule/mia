@@ -10,6 +10,9 @@
   "providers": {
     "openrouter": {
       "apiKey": "${OPENROUTER_API_KEY}"
+    },
+    "gemini": {
+      "apiKey": ""
     }
   },
   "channels": {
