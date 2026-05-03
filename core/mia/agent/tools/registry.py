@@ -23,6 +23,15 @@ class ToolRegistry:
         """Unregister a tool by name."""
         self._tools.pop(name, None)
 
+    def unregister_prefix(self, prefix: str) -> int:
+        """Remove every tool whose name starts with *prefix* (e.g. ``mcp_``). Returns count removed."""
+        removed = 0
+        for name in list(self._tools.keys()):
+            if name.startswith(prefix):
+                self._tools.pop(name, None)
+                removed += 1
+        return removed
+
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
         return self._tools.get(name)

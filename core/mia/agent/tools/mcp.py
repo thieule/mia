@@ -11,6 +11,22 @@ from mia.agent.tools.base import Tool
 from mia.agent.tools.registry import ToolRegistry
 
 
+def _prefer_ipv4_loopback_url(url: str) -> str:
+    """Tránh localhost → ::1 khi server MCP chỉ bind 127.0.0.1."""
+    s = (url or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    needle = "://localhost"
+    idx = low.find(needle)
+    if idx < 0:
+        return s
+    after_host = idx + len(needle)
+    if after_host >= len(s) or s[after_host] not in ":/":
+        return s
+    return s[: idx + 3] + "127.0.0.1" + s[after_host:]
+
+
 def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None:
     """Return the single non-null branch for nullable unions."""
     if not isinstance(options, list):
@@ -98,6 +114,7 @@ class MCPToolWrapper(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
+        from mcp.shared.exceptions import McpError
 
         try:
             result = await asyncio.wait_for(
@@ -115,6 +132,18 @@ class MCPToolWrapper(Tool):
                 raise
             logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
             return "(MCP tool call was cancelled)"
+        except McpError as exc:
+            err = getattr(exc, "error", None)
+            code = getattr(err, "code", None) if err is not None else None
+            msg = (getattr(err, "message", None) or str(exc)).strip()
+            logger.error(
+                "MCP tool '{}' failed: code={} message={}",
+                self._name,
+                code,
+                msg,
+            )
+            tail = f" [code {code}]" if code is not None else ""
+            return f"(MCP tool call failed: {msg}){tail}"
         except Exception as exc:
             logger.exception(
                 "MCP tool '{}' failed: {}: {}",
@@ -122,7 +151,7 @@ class MCPToolWrapper(Tool):
                 type(exc).__name__,
                 exc,
             )
-            return f"(MCP tool call failed: {type(exc).__name__})"
+            return f"(MCP tool call failed: {type(exc).__name__}: {exc})"
 
         parts = []
         for block in result.content:
@@ -340,6 +369,7 @@ async def connect_mcp_servers(
                 )
                 read, write = await server_stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
+                mcp_url = _prefer_ipv4_loopback_url(cfg.url)
 
                 def httpx_client_factory(
                     headers: dict[str, str] | None = None,
@@ -359,9 +389,10 @@ async def connect_mcp_servers(
                     )
 
                 read, write = await server_stack.enter_async_context(
-                    sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
+                    sse_client(mcp_url, httpx_client_factory=httpx_client_factory)
                 )
             elif transport_type == "streamableHttp":
+                mcp_url = _prefer_ipv4_loopback_url(cfg.url)
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
@@ -370,7 +401,7 @@ async def connect_mcp_servers(
                     )
                 )
                 read, write, _ = await server_stack.enter_async_context(
-                    streamable_http_client(cfg.url, http_client=http_client)
+                    streamable_http_client(mcp_url, http_client=http_client)
                 )
             else:
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
@@ -451,10 +482,19 @@ async def connect_mcp_servers(
             logger.info(
                 "MCP server '{}': connected, {} capabilities registered", name, registered_count
             )
+            if registered_count == 0:
+                logger.warning(
+                    "MCP server '{}': 0 tools/resources registered — check enabledTools (use [\"*\"]), "
+                    "server URL (try 127.0.0.1 instead of localhost), and that Agile MCP is running (MCP_TRANSPORT=streamable-http, MCP_PORT).",
+                    name,
+                )
             return name, server_stack
 
         except Exception as e:
-            logger.error("MCP server '{}': failed to connect: {}", name, e)
+            hint = ""
+            if cfg.url and "localhost" in (cfg.url or "").lower():
+                hint = " Tip: replace `localhost` with `127.0.0.1` in MCP URL if connection fails (IPv6 vs IPv4)."
+            logger.error("MCP server '{}': failed to connect: {}{}", name, e, hint)
             try:
                 await server_stack.aclose()
             except Exception:

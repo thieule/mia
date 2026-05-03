@@ -1,0 +1,113 @@
+# DB: MySQL tạo `ai_workflow` (MYSQL_DATABASE) + script docker/mysql-init tạo `agile_studio` cho Hub/MCP/Chat.
+# Init chỉ chạy khi volume trống. Xóa volume và tạo lại: docker compose down -v && docker compose up -d
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: ai_demo_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ai_workflow
+      # Không dùng MYSQL_USER=root (image MySQL từ chối); user này có quyền trên MYSQL_DATABASE
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+  agile-studio:
+    build:
+      context: ./agile-studio
+      dockerfile: Dockerfile
+    container_name: ai_demo_agile_studio
+    restart: unless-stopped
+    environment:
+      AGILE_DATABASE_URL: mysql+pymysql://app:app@mysql:3306/agile_studio
+      AGILE_LISTEN_HOST: "0.0.0.0"
+      AGILE_LISTEN_PORT: "9120"
+      AGILE_CHAT_SERVICE_URL: http://agile-studio-chat:9130
+    volumes:
+      - ./agile-studio/agile_hub:/app/agile_hub
+    ports:
+      - "9120:9120"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      agile-studio-chat:
+        condition: service_started
+
+  # MCP Agile Studio — streamable HTTP; trong container listen MCP_PORT (8000), host map 9121 → http://127.0.0.1:9121/mcp
+  agile-studio-mcp:
+    build:
+      context: ./agile-studio
+      dockerfile: Dockerfile
+    container_name: ai_demo_agile_mcp
+    restart: unless-stopped
+    environment:
+      AGILE_DATABASE_URL: mysql+pymysql://app:app@mysql:3306/agile_studio
+      AGILE_CHAT_SERVICE_URL: http://agile-studio-chat:9130
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+      # Avoid HTTP 404 from stale Mcp-Session-Id after Hub/MCP restarts; use JSON responses (SDK-friendly).
+      MCP_STATELESS_HTTP: "true"
+      MCP_JSON_RESPONSE: "true"
+    volumes:
+      - ./agile-studio/agile_hub:/app/agile_hub
+      - ./agile-studio/mcp_server:/app/mcp_server
+    ports:
+      - "9121:8000"
+    command: ["python", "-m", "mcp_server"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      agile-studio-chat:
+        condition: service_started
+
+  agile-studio-web:
+    image: node:20-alpine
+    working_dir: /app
+    container_name: ai_demo_agile_studio_web
+    restart: unless-stopped
+    environment:
+      VITE_PROXY_AGILE_API: http://agile-studio:9120
+      VITE_PROXY_AGILE_CHAT_API: http://agile-studio-chat:9130
+    volumes:
+      # Không gắn volume riêng cho node_modules: volume cũ dễ lệch package.json (vd. thêm react-router-dom).
+      - ./agile-studio/web:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5175:5175"
+    depends_on:
+      - agile-studio
+      - agile-studio-chat
+
+  agile-studio-chat:
+    build:
+      context: ./agile-studio/chat-service
+      dockerfile: Dockerfile
+    container_name: ai_demo_agile_studio_chat
+    restart: unless-stopped
+    environment:
+      CHAT_SERVICE_PORT: "9130"
+      CHAT_MYSQL_HOST: mysql
+      CHAT_MYSQL_PORT: "3306"
+      CHAT_MYSQL_USER: app
+      CHAT_MYSQL_PASSWORD: app
+      CHAT_MYSQL_DATABASE: agile_studio
+    ports:
+      - "9130:9130"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:

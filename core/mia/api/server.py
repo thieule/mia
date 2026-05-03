@@ -171,11 +171,34 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def handle_reload_mcp(request: web.Request) -> web.Response:
+    """POST /internal/reload-mcp — reload MCP tool registrations from disk (requires ``admin_secret``)."""
+    secret = request.app.get("admin_secret")
+    if not secret:
+        return web.json_response({"error": "reload disabled (no admin secret)"}, status=404)
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {secret}":
+        return web.json_response({"error": "unauthorized"}, status=401)
+    agent_loop = request.app["agent_loop"]
+    try:
+        result = await agent_loop.reload_mcp_from_disk()
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+    except Exception as e:
+        logger.exception("reload_mcp_from_disk failed")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(agent_loop, model_name: str = "mia", request_timeout: float = 120.0) -> web.Application:
+def create_app(
+    agent_loop,
+    model_name: str = "mia",
+    request_timeout: float = 120.0,
+    admin_secret: str | None = None,
+) -> web.Application:
     """Create the aiohttp application.
 
     Args:
@@ -188,8 +211,12 @@ def create_app(agent_loop, model_name: str = "mia", request_timeout: float = 120
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
     app["session_locks"] = {}  # per-user locks, keyed by session_key
+    app["admin_secret"] = (admin_secret or "").strip() or None
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+    if app["admin_secret"]:
+        app.router.add_post("/internal/reload-mcp", handle_reload_mcp)
+
     return app

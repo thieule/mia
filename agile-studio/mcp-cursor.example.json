@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agile-studio": {
+      "command": "python3.11",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/path/to/poc-ai/agile-studio"
+    }
+  }
+}

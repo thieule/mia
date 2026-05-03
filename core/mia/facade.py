@@ -56,6 +56,10 @@ class Mia:
             if not resolved.exists():
                 raise FileNotFoundError(f"Config not found: {resolved}")
 
+        from mia.config.loader import get_config_path
+
+        cfg_file = resolved if resolved is not None else get_config_path()
+
         config: Config = resolve_config_env_vars(load_config(resolved))
         if workspace is not None:
             config.agents.defaults.workspace = str(
@@ -84,6 +88,7 @@ class Mia:
             unified_session=defaults.unified_session,
             session_ttl_minutes=defaults.session_ttl_minutes,
             working_queue_config=config.working_queue,
+            config_path=cfg_file,
         )
         return cls(loop)
 
@@ -134,7 +139,12 @@ def _make_provider(config: Any) -> Any:
         needs_key = not (p and p.api_key)
         exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
         if needs_key and not exempt:
-            raise ValueError(f"No API key configured for provider '{provider_name}'.")
+            pn = provider_name or "unknown"
+            raise ValueError(
+                f"No API key configured for provider '{pn}' (model '{model}'). "
+                "Set the matching key in config (e.g. providers.openrouter.apiKey / ${OPENROUTER_API_KEY}) "
+                "and the referenced environment variable in `.env`."
+            )
 
     if backend == "openai_codex":
         from mia.providers.openai_codex_provider import OpenAICodexProvider

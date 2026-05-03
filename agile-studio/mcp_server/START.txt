@@ -1,0 +1,24 @@
+# MCP Agile Studio — cần Python 3.10+ và: pip install -r requirements-mcp.txt
+
+# Cấu hình: tạo file  agile-studio/.env  từ .env.example
+#   cp .env.example .env
+#   # chỉnh AGILE_DATABASE_URL, v.v. — không cần export từng biến.
+
+# 1) stdio (mặc định) — KHÔNG có URL; Cursor/Claude tự gọi process, đọc .env
+python3.11 -m mcp_server
+
+# 2) streamable HTTP — endpoint: http://127.0.0.1:8000/mcp (có thể đổi trong .env: MCP_PORT, …)
+# Đặt trong .env:  MCP_TRANSPORT=streamable-http
+# python3.11 -m mcp_server
+#
+# Docker (docker-compose): service `agile-studio-mcp` bật sẵn streamable-http, mặc định:
+#   http://localhost:9121/mcp
+# Kiểm tra đúng service: GET http://localhost:9121/health → JSON có streamable_http_path.
+# Log "POST /mcp HTTP/1.1" 404: thường là MCP trả 404 khi Mcp-Session-Id hết hạn/sai (sau restart).
+#   Compose mặc định bật MCP_STATELESS_HTTP=true để tránh; hoặc restart client/agent để lấy session mới.
+# Đừng nhầm cổng Hub 9120 với MCP 9121 — POST /mcp vào Hub sẽ 404.
+
+# 3) SSE: MCP_TRANSPORT=sse  trong .env
+#    Thường: http://127.0.0.1:8000/sse
+
+File .env ở thư mục agile-studio (một cấp trên mcp_server/) — server tự nạp khi chạy.

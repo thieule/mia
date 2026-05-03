@@ -428,8 +428,19 @@ def _make_provider(config: Config):
         needs_key = not (p and p.api_key)
         exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
         if needs_key and not exempt:
+            pn = provider_name or "(unknown)"
             console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.mia/config.json under providers section")
+            console.print(f"Resolved provider: [cyan]{pn}[/cyan]  model: [cyan]{model}[/cyan]")
+            console.print(
+                "Set `providers.<provider>.apiKey` in your config (often via `${ENV_VAR}` in JSON), "
+                "then define that variable in the deployment `.env`."
+            )
+            if pn == "openrouter":
+                console.print("Example: set `OPENROUTER_API_KEY` in `ai-tech/.env` (see `EXAMPLE_.env`).")
+            elif pn == "gemini":
+                console.print("Example: set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in `.env`.")
+            elif pn == "anthropic":
+                console.print("Example: set `ANTHROPIC_API_KEY` in `.env` or config.")
             raise typer.Exit(1)
 
     # --- instantiation by backend ---
@@ -564,7 +575,11 @@ def serve(
     else:
         logger.disable("mia")
 
-    runtime_config = _load_runtime_config(config, workspace)
+    cli_config = config
+    runtime_config = _load_runtime_config(cli_config, workspace)
+    from mia.config.loader import get_config_path
+
+    serve_cfg_path = Path(cli_config).expanduser().resolve() if cli_config else get_config_path()
     api_cfg = runtime_config.api
     host = host if host is not None else api_cfg.host
     port = port if port is not None else api_cfg.port
@@ -593,6 +608,7 @@ def serve(
         unified_session=runtime_config.agents.defaults.unified_session,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         working_queue_config=runtime_config.working_queue,
+        config_path=serve_cfg_path,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -608,7 +624,13 @@ def serve(
         )
     console.print()
 
-    api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
+    admin_secret = (os.environ.get("MIA_GATEWAY_ADMIN_SECRET") or os.environ.get("MIA_MCP_RELOAD_SECRET") or "").strip()
+    api_app = create_app(
+        agent_loop,
+        model_name=model_name,
+        request_timeout=timeout,
+        admin_secret=admin_secret or None,
+    )
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
@@ -625,6 +647,48 @@ def serve(
 # ============================================================================
 # Gateway / Server
 # ============================================================================
+
+
+async def _run_gateway_admin_http(agent, host: str, port: int):
+    """Optional HTTP endpoint để reload MCP (POST /internal/reload-mcp) — bật khi có secret trong env."""
+    secret = (os.environ.get("MIA_GATEWAY_ADMIN_SECRET") or os.environ.get("MIA_MCP_RELOAD_SECRET") or "").strip()
+    if not secret:
+        return None
+    try:
+        from aiohttp import web
+    except ImportError:
+        logger.warning("aiohttp missing — install aiohttp for gateway MCP reload HTTP endpoint")
+        return None
+
+    async def handle_reload(request):
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {secret}":
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            result = await agent.reload_mcp_from_disk()
+            status = 200 if result.get("ok") else 400
+            return web.json_response(result, status=status)
+        except Exception as e:
+            logger.exception("Gateway MCP reload failed")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    app = web.Application()
+    app.router.add_post("/internal/reload-mcp", handle_reload)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    logger.info(
+        "Gateway admin: POST http://{}:{}/internal/reload-mcp (Authorization: Bearer <secret>)",
+        host,
+        port,
+    )
+    return runner
+
+
+async def _cleanup_gateway_admin(runner) -> None:
+    if runner is not None:
+        await runner.cleanup()
 
 
 @app.command()
@@ -648,8 +712,13 @@ def gateway(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    config = _load_runtime_config(config, workspace)
+    cli_config = config
+    config = _load_runtime_config(cli_config, workspace)
     port = port if port is not None else config.gateway.port
+
+    from mia.config.loader import get_config_path
+
+    gateway_cfg_path = Path(cli_config).expanduser().resolve() if cli_config else get_config_path()
 
     console.print(f"{__logo__} Starting mia gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
@@ -687,6 +756,7 @@ def gateway(
         unified_session=config.agents.defaults.unified_session,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         working_queue_config=config.working_queue,
+        config_path=gateway_cfg_path,
     )
 
     # Set cron callback (needs agent)
@@ -872,9 +942,16 @@ def gateway(
         payload=CronPayload(kind="system_event"),
     ))
     console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+    if not (os.environ.get("MIA_GATEWAY_ADMIN_SECRET") or os.environ.get("MIA_MCP_RELOAD_SECRET")):
+        console.print(
+            "[dim]— MCP reload: set env MIA_GATEWAY_ADMIN_SECRET (or MIA_MCP_RELOAD_SECRET) for "
+            f"POST http://{config.gateway.host}:{port}/internal/reload-mcp without restarting[/dim]"
+        )
 
     async def run():
+        admin_runner = None
         try:
+            admin_runner = await _run_gateway_admin_http(agent, config.gateway.host, port)
             await cron.start()
             await heartbeat.start()
             await working_queue.start()
@@ -890,6 +967,7 @@ def gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            await _cleanup_gateway_admin(admin_runner)
             await agent.close_mcp()
             working_queue.stop()
             heartbeat.stop()
@@ -921,7 +999,11 @@ def agent(
     from mia.bus.queue import MessageBus
     from mia.cron.service import CronService
 
-    config = _load_runtime_config(config, workspace)
+    cli_config = config
+    config = _load_runtime_config(cli_config, workspace)
+    from mia.config.loader import get_config_path
+
+    agent_cfg_path = Path(cli_config).expanduser().resolve() if cli_config else get_config_path()
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
@@ -960,6 +1042,7 @@ def agent(
         unified_session=config.agents.defaults.unified_session,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         working_queue_config=config.working_queue,
+        config_path=agent_cfg_path,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

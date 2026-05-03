@@ -153,6 +153,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         working_queue_config: Any | None = None,
+        config_path: Path | None = None,
     ):
         from mia.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -218,6 +219,8 @@ class AgentLoop:
             asyncio.Semaphore(_max) if _max > 0 else None
         )
         self._working_queue_config = working_queue_config
+        #: Path to ``config.json`` — enables :meth:`reload_mcp_from_disk` without restart.
+        self._config_path = config_path
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -307,6 +310,32 @@ class AgentLoop:
             self._mcp_stacks.clear()
         finally:
             self._mcp_connecting = False
+
+    async def reload_mcp_from_disk(self) -> dict[str, Any]:
+        """Đọc lại ``config.json``, gỡ tool MCP cũ, đóng session MCP và kết nối lại (không restart process)."""
+        from mia.config.loader import get_config_path, load_config, resolve_config_env_vars, set_config_path
+
+        path = self._config_path
+        if path is None:
+            path = get_config_path()
+        path = path.resolve()
+        if not path.is_file():
+            return {"ok": False, "error": f"config file not found: {path}"}
+
+        set_config_path(path)
+        cfg = resolve_config_env_vars(load_config(path))
+        removed = self.tools.unregister_prefix("mcp_")
+        await self.close_mcp()
+        self._mcp_connecting = False
+        self._mcp_servers = cfg.tools.mcp_servers
+        await self._connect_mcp()
+        connected = list(self._mcp_stacks.keys())
+        return {
+            "ok": True,
+            "config_path": str(path),
+            "removed_mcp_registrations": removed,
+            "mcp_servers_connected": connected,
+        }
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -591,6 +620,7 @@ class AgentLoop:
             except (RuntimeError, BaseExceptionGroup):
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
+        self._mcp_connected = False
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

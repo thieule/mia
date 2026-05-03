@@ -1,0 +1,9 @@
+# API Agile Studio — tách khỏi agent; cùng stack MySQL + FastAPI.
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.35
+pymysql>=1.1.0
+pydantic[email]>=2.9.0
+pydantic-settings>=2.5.0
+pyjwt>=2.9.0
+bcrypt>=4.2.0

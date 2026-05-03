@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -22,6 +22,17 @@ from fastapi.responses import JSONResponse
 ROOT = Path(__file__).resolve().parent
 DATA_DIR_DEFAULT = ROOT / "data"
 SESSION_PREFIX = "acs_"
+
+
+def _chat_debug_enabled() -> bool:
+    return (os.environ.get("API_CENTER_CHAT_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _chat_dbg(msg: str, *parts: Any) -> None:
+    if not _chat_debug_enabled():
+        return
+    extra = " ".join(str(p) for p in parts) if parts else ""
+    print(f"[api-center][chat-debug] {msg}{(' ' + extra) if extra else ''}", flush=True)
 
 _sessions: dict[str, float] = {}
 _session_file: Path | None = None
@@ -142,11 +153,29 @@ def _load_catalog(path: Path | None) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _catalog_meta_for_runtime_id(
+    catalog: dict[str, dict[str, Any]], runtime_id: str
+) -> dict[str, Any]:
+    """
+    agents.json dùng key runtime (vd. ``mia-ba``). agents.catalog.json thường có key ngắn (``ba``)
+    và ``alias``: ``mia-ba`` — cần ghép để có displayName đúng (mention @miaba hoạt động).
+    """
+    if runtime_id in catalog and isinstance(catalog.get(runtime_id), dict):
+        return catalog[runtime_id]
+    rid = (runtime_id or "").strip()
+    for row in catalog.values():
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("alias") or "").strip() == rid:
+            return row
+    return {}
+
+
 def _merge_agents(agents: dict[str, dict[str, Any]], catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for aid in sorted(agents.keys(), key=str.lower):
         a = agents[aid]
-        c = catalog.get(aid, {})
+        c = _catalog_meta_for_runtime_id(catalog, aid)
         rows.append(
             {
                 "id": aid,
@@ -253,6 +282,7 @@ async def _enqueue_agent_queue_item_direct(
         return False, f"direct_import_error:{type(e).__name__}", None
     agent_ws = _agent_workspace_path(agent)
     if agent_ws is None or not agent_ws.is_dir():
+        _chat_dbg("enqueue_skip", "direct_workspace_not_found", f"agent_workspace={agent.get('workspace')!r}")
         return False, "direct_workspace_not_found", None
     wq_subdir = (os.environ.get("API_CENTER_WORKING_QUEUE_SUBDIR") or "working_queue").strip() or "working_queue"
     queue_dir = agent_ws / wq_subdir
@@ -272,8 +302,15 @@ async def _enqueue_agent_queue_item_direct(
             enqueued_by=enqueued_by,
             item_kind=ik,
         )
+        _chat_dbg(
+            "enqueue_ok",
+            f"queue_dir={queue_dir}",
+            f"task_id={task_id}",
+            f"item_kind={ik}",
+        )
         return True, "direct_enqueued", str(task_id)
     except Exception as e:
+        _chat_dbg("enqueue_fail", type(e).__name__, str(e))
         return False, f"direct_enqueue_error:{type(e).__name__}", None
 
 
@@ -334,9 +371,13 @@ async def _wait_agent_task_result(
 ) -> tuple[str, str]:
     ws = _agent_workspace_path(agent)
     if ws is None:
+        _chat_dbg("wait_task", "no_workspace_path")
         return "unknown", "agent_workspace_not_found"
     item_path = ws / "working_queue" / "state" / "items" / f"{task_id}.json"
+    _chat_dbg("wait_task_start", f"path={item_path}", f"timeout_s={timeout_s}")
     end_at = time.time() + max(0.0, timeout_s)
+    last_pulse = 0.0
+    last_loc = ""
     while time.time() <= end_at:
         if item_path.is_file():
             try:
@@ -345,13 +386,24 @@ async def _wait_agent_task_result(
                 row = {}
             if isinstance(row, dict):
                 loc = str(row.get("location") or row.get("status") or "").strip().lower()
+                if loc != last_loc:
+                    last_loc = loc
+                    _chat_dbg("wait_task_state", f"location={loc!r}", f"task_id={task_id}")
                 if loc == "done":
                     txt = str(row.get("result_excerpt") or "").strip()
+                    _chat_dbg("wait_task_done", f"excerpt_len={len(txt)}")
                     return "done", txt
                 if loc == "failed":
                     err = str(row.get("error") or "Task failed").strip()
+                    _chat_dbg("wait_task_failed", err[:300])
                     return "failed", err
+        else:
+            now = time.time()
+            if _chat_debug_enabled() and now - last_pulse >= 8.0:
+                last_pulse = now
+                _chat_dbg("wait_task_poll", "state_file_missing_yet", f"task_id={task_id}")
         await asyncio.sleep(1.5)
+    _chat_dbg("wait_task_timeout", f"task_id={task_id}", f"path_exists={item_path.is_file()}")
     return "timeout", "Agent is processing, not completed in timeout."
 
 
@@ -361,6 +413,231 @@ def _is_valid_http_url(raw: str) -> bool:
     except Exception:
         return False
     return p.scheme in {"http", "https"} and bool(p.netloc)
+
+
+def _fix_vite_port_to_hub(url: str) -> str:
+    """Web UI Vite (5175/5173) hay bị nhập nhầm thay cho Hub API (9120)."""
+    u = (url or "").strip()
+    if ":5175" in u:
+        return u.replace(":5175", ":9120", 1)
+    if ":5173" in u:
+        return u.replace(":5173", ":9120", 1)
+    if ":4173" in u:
+        return u.replace(":4173", ":9120", 1)
+    return u
+
+
+def _fix_vite_port_to_mcp(url: str) -> str:
+    """Cùng lý do — endpoint MCP streamable-http trong compose là 9121."""
+    u = (url or "").strip()
+    if ":5175" in u:
+        return u.replace(":5175", ":9121", 1)
+    if ":5173" in u:
+        return u.replace(":5173", ":9121", 1)
+    if ":4173" in u:
+        return u.replace(":4173", ":9121", 1)
+    return u
+
+
+def _prefer_ipv4_loopback_url(url: str) -> str:
+    """Một số máy `localhost` → ::1 trong khi MCP chỉ listen 127.0.0.1 — client kết nối thất bại."""
+    s = (url or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    needle = "://localhost"
+    idx = low.find(needle)
+    if idx < 0:
+        return s
+    after_host = idx + len(needle)
+    if after_host >= len(s) or s[after_host] not in ":/":
+        return s
+    return s[: idx + 3] + "127.0.0.1" + s[after_host:]
+
+
+def _derive_hub_base_from_mcp_tools_url(tools_url: str) -> str:
+    """Hub reply base từ URL MCP streamable-http (vd. ...:9121/mcp → ...:9120)."""
+    u = _fix_vite_port_to_hub((tools_url or "").strip())
+    u = u.rstrip("/")
+    if ":9121" in u:
+        u = u.replace(":9121", ":9120", 1)
+    low = u.lower()
+    if low.endswith("/mcp"):
+        u = u[:-4].rstrip("/")
+    return u.strip()
+
+
+def _derive_tools_url_from_hub_base(hub_url: str) -> str:
+    """URL MCP tools mặc định từ base Hub (docker: 9120 → 9121 + /mcp)."""
+    u = _fix_vite_port_to_mcp((hub_url or "").strip()).rstrip("/")
+    if ":9120" in u:
+        u = u.replace(":9120", ":9121", 1)
+    if not u.lower().endswith("/mcp"):
+        u = u + "/mcp"
+    return u.strip()
+
+
+def _reply_dispatch_base_url(mcp_row: dict[str, Any]) -> str:
+    """URL gốc để POST .../agent-chat/reply (không phải endpoint /mcp của FastMCP)."""
+    explicit = str(mcp_row.get("hub_reply_base_url") or "").strip()
+    if explicit and _is_valid_http_url(explicit):
+        return explicit.rstrip("/")
+    raw = str(mcp_row.get("mcp_url") or "").strip()
+    if raw.rstrip("/").lower().endswith("/mcp"):
+        return _derive_hub_base_from_mcp_tools_url(raw).rstrip("/")
+    return raw.rstrip("/")
+
+
+def _normalize_mcp_hub_and_tools_urls(payload: dict[str, Any]) -> tuple[str, str]:
+    """
+    Trả về (hub_reply_base, mcp_tools_url) — cả hai đều http(s) hợp lệ.
+    Cho phép chỉ nhập một trong hai dạng: base Hub (9120) hoặc URL MCP (.../mcp, thường 9121).
+    """
+    hub_opt = str(payload.get("hub_reply_base_url") or "").strip()
+    tools_opt = str(payload.get("mcp_tools_url") or "").strip()
+    legacy = str(payload.get("mcp_url") or "").strip()
+    env_tools = (os.environ.get("API_CENTER_AGILE_MCP_TOOLS_URL") or "").strip()
+
+    if hub_opt and tools_opt:
+        hub_f = _prefer_ipv4_loopback_url(_fix_vite_port_to_hub(hub_opt).rstrip("/"))
+        tools_f = _prefer_ipv4_loopback_url(_fix_vite_port_to_mcp(tools_opt).rstrip("/"))
+        return hub_f, tools_f
+
+    if legacy.rstrip("/").lower().endswith("/mcp"):
+        raw_tools = tools_opt or legacy.strip().rstrip("/")
+        tools = _prefer_ipv4_loopback_url(_fix_vite_port_to_mcp(raw_tools).rstrip("/"))
+        hub = hub_opt or _derive_hub_base_from_mcp_tools_url(legacy)
+        hub = _prefer_ipv4_loopback_url(_fix_vite_port_to_hub(hub).rstrip("/"))
+        return hub.rstrip("/"), tools.rstrip("/")
+
+    hub = _prefer_ipv4_loopback_url(_fix_vite_port_to_hub((hub_opt or legacy)).rstrip("/"))
+    if not hub:
+        raise ValueError("Need mcp_url (hub base or .../mcp) or hub_reply_base_url + mcp_tools_url")
+    tools = tools_opt or _derive_tools_url_from_hub_base(hub)
+    tools = _prefer_ipv4_loopback_url(_fix_vite_port_to_mcp(tools).rstrip("/"))
+    if env_tools:
+        tools = _prefer_ipv4_loopback_url(_fix_vite_port_to_mcp(env_tools).rstrip("/"))
+    return hub.rstrip("/"), tools.rstrip("/")
+
+
+def _inject_agile_studio_mcp_into_agent_configs(
+    merged_agents: list[dict[str, Any]],
+    *,
+    tools_url: str,
+    api_key: str,
+) -> dict[str, Any]:
+    """Gộp tools.mcpServers['agile-studio'] vào config/config.json của mỗi agent trong agents.json."""
+    summary: dict[str, Any] = {"updated": [], "skipped": [], "errors": []}
+    tools_url_n = _prefer_ipv4_loopback_url((tools_url or "").strip())
+    entry = {
+        "type": "streamableHttp",
+        "url": tools_url_n,
+        "headers": {"Authorization": f"Bearer {api_key}"},
+        "toolTimeout": 30,
+        "enabledTools": ["*"],
+    }
+    for row in merged_agents:
+        aid = str(row.get("id") or "").strip()
+        ws = str(row.get("workspace") or "").strip()
+        root = _agent_root_from_workspace(ws)
+        if root is None:
+            summary["skipped"].append({"agent": aid, "reason": "bad_workspace", "workspace": ws})
+            continue
+        cfg_path = root / "config" / "config.json"
+        if not cfg_path.is_file():
+            summary["skipped"].append({"agent": aid, "reason": "missing_config", "path": str(cfg_path)})
+            continue
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            summary["errors"].append({"agent": aid, "error": f"read_json:{e}"})
+            continue
+        if not isinstance(raw, dict):
+            summary["errors"].append({"agent": aid, "error": "config_root_not_object"})
+            continue
+        tools = raw.setdefault("tools", {})
+        if not isinstance(tools, dict):
+            raw["tools"] = {}
+            tools = raw["tools"]
+        mcp = tools.setdefault("mcpServers", {})
+        if not isinstance(mcp, dict):
+            tools["mcpServers"] = {}
+            mcp = tools["mcpServers"]
+        mcp["agile-studio"] = entry
+        try:
+            tmp = cfg_path.parent / f".config.json.{os.getpid()}.tmp"
+            tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            tmp.replace(cfg_path)
+            summary["updated"].append(aid)
+        except Exception as e:
+            summary["errors"].append({"agent": aid, "error": str(e)})
+    return summary
+
+
+def _sync_agile_mcp_to_managed_agents(merged_agents: list[dict[str, Any]]) -> None:
+    """Khi khởi động hoặc sau khi lưu credential: đồng bộ MCP Agile vào config các agent."""
+    rec = _load_mcp_credentials()
+    records = rec.get("records") if isinstance(rec.get("records"), dict) else {}
+    row = records.get("agile-studio")
+    if not isinstance(row, dict):
+        return
+    api_key = str(row.get("api_key") or "").strip()
+    if not api_key:
+        return
+    tools_url = _fix_vite_port_to_mcp(str(row.get("mcp_tools_url") or "").strip())
+    hub = str(row.get("mcp_url") or "").strip()
+    if not tools_url:
+        if hub and not hub.rstrip("/").lower().endswith("/mcp"):
+            tools_url = _derive_tools_url_from_hub_base(hub)
+        elif hub:
+            tools_url = _fix_vite_port_to_mcp(hub.strip().rstrip("/"))
+    env_tools = (os.environ.get("API_CENTER_AGILE_MCP_TOOLS_URL") or "").strip()
+    if env_tools:
+        tools_url = _fix_vite_port_to_mcp(env_tools.strip())
+    tools_url = _prefer_ipv4_loopback_url((tools_url or "").strip())
+    if not tools_url or not _is_valid_http_url(tools_url):
+        print("[api-center] agile MCP: skip agent config sync (missing or invalid mcp_tools_url)", flush=True)
+        return
+    summary = _inject_agile_studio_mcp_into_agent_configs(
+        merged_agents, tools_url=tools_url, api_key=api_key
+    )
+    n_ok = len(summary.get("updated") or [])
+    n_err = len(summary.get("errors") or [])
+    print(
+        f"[api-center] agile MCP: synced agent configs updated={n_ok} errors={n_err}",
+        flush=True,
+    )
+
+
+async def _notify_gateways_reload_mcp() -> dict[str, Any]:
+    """
+    Gọi POST tới URL gateway (mia gateway hoặc ``mia serve``) để reload MCP sau khi đã ghi config.
+
+    Env::
+
+        API_CENTER_GATEWAY_MCP_RELOAD_URLS=http://127.0.0.1:18793/internal/reload-mcp,http://127.0.0.1:8900/internal/reload-mcp
+        API_CENTER_GATEWAY_MCP_RELOAD_SECRET=<cùng giá trị với MIA_GATEWAY_ADMIN_SECRET trên gateway>
+    """
+    urls_raw = (os.environ.get("API_CENTER_GATEWAY_MCP_RELOAD_URLS") or "").strip()
+    secret = (os.environ.get("API_CENTER_GATEWAY_MCP_RELOAD_SECRET") or "").strip()
+    if not urls_raw or not secret:
+        return {"skipped": True, "reason": "set API_CENTER_GATEWAY_MCP_RELOAD_URLS and API_CENTER_GATEWAY_MCP_RELOAD_SECRET"}
+    urls = [u.strip() for u in urls_raw.split(",") if u.strip()]
+    if not urls:
+        return {"skipped": True, "reason": "empty URLs"}
+    headers = {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
+    results: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        for url in urls:
+            try:
+                r = await client.post(url, json={}, headers=headers)
+                body_preview = (r.text or "")[:800]
+                results.append({"url": url, "status_code": r.status_code, "body_preview": body_preview})
+            except Exception as e:
+                results.append({"url": url, "error": f"{type(e).__name__}: {e}"})
+    ok_count = sum(1 for x in results if 200 <= int(x.get("status_code") or 0) < 300)
+    print(f"[api-center] gateway MCP reload notified ok={ok_count}/{len(results)}", flush=True)
+    return {"notified": True, "results": results}
 
 
 def _extract_bearer(authorization: str | None, x_api_key: str | None) -> str:
@@ -394,11 +671,23 @@ def _select_target_agent(
     mentions: list[str],
 ) -> dict[str, Any] | None:
     if target_agent_id:
+        tid = str(target_agent_id).strip().lower()
+        if tid.startswith("ai-"):
+            tid = "mia-" + tid[3:]
         for a in merged_agents:
-            if str(a.get("id")) == target_agent_id:
+            aid = str(a.get("id") or "").strip().lower()
+            if aid == tid:
                 return a
         return None
     mention_set = {m.strip().lower() for m in mentions if isinstance(m, str) and m.strip()}
+    for m in list(mention_set):
+        if m.startswith("miamia-"):
+            mention_set.add("mia-" + m[7:])
+    for m in list(mention_set):
+        if m.startswith("ai-"):
+            mention_set.add("mia-" + m[3:])
+        if m.startswith("mia-"):
+            mention_set.add("ai-" + m[4:])
     for a in merged_agents:
         aid = str(a.get("id") or "").lower()
         if aid and (aid in mention_set or f"@{aid}" in mention_set):
@@ -450,7 +739,68 @@ def _build_notification_message(payload: dict[str, Any], agent_id: str) -> str:
     ]
     if changed_text:
         lines.append(f"- changed_fields: {changed_text}")
-    lines.append("Hãy đọc context và cập nhật hành động phù hợp với vai trò của bạn.")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    hints = data.get("recipient_hints") if isinstance(data.get("recipient_hints"), dict) else {}
+    if hints:
+        aid_norm = str(agent_id).strip().lower()
+        mentioned = hints.get("mentioned_agent_ids") if isinstance(hints.get("mentioned_agent_ids"), list) else []
+        assignees = hints.get("story_assignee_agent_ids") if isinstance(hints.get("story_assignee_agent_ids"), list) else []
+        mentioned_l = {str(x).strip().lower() for x in mentioned}
+        assignees_l = {str(x).strip().lower() for x in assignees}
+        direct_mention = aid_norm in mentioned_l
+        assignee_hit = aid_norm in assignees_l
+        lines.append("")
+        lines.append("Relevance hints (comment/story events):")
+        lines.append(f"- You are explicitly @mentioned in this comment: {direct_mention}")
+        lines.append(f"- You are an AI assignee on this story: {assignee_hit}")
+        excerpt = str(hints.get("comment_excerpt") or "").strip()
+        if excerpt:
+            lines.append("- Comment text:")
+            lines.append(excerpt[:4000])
+        mmap = hints.get("ai_member_ids_by_agent")
+        if isinstance(mmap, dict):
+            mid: int | None = None
+            for k, v in mmap.items():
+                if str(k).strip().lower() == aid_norm:
+                    try:
+                        mid = int(v)
+                    except (TypeError, ValueError):
+                        mid = None
+                    break
+            if mid is not None and mid > 0:
+                lines.append("")
+                lines.append(
+                    f"- Your Agile MCP author_member_id for this project (use with agile_comment_create / chat tools): {mid}"
+                )
+    lines.append("")
+    data_story_id = data.get("story_id")
+    comment_events = {
+        "agile_studio.comment.created",
+        "agile_studio.comment.updated",
+    }
+    if event_type in comment_events and data_story_id is not None:
+        lines.append(
+            "Story-comment thread: **reply on the story** using MCP "
+            "`agile_comment_create(story_id, author_member_id, body=…)` "
+            f"(or `body_text` / `text` / `content` / `message` for the comment text) "
+            f"with story_id={data_story_id} and author_member_id from the hints above when present. "
+            "Use `agile_story_get` for full context. "
+            "If the human asks for a richer description or clarification, **post that text as a new story comment** "
+            "(do not stay silent). "
+            "Use `agile_story_update` only when they explicitly ask to change stored story fields. "
+            "`agile_chat_send` to a **project group channel** (e.g. `general`) is **discouraged** for "
+            "comment-thread answers — the default answer belongs on the story."
+        )
+    else:
+        lines.append(
+            "Read Context JSON (webhook_payload). "
+            "This is an automated **status / project-data** signal — do **not** post to the project's "
+            "**group chat** via MCP `agile_chat_send` (`project_channel` / e.g. `general`); humans "
+            "should not see broadcast noise there. "
+            "If the event is directly relevant (mention / assignee / clear ask in a comment), "
+            "reply via Agile Studio MCP — for story threads prefer `agile_comment_create`. "
+            "Otherwise note briefly in your queue reply only — don't spam any channel."
+        )
     return "\n".join(lines)
 
 
@@ -535,13 +885,13 @@ async def _send_reply_via_mcp(
     payload: dict[str, Any],
 ) -> tuple[bool, str]:
     api_key = str(mcp_row.get("api_key") or "").strip()
-    mcp_url = str(mcp_row.get("mcp_url") or "").strip()
-    if not api_key or not mcp_url:
+    reply_base = _reply_dispatch_base_url(mcp_row)
+    if not api_key or not reply_base:
         return False, "missing mcp_url/api_key"
     path = (os.environ.get("API_CENTER_MCP_REPLY_PATH") or "/agent-chat/reply").strip()
     if not path.startswith("/"):
         path = "/" + path
-    url = mcp_url.rstrip("/") + path
+    url = reply_base.rstrip("/") + path
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -632,6 +982,13 @@ async def _process_chat_dispatch(
     )
     should = _should_respond(channel_type, agent)
     selected_agent_id = str(agent.get("id")) if isinstance(agent, dict) else None
+    _chat_dbg(
+        "select_agent",
+        f"target_agent_id={target_agent_id!r}",
+        f"selected_agent_id={selected_agent_id!r}",
+        f"should_respond={should}",
+        f"mentions={mentions!r}",
+    )
 
     reply_text = ""
     agent_task_id: str | None = None
@@ -667,10 +1024,23 @@ async def _process_chat_dispatch(
                     reply_text = done_text[:12000]
                 elif done_state == "failed":
                     reply_text = f"[{who}] processing error: {done_text}"
+                elif done_state == "timeout":
+                    reply_text = (
+                        f"[{who}] No reply within the wait window. "
+                        "The task was enqueued on the selected agent's working queue (`"
+                        f"{who}`); if API Center `--start-agents` only launches other agents, nothing "
+                        "consumes this queue — add this id to `--agent-ids`, or run `python start.py` "
+                        "(Python 3.11+) from that agent's workspace directory. "
+                        f"Task `{task_id}` is still in the queue. "
+                        "Increase `API_CENTER_CHAT_WAIT_TIMEOUT_S` (default 45) if the LLM run is slow. "
+                        "If the agent process is running but this persists, ensure `working_queue.enabled` is "
+                        "true in that agent's `config/config.json` (otherwise the gateway never drains the queue). "
+                        f"Details: {done_text}"
+                    )
                 else:
                     reply_text = (
                         f"[{who}] received request and is processing. "
-                        f"Mã task: {task_id}"
+                        f"Task ID: {task_id}"
                     )
             else:
                 reply_text = (
@@ -714,12 +1084,22 @@ async def _process_chat_dispatch(
             "message_preview": message[:240],
         }
     )
+    # Luôn in (không cần API_CENTER_CHAT_DEBUG) — để terminal có dòng khi có request chat.
+    print(
+        "[api-center][chat-result]"
+        f" trace_id={trace_id}"
+        f" should_respond={should}"
+        f" selected_agent_id={selected_agent_id!r}"
+        f" reply_chars={len(reply_text)}"
+        f" dispatch_status={agent_dispatch_status!r}",
+        flush=True,
+    )
     return result
 
 
 def require_session(
-    authorization: str | None = Header(default=None),
-    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
 ) -> str:
     token = _extract_bearer(authorization, x_api_key)
     if not token:
@@ -784,10 +1164,24 @@ def _pick_agents_to_start(merged_agents: list[dict[str, Any]], raw_ids: str) -> 
 def _start_agent_processes(merged_agents: list[dict[str, Any]], args: argparse.Namespace) -> list[subprocess.Popen[Any]]:
     if not args.start_agents:
         return []
-    targets = _pick_agents_to_start(merged_agents, str(args.agent_ids or ""))
+    raw_ids = str(args.agent_ids or "").strip()
+    targets = _pick_agents_to_start(merged_agents, raw_ids)
     if not targets:
         print("[api-center] --start-agents enabled but no matching agents selected.", flush=True)
         return []
+    if raw_ids:
+        started = {str(r.get("id") or "").strip().lower() for r in targets if str(r.get("id") or "").strip()}
+        catalog_ids = [
+            str(r.get("id") or "").strip().lower() for r in merged_agents if str(r.get("id") or "").strip()
+        ]
+        not_started = sorted({x for x in catalog_ids if x not in started})
+        if not_started:
+            print(
+                "[api-center] --agent-ids is a subset: Agile chat or webhooks targeting agents that are "
+                "not started here will time out until you add them to --agent-ids or run `python start.py` "
+                f"in that workspace. Started: {sorted(started)}; not started: {not_started}",
+                flush=True,
+            )
     extra = shlex.split(str(args.agent_start_args or "").strip())
     procs: list[subprocess.Popen[Any]] = []
     for row in targets:
@@ -825,11 +1219,22 @@ def _stop_agent_processes(procs: list[subprocess.Popen[Any]]) -> None:
                 pass
 
 
+def _normalize_public_http_base(env_val: str | None, request: Request) -> str:
+    """HTTP base URL cho link trong JSON (browser). Nếu env thiếu scheme (vd. localhost:18881), thêm http://."""
+    s = (env_val or "").strip()
+    if not s:
+        return f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+    low = s.lower()
+    if low.startswith("https://") or low.startswith("http://"):
+        return s.rstrip("/")
+    return f"http://{s.lstrip('/')}".rstrip("/")
+
+
 def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
     app = FastAPI(title="API Center", version="1")
 
     def _base_urls(request: Request) -> tuple[str, str]:
-        http_base = os.environ.get("API_CENTER_PUBLIC_BASE_URL") or f"{request.url.scheme}://{request.url.netloc}"
+        http_base = _normalize_public_http_base(os.environ.get("API_CENTER_PUBLIC_BASE_URL"), request)
         if http_base.startswith("https://"):
             ws_base = "wss://" + http_base[len("https://") :]
         elif http_base.startswith("http://"):
@@ -904,14 +1309,19 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Root must be JSON object")
         server_id = str(payload.get("mcp_server_id") or payload.get("server_id") or "agile-studio").strip()
-        mcp_url = str(payload.get("mcp_url") or payload.get("url") or "").strip()
         api_key = str(payload.get("api_key") or "").strip()
         if not server_id:
             raise HTTPException(status_code=400, detail="mcp_server_id is required")
-        if not mcp_url or not _is_valid_http_url(mcp_url):
-            raise HTTPException(status_code=400, detail="mcp_url must be a valid http/https URL")
         if not api_key:
             raise HTTPException(status_code=400, detail="api_key is required")
+        try:
+            hub_reply, mcp_tools = _normalize_mcp_hub_and_tools_urls(payload)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if not _is_valid_http_url(hub_reply):
+            raise HTTPException(status_code=400, detail="hub reply base URL must be valid http/https")
+        if not _is_valid_http_url(mcp_tools):
+            raise HTTPException(status_code=400, detail="mcp_tools_url must be valid http/https")
 
         rec = _load_mcp_credentials()
         records = rec.setdefault("records", {})
@@ -923,16 +1333,44 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
         created_at = now
         if isinstance(existing, dict) and isinstance(existing.get("created_at"), (int, float)):
             created_at = float(existing["created_at"])
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         records[server_id] = {
             "mcp_server_id": server_id,
-            "mcp_url": mcp_url,
+            "mcp_url": hub_reply,
+            "hub_reply_base_url": hub_reply,
+            "mcp_tools_url": mcp_tools,
             "api_key": api_key,
             "created_at": created_at,
             "updated_at": now,
-            "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+            "metadata": meta,
         }
         _persist_mcp_credentials(rec)
-        return {"ok": True, "mcp_server_id": server_id, "mcp_url": mcp_url, "stored": True, "updated_at": now}
+        agent_sync: dict[str, Any] | None = None
+        if server_id == "agile-studio":
+            agent_sync = _inject_agile_studio_mcp_into_agent_configs(
+                merged_agents, tools_url=mcp_tools, api_key=api_key
+            )
+            print(
+                "[api-center] agile MCP: injected into agent configs "
+                f"updated={len(agent_sync.get('updated') or [])} errors={len(agent_sync.get('errors') or [])}",
+                flush=True,
+            )
+        gateway_reload: dict[str, Any] | None = None
+        if server_id == "agile-studio":
+            gateway_reload = await _notify_gateways_reload_mcp()
+        out: dict[str, Any] = {
+            "ok": True,
+            "mcp_server_id": server_id,
+            "mcp_url": hub_reply,
+            "mcp_tools_url": mcp_tools,
+            "stored": True,
+            "updated_at": now,
+        }
+        if agent_sync is not None:
+            out["agent_config_sync"] = agent_sync
+        if gateway_reload is not None:
+            out["gateway_reload"] = gateway_reload
+        return out
 
     @app.get("/v1/mcp/credentials/{server_id}")
     async def mcp_get(server_id: str, _: str = Depends(require_session)) -> dict[str, Any]:
@@ -948,6 +1386,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
         return {
             "mcp_server_id": server_id,
             "mcp_url": row.get("mcp_url"),
+            "mcp_tools_url": row.get("mcp_tools_url"),
             "has_api_key": bool(api_key),
             "api_key_masked": masked,
             "created_at": row.get("created_at"),
@@ -960,6 +1399,12 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
         if isinstance(payload, dict):
             _console_inbound_chat(payload, "http")
         result = await _process_chat_dispatch(payload=payload, merged_agents=merged_agents)
+        _chat_dbg(
+            "http_dispatch_result",
+            f"should_respond={result.get('should_respond')}",
+            f"reply_len={len(str(result.get('reply_text') or ''))}",
+            f"agent_dispatch_status={result.get('agent_dispatch_status')!r}",
+        )
         delivery_mode = "none"
         delivery_status = "skipped"
         if result.get("should_respond"):
@@ -1006,36 +1451,54 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
 
     @app.websocket("/ws/agent-chat")
     async def ws_agent_chat(websocket: WebSocket) -> None:
+        """Bidirectional chat bridge **browser ⇄ API Center** (not agent ⇄ API Center).
+
+        Client → server: ``{"event":"chat.message.created","payload":{...}}``.
+        Server → client: ``chat.connected``, ``chat.agent.ack``, ``chat.agent.reply`` (includes ``reply_text``),
+        ``chat.agent.error``. Agent work runs via working-queue + subprocess gateway; replies return on this socket after dispatch completes.
+        """
         token = websocket.query_params.get("session_key", "").strip()
         if not token:
             auth = websocket.headers.get("authorization") or ""
             if auth.startswith("Bearer "):
                 token = auth[7:].strip()
         if not token or not _session_valid(token):
+            _chat_dbg("ws_agent_chat", "reject", "401_missing_or_invalid_session")
             await websocket.close(code=4401)
             return
         await websocket.accept()
+        _chat_dbg("ws_agent_chat", "accepted", f"session_prefix={(token[:12] + '…') if len(token) > 12 else token!r}")
         await websocket.send_json({"event": "chat.connected", "ok": True})
         try:
             while True:
                 data = await websocket.receive_json()
                 if not isinstance(data, dict):
+                    _chat_dbg("ws_recv", "invalid_payload_non_object")
                     await websocket.send_json({"event": "chat.agent.error", "error": "invalid payload"})
                     continue
                 ev = str(data.get("event") or "").strip()
                 if ev != "chat.message.created":
+                    _chat_dbg("ws_recv", "unsupported_event", repr(ev))
                     await websocket.send_json({"event": "chat.agent.error", "error": "unsupported event"})
                     continue
                 payload = data.get("payload")
                 if not isinstance(payload, dict):
+                    _chat_dbg("ws_recv", "payload_not_object")
                     await websocket.send_json({"event": "chat.agent.error", "error": "payload must be object"})
                     continue
                 _console_inbound_chat(payload, "ws")
                 try:
                     result = await _process_chat_dispatch(payload=payload, merged_agents=merged_agents)
                 except HTTPException as he:
+                    _chat_dbg("ws_dispatch_http_exc", he.status_code, str(he.detail))
                     await websocket.send_json({"event": "chat.agent.error", "error": str(he.detail), "status": he.status_code})
                     continue
+                _chat_dbg(
+                    "ws_dispatch_result",
+                    f"should_respond={result.get('should_respond')}",
+                    f"reply_len={len(str(result.get('reply_text') or ''))}",
+                    f"dispatch_status={result.get('agent_dispatch_status')!r}",
+                )
                 await websocket.send_json({"event": "chat.agent.ack", **result})
                 if result.get("should_respond"):
                     rec = _load_mcp_credentials()
@@ -1065,9 +1528,12 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
                             "delivery_status": status,
                         }
                     )
+                    _chat_dbg("ws_reply_sent", f"delivery_mode={mode}", f"delivery_status={status!r}")
         except WebSocketDisconnect:
+            _chat_dbg("ws_agent_chat", "disconnect", "client_closed")
             return
         except Exception as e:
+            _chat_dbg("ws_agent_chat", "exception", type(e).__name__, str(e))
             await websocket.send_json({"event": "chat.agent.error", "error": f"{type(e).__name__}: {e}"})
             await websocket.close(code=1011)
 
@@ -1095,10 +1561,31 @@ def main() -> int:
         return 1
 
     _init_storage((args.data_dir or DATA_DIR_DEFAULT).resolve())
+    _sync_agile_mcp_to_managed_agents(merged_agents)
+    env_file = (args.env or ROOT / ".env").resolve()
+    print(
+        "[api-center] startup"
+        f" env_file={env_file}"
+        f" chat_debug={_chat_debug_enabled()}"
+        f" port={args.port}",
+        flush=True,
+    )
+    print(
+        "[api-center] Khi có chat @agent, terminal sẽ có [api-center][chat-inbound] và [api-center][chat-result].",
+        flush=True,
+    )
     app = create_app(merged_agents)
     agent_procs = _start_agent_processes(merged_agents, args)
     try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            # Giữ WS sống khi chờ agent (LLM + queue có thể >45s); tránh proxy/ngắt idle.
+            ws_ping_interval=25.0,
+            ws_ping_timeout=25.0,
+        )
     finally:
         _stop_agent_processes(agent_procs)
     return 0

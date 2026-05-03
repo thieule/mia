@@ -100,7 +100,7 @@ class WorkingQueueService:
         if not isinstance(wtask, WorkingQueueTaskPayload):
             return
         key = session_key_for_project(wtask.project_id)
-        user_text = build_process_prompt(wtask)
+        user_text = build_process_prompt(wtask, workspace=self.workspace)
         kind = wtask.item_kind
         logger.info(
             "Working queue: item {} kind={} project={} session={}",

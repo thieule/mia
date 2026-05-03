@@ -2,8 +2,8 @@
   "agents": {
     "defaults": {
       "workspace": "./workspace",
-      "model": "${OPENROUTER_MODEL}",
-      "provider": "openrouter",
+      "model": "${GEMINI_MODEL}",
+      "provider": "gemini",
       "timezone": "UTC"
     }
   },
@@ -12,15 +12,19 @@
       "apiKey": "${OPENROUTER_API_KEY}"
     },
     "gemini": {
-      "apiKey": ""
+      "apiKey": "${GEMINI_API_KEY}"
     }
   },
   "channels": {
     "discord": {
       "enabled": false,
       "token": "${DISCORD_BOT_TOKEN_MIA_BA}",
-      "allowFrom": ["*"],
-      "adminUserIds": ["${DISCORD_ADMIN_USER_IDS}"],
+      "allowFrom": [
+        "*"
+      ],
+      "adminUserIds": [
+        "${DISCORD_ADMIN_USER_IDS}"
+      ],
       "groupPolicy": "open",
       "streaming": true,
       "intents": 37377,
@@ -31,6 +35,11 @@
   },
   "gateway": {
     "port": 18793
+  },
+  "working_queue": {
+    "enabled": true,
+    "interval_s": 3,
+    "max_tasks_per_tick": 2
   },
   "tools": {
     "restrictToWorkspace": true,
@@ -47,14 +56,18 @@
     "mcpServers": {
       "registry": {
         "command": "python",
-        "args": ["../ai-tools/registry/server.py"],
+        "args": [
+          "../ai-tools/registry/server.py"
+        ],
         "env": {
           "AI_TOOL_SECRET": "${AI_TOOL_SECRET}"
         }
       },
       "pytest_runner": {
         "command": "python",
-        "args": ["../ai-tools/servers/pytest_runner/server.py"],
+        "args": [
+          "../ai-tools/servers/pytest_runner/server.py"
+        ],
         "env": {
           "AI_TOOL_SECRET": "${AI_TOOL_SECRET}",
           "TEST_RUNS_PATH": "${TEST_RUNS_PATH_MIA_BA}"
@@ -65,6 +78,17 @@
         "headers": {
           "Authorization": "${GITHUB_MCP_AUTH_HEADER}"
         }
+      },
+      "agile-studio": {
+        "type": "streamableHttp",
+        "url": "http://127.0.0.1:9121/mcp",
+        "headers": {
+          "Authorization": "Bearer mcp_pClGg2_YlJWZJgYyJS-A5vLM1vwUBIQ8"
+        },
+        "toolTimeout": 30,
+        "enabledTools": [
+          "*"
+        ]
       }
     }
   }

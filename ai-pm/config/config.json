@@ -32,6 +32,11 @@
   "gateway": {
     "port": 18797
   },
+  "working_queue": {
+    "enabled": true,
+    "interval_s": 3,
+    "max_tasks_per_tick": 2
+  },
   "tools": {
     "restrictToWorkspace": true,
     "exec": {

@@ -1,0 +1,259 @@
+"""Mirror browser chat behaviour after MCP posts a message: notify API Center so @mentions enqueue agents."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from agile_hub import api_center_client, crud
+
+log = logging.getLogger(__name__)
+
+
+def _mention_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for m in re.finditer(r"@([^\s@]+)", text or ""):
+        tok = (m.group(1) or "").strip().lower()
+        tok = re.sub(r"[.,;:!?)\]]+$", "", tok)
+        if tok:
+            out.append(tok)
+    return list(dict.fromkeys(out))
+
+
+def _channel_id_for_dispatch(
+    *,
+    project_id: int,
+    target_kind: str,
+    channel_name: str | None,
+    sender_user_id: int,
+    user_id: int,
+) -> str:
+    tk = (target_kind or "").strip().lower()
+    if tk == "project_channel":
+        name = (channel_name or "general").strip() or "general"
+        return f"{project_id}_{name}"
+    peer = int(user_id or 0)
+    viewer = int(sender_user_id or 0)
+    if peer > 0 and viewer > 0:
+        lo = min(peer, viewer)
+        hi = max(peer, viewer)
+        return f"{project_id}_dm_{lo}_{hi}"
+    return f"{project_id}_{viewer}"
+
+
+def _normalize_catalog_agent_id(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    if s.startswith("ai-"):
+        return "mia-" + s[3:]
+    return s
+
+
+def _dm_peer_user_id_for_agent_send(
+    target_kind: str,
+    room_user_id: int,
+    agent_member_id: int,
+    original_sender_id: int,
+) -> int | None:
+    """Match web ``dmPeerUserIdForAgentSend`` for ``SendMessageDto.userId`` in DM."""
+    if (target_kind or "").strip().lower() != "private_user":
+        return None
+    s = int(agent_member_id or 0)
+    other = int(room_user_id or 0)
+    me = int(original_sender_id or 0)
+    if not s or not other or not me:
+        return other if other else None
+    if s == other:
+        return me
+    if s == me:
+        return other
+    return other
+
+
+def _post_agent_reply_to_chat_service(
+    *,
+    project_id: int,
+    target_kind: str,
+    channel_name: str | None,
+    user_id: int,
+    original_sender_id: int,
+    agent_member_id: int,
+    sender_name: str,
+    content: str,
+) -> None:
+    base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
+    if not base:
+        log.warning("chat_api_center_bridge: AGILE_CHAT_SERVICE_URL unset, cannot post agent reply to chat")
+        return
+    tk = (target_kind or "").strip().lower()
+    body: dict[str, Any] = {
+        "projectId": int(project_id),
+        "targetKind": tk,
+        "senderUserId": int(agent_member_id),
+        "senderName": (sender_name or "").strip() or None,
+        "content": content[:4000],
+    }
+    if tk == "project_channel":
+        body["channelName"] = (channel_name or "general").strip() or "general"
+    else:
+        peer = _dm_peer_user_id_for_agent_send(tk, user_id, agent_member_id, original_sender_id)
+        if peer and int(peer) > 0:
+            body["userId"] = int(peer)
+    url = f"{base}/api/chat/messages"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            sc = int(getattr(resp, "status", None) or resp.getcode() or 0)
+            if not (200 <= sc < 300):
+                raw = resp.read().decode("utf-8", errors="replace")[:400]
+                log.warning("chat_api_center_bridge: chat-service POST %s %s", sc, raw)
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="replace")[:500]
+        log.warning("chat_api_center_bridge: chat-service HTTP %s: %s", e.code, msg)
+    except urllib.error.URLError as e:
+        log.warning("chat_api_center_bridge: chat-service unreachable: %s", e.reason)
+
+
+def _dispatch_sync(
+    db: Session,
+    *,
+    project_id: int,
+    target_kind: str,
+    channel_name: str | None,
+    user_id: int,
+    sender_user_id: int,
+    sender_name: str | None,
+    content: str,
+) -> dict[str, Any]:
+    toks = _mention_tokens(content)
+    if not toks:
+        return {"ok": False, "skipped": "no_mentions"}
+
+    row = crud.api_center_connection_get(db)
+    if row is None or not (row.session_key or "").strip():
+        return {"ok": False, "skipped": "api_center_not_connected"}
+
+    p = crud.project_get(db, project_id)
+    if p is None:
+        return {"ok": False, "skipped": "project_not_found"}
+
+    ch_id = _channel_id_for_dispatch(
+        project_id=project_id,
+        target_kind=target_kind,
+        channel_name=channel_name,
+        sender_user_id=sender_user_id,
+        user_id=user_id,
+    )
+    ct = "direct" if (target_kind or "").strip().lower() == "private_user" else "group"
+    trace_id = f"mcp_chat_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    payload: dict[str, Any] = {
+        "trace_id": trace_id,
+        "project_id": str(project_id),
+        "project_context": {
+            "name": getattr(p, "name", None) or f"Project {project_id}",
+            "id": project_id,
+            "slug": getattr(p, "slug", None),
+            "workspace_ref": getattr(p, "workspace_ref", None),
+        },
+        "channel_id": ch_id,
+        "channel_type": ct,
+        "sender": {"id": str(sender_user_id), "name": (sender_name or "").strip()},
+        "message": content,
+        "mentions": toks,
+        "conversation_history": [],
+    }
+    try:
+        out = api_center_client.chat_dispatch(row.endpoint, row.session_key or "", payload)
+        log.debug(
+            "chat_api_center_bridge dispatch trace_id=%s should_respond=%s",
+            trace_id,
+            (out or {}).get("should_respond"),
+        )
+        ads = str((out or {}).get("agent_dispatch_status") or "")
+        reply = str((out or {}).get("reply_text") or "").strip()
+        sel_agent = _normalize_catalog_agent_id(str((out or {}).get("selected_agent_id") or ""))
+        if (
+            (out or {}).get("should_respond")
+            and ":done" in ads
+            and reply
+            and sel_agent
+        ):
+            mmap = crud.project_ai_agent_member_ids_map(db, project_id)
+            agent_mid = None
+            for k, v in mmap.items():
+                if str(k).strip().lower() == sel_agent:
+                    agent_mid = int(v)
+                    break
+            if agent_mid and agent_mid > 0:
+                mem = crud.member_get(db, agent_mid)
+                dn = (getattr(mem, "display_name", None) or "").strip() if mem else ""
+                post_name = dn or sel_agent
+                _post_agent_reply_to_chat_service(
+                    project_id=project_id,
+                    target_kind=target_kind,
+                    channel_name=channel_name,
+                    user_id=int(user_id or 0),
+                    original_sender_id=int(sender_user_id),
+                    agent_member_id=agent_mid,
+                    sender_name=post_name,
+                    content=reply,
+                )
+            else:
+                log.warning(
+                    "chat_api_center_bridge: no project member for selected_agent_id=%s",
+                    sel_agent,
+                )
+        return {"ok": True, "trace_id": trace_id, "dispatch": out}
+    except ValueError as e:
+        log.warning("chat_api_center_bridge dispatch failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def schedule_dispatch_after_mcp_chat_message(
+    *,
+    project_id: int,
+    target_kind: str,
+    channel_name: str | None,
+    user_id: int,
+    sender_user_id: int,
+    sender_name: str | None,
+    content: str,
+) -> None:
+    """Run API Center chat dispatch in a daemon thread (MCP tool must not block on agent wait)."""
+    if not _mention_tokens(content):
+        return
+
+    def _run() -> None:
+        from agile_hub.db import session_scope
+
+        try:
+            with session_scope() as db:
+                _dispatch_sync(
+                    db,
+                    project_id=project_id,
+                    target_kind=target_kind,
+                    channel_name=channel_name,
+                    user_id=user_id,
+                    sender_user_id=sender_user_id,
+                    sender_name=sender_name,
+                    content=content,
+                )
+        except Exception as e:
+            log.warning("chat_api_center_bridge background task: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
