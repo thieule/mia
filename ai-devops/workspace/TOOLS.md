@@ -7,6 +7,7 @@
   - **`registry`** — discover tools: `mcp_registry_find_tools`, `mcp_registry_list_all_tools` (use to validate new DevOps MCPs after config changes).
   - **`pytest_runner`** — when automation or app code is in scope; reports under `TEST_RUNS_PATH_MIA_DEVOPS` (default `workspace/agent/test-runs/`).
   - **`github`** — workflows, issues, API-oriented tasks when `GITHUB_MCP_AUTH_HEADER` is set.
+  - **`linux_deploy`** — **`mcp_linux_deploy_ssh_exec`**, **`mcp_linux_deploy_rsync_upload`**, **`mcp_linux_deploy_deploy_allowed_hosts`** — remote Linux via SSH/rsync when **`LINUX_DEPLOY_ALLOWED_HOSTS`** is set on the gateway (`toolTimeout` 600s). Requires `ssh` / `rsync` on PATH and key-based auth.
 
 ## Workspace boundary
 

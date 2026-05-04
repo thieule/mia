@@ -116,6 +116,8 @@ class WebSearchTool(Tool):
             return await self._search_brave(query, n)
         elif provider == "kagi":
             return await self._search_kagi(query, n)
+        elif provider == "wikipedia":
+            return await self._search_wikipedia(query, n)
         else:
             return f"Error: unknown search provider '{provider}'"
 
@@ -228,6 +230,45 @@ class WebSearchTool(Tool):
             return _format_results(query, items, n)
         except Exception as e:
             return f"Error: {e}"
+
+    async def _search_wikipedia(self, query: str, n: int) -> str:
+        """MediaWiki full-text search — no API key (respect Wikimedia User-Agent policy)."""
+        origin = (os.environ.get("WIKIPEDIA_ORIGIN") or "https://en.wikipedia.org").strip().rstrip("/")
+        if not origin.startswith(("http://", "https://")):
+            origin = "https://" + origin.lstrip("/")
+        api_url = f"{origin}/w/api.php"
+        ok, err = _validate_url_safe(api_url)
+        if not ok:
+            return f"Error: invalid Wikipedia API URL: {err}"
+        try:
+            params = {
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": min(n, 50),
+                "format": "json",
+                "formatversion": "2",
+            }
+            async with httpx.AsyncClient(proxy=self.proxy) as client:
+                r = await client.get(
+                    api_url,
+                    params=params,
+                    headers={"User-Agent": f"{USER_AGENT} MiaBA/1.0 (research)"},
+                    timeout=min(float(self.config.timeout), 30.0),
+                )
+                r.raise_for_status()
+            rows = r.json().get("query", {}).get("search", []) or []
+            items: list[dict[str, Any]] = []
+            for row in rows[:n]:
+                title = row.get("title") or ""
+                snippet = _strip_tags(row.get("snippet") or "")
+                slug = title.replace(" ", "_")
+                page_url = f"{origin}/wiki/{quote(slug, safe='/:%()')}"
+                items.append({"title": title, "url": page_url, "content": snippet})
+            return _format_results(query, items, n)
+        except Exception as e:
+            logger.warning("Wikipedia search failed ({}), falling back to DuckDuckGo", e)
+            return await self._search_duckduckgo(query, n)
 
     async def _search_duckduckgo(self, query: str, n: int) -> str:
         try:

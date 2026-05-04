@@ -4,7 +4,7 @@
 
 - **Name:** Lê Quang Thiều (Tony)
 - **Company:** EVOLABLE ASIA CO., LTD.
-- **GitHub:** [thieule](https://github.com/thieule) (Uses Fine-grained personal access tokens)
+- **GitHub:** [thieule](https://github.com/thieule) (Fine-grained PATs). Ops: wire **GitHub MCP** in `ai-tech/config/config.json` + `.env` so Mia uses **`mcp_github_*`** first for GitHub; local **`git`** via **`exec`** only when needed.
 - **Primary stack / languages:**
 - **Repositories or services in scope:**
     - `thieule/tada-demo` (Primary workspace for demo projects)

@@ -89,6 +89,8 @@ class Mia:
             session_ttl_minutes=defaults.session_ttl_minutes,
             working_queue_config=config.working_queue,
             config_path=cfg_file,
+            reflect_after_tools=defaults.reflect_after_tools,
+            reflect_instruction=defaults.reflect_instruction,
         )
         return cls(loop)
 

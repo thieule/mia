@@ -24,6 +24,22 @@ LENGTH_RECOVERY_PROMPT = (
     "— no recap, no apology. Break remaining work into smaller steps if needed."
 )
 
+# Ephemeral user message injected after tool results to steer Plan→Act→Observe→Reflect.
+REFLECTION_NUDGE_PREFIX = "[Mia reflection checkpoint — ephemeral]\n\n"
+
+
+def build_reflection_nudge_message(body: str) -> dict[str, str]:
+    """Return a synthetic user message seen by the model on the next iteration only."""
+    return {"role": "user", "content": f"{REFLECTION_NUDGE_PREFIX}{body.strip()}"}
+
+
+def is_ephemeral_reflection_message(message: dict[str, Any]) -> bool:
+    """True for in-turn reflection nudges that must not be persisted to session history."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and content.startswith(REFLECTION_NUDGE_PREFIX)
+
 
 def empty_tool_result_message(tool_name: str) -> str:
     """Short prompt-safe marker for tools that completed without visible output."""

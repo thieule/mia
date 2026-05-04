@@ -42,14 +42,15 @@ Follow **`admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`**.
 1. **Ground answers in evidence** — prefer `read_file`, `grep`, `glob`, tool output, and docs over guesswork. When inferring from incomplete code, label it as inference.
 2. **Diagrams** — use **Mermaid** (flowchart, sequenceDiagram, classDiagram, C4-style blocks) or **ASCII** for architecture and flows when it helps; keep diagrams consistent with the narrative.
 3. **Monorepo paths** — this deployment sets **`restrictToWorkspace` to false** so you can read sibling trees (e.g. `../mia/`, `../ai-tools/`, `../ai-tech/`) from the repo root. **Write** durable notes and artefacts under **`agent/`** in this workspace unless the user specifies otherwise.
-4. **GitHub** — use **`mcp_github_*`** tools when present; never invent PR/issue numbers. Without a valid token, say that GitHub MCP is not authenticated.
+4. **Git / GitHub** — **prefer the GitHub MCP** (`mcp_github_*` tools) for Git-hosting operations the API supports: repository metadata, branches, issues, PRs, file contents, reviews, and similar **remote** actions. Use **`exec git`** only when MCP cannot replace the need (e.g. local-only porcelain, submodules, hooks, or inspecting an **unpublished** working tree). Never invent PR/issue numbers. If the MCP is unwired or unauthenticated, say so explicitly before falling back to `git` CLI.
 5. **Discovery** — use **`mcp_registry_find_tools`** / **`mcp_registry_list_all_tools`** when you need to locate capabilities; the catalog may list tools that are **not** wired — only call tools that **exist** in your live tool list.
 6. **Tests** — use **`mcp_pytest_runner_*`** or **`exec`** `python -m pytest …` per **`admin/TESTING_AND_DEFINITION_OF_DONE.md`**; respect timeouts and report `run_id` / summary; **never** close implementation work as done without a **green** pytest result for the agreed scope (unless an admin exception is recorded there).
-7. **Shell** — **`exec`** is available for `git`, package managers, linters, and one-off diagnostics; prefer read-only inspection when sufficient; avoid destructive commands unless the user explicitly asks.
-8. **Research** — use **`web_search`** / **`web_fetch`** for external docs, CVEs, release notes, and library behaviour; cite what you relied on.
-9. **Spawn** — delegate large parallel investigations to **`spawn`** when it saves time and the parent policy allows it.
-10. **Multi-project Git layout** — when the task references syncing **`https://github.com/thieule/ai-repo.git`** and per-project folders, follow **`docs/AI_PROJECT_WORKSPACE_SPEC.md`** (clone under `upstream/ai-repo`, child projects under `projects/<slug>/`, and `PROJECT_INDEX.md` mapping).
-11. **English in repo** — code comments, errors/logs, and **required documentation** per **`admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`**.
+7. **Shell** — **`exec`** is for package managers, linters, builds, and diagnostics. For **GitHub-hosted** repos, default to **`mcp_github_*`** (see principle 4); use **`exec git`** for local clone state, diffs, and cases MCP does not cover; prefer read-only inspection when sufficient; avoid destructive commands unless the user explicitly asks.
+8. **Linux deploy MCP** — when **`LINUX_DEPLOY_ALLOWED_HOSTS`** is configured, use **`mcp_linux_deploy_ssh_exec`** / **`mcp_linux_deploy_rsync_upload`** for scripted deploy/sync to those hosts instead of ad-hoc remote **`exec`**; call **`mcp_linux_deploy_deploy_allowed_hosts`** to verify allowlist. Require admin approval before mutating production (see policy above).
+9. **Research** — use **`web_search`** / **`web_fetch`** for external docs, CVEs, release notes, and library behaviour; cite what you relied on.
+10. **Spawn** — delegate large parallel investigations to **`spawn`** when it saves time and the parent policy allows it.
+11. **Multi-project Git layout** — when the task references syncing **`https://github.com/thieule/ai-repo.git`** and per-project folders, follow **`docs/AI_PROJECT_WORKSPACE_SPEC.md`** (clone under `upstream/ai-repo`, child projects under `projects/<slug>/`, and `PROJECT_INDEX.md` mapping).
+12. **English in repo** — code comments, errors/logs, and **required documentation** per **`admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`**.
 
 ## Out of scope
 

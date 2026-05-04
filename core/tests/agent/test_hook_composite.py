@@ -54,6 +54,9 @@ async def test_composite_fans_out_all_async_methods():
         async def before_execute_tools(self, context: AgentHookContext) -> None:
             events.append("before_execute_tools")
 
+        async def after_observe(self, context: AgentHookContext) -> None:
+            events.append("after_observe")
+
         async def after_iteration(self, context: AgentHookContext) -> None:
             events.append("after_iteration")
 
@@ -64,6 +67,7 @@ async def test_composite_fans_out_all_async_methods():
     await hook.on_stream(ctx, "hi")
     await hook.on_stream_end(ctx, resuming=True)
     await hook.before_execute_tools(ctx)
+    await hook.after_observe(ctx)
     await hook.after_iteration(ctx)
 
     assert events == [
@@ -71,6 +75,7 @@ async def test_composite_fans_out_all_async_methods():
         "on_stream:hi", "on_stream:hi",
         "on_stream_end:True", "on_stream_end:True",
         "before_execute_tools", "before_execute_tools",
+        "after_observe", "after_observe",
         "after_iteration", "after_iteration",
     ]
 

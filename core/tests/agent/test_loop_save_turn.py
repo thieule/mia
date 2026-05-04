@@ -1,6 +1,7 @@
 from mia.agent.context import ContextBuilder
 from mia.agent.loop import AgentLoop
 from mia.session.manager import Session
+from mia.utils.runtime import build_reflection_nudge_message
 
 
 def _mk_loop() -> AgentLoop:
@@ -9,6 +10,17 @@ def _mk_loop() -> AgentLoop:
 
     loop.max_tool_result_chars = AgentDefaults().max_tool_result_chars
     return loop
+
+
+def test_save_turn_skips_ephemeral_reflection_nudge() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:reflect-skip")
+    loop._save_turn(
+        session,
+        [build_reflection_nudge_message("Brief checkpoint.")],
+        skip=0,
+    )
+    assert session.messages == []
 
 
 def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:

@@ -609,6 +609,8 @@ def serve(
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         working_queue_config=runtime_config.working_queue,
         config_path=serve_cfg_path,
+        reflect_after_tools=runtime_config.agents.defaults.reflect_after_tools,
+        reflect_instruction=runtime_config.agents.defaults.reflect_instruction,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -757,6 +759,8 @@ def gateway(
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         working_queue_config=config.working_queue,
         config_path=gateway_cfg_path,
+        reflect_after_tools=config.agents.defaults.reflect_after_tools,
+        reflect_instruction=config.agents.defaults.reflect_instruction,
     )
 
     # Set cron callback (needs agent)
@@ -1043,6 +1047,8 @@ def agent(
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         working_queue_config=config.working_queue,
         config_path=agent_cfg_path,
+        reflect_after_tools=config.agents.defaults.reflect_after_tools,
+        reflect_instruction=config.agents.defaults.reflect_instruction,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

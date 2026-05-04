@@ -2,7 +2,7 @@
 
 **Tên gọi chính thức:** **Mia BA** (M + BA in hoa). Thư mục triển khai: `ai-ba/`.
 
-Standalone deployment for **Mia BA** — a **business analysis** assistant: requirements, user stories, acceptance criteria, process and data flows (Mermaid), stakeholder comms, gap analysis, prioritisation, and **research** via web + GitHub MCP when configured.
+Standalone deployment for **Mia BA** — a **business analysis** assistant: customer needs analysis, requirements discovery, **research** (web + GitHub MCP when configured), **long-form specs** (markdown under `workspace/agent/`), **phased planning** and traceability, user stories, acceptance criteria, process and data flows (Mermaid), stakeholder comms, gap analysis, and prioritisation. Deep engagements follow **`workspace/project/BA_DELIVERY_PLAYBOOK.md`**. Project specs should live in **Git** using **`agile_project_get`** / **`agile_projects_list`** (Agile Studio MCP) for `github_repository`, `documents_storage_path`, and related settings — not guessed paths.
 
 Uses the same **mia** package as other deployments (`../core`), **separate gateway** (default port **18793**), **separate workspace** (`workspace/`), and optional **Discord** bot token `DISCORD_BOT_TOKEN_MIA_BA`.
 

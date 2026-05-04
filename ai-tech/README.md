@@ -1,6 +1,6 @@
 # Mia tech
 
-Standalone deployment for **Mia tech** — a **technical** assistant: architecture, troubleshooting, diagrams (Mermaid / ASCII), reading and searching code across the monorepo, GitHub via MCP, web research, optional pytest runs, and shell **`exec`** for builds and CLI tools.
+Standalone deployment for **Mia tech** — a **technical** assistant: architecture, troubleshooting, diagrams (Mermaid / ASCII), reading and searching code across the monorepo, **Git on GitHub primarily via GitHub MCP** (`mcp_github_*`), web research, optional pytest runs, and shell **`exec`** for builds, local **`git`** when MCP does not apply, and other CLI tools.
 
 Uses the same **mia** package as other deployments (`../core`), **separate gateway** (default port **18792**), **separate workspace** (`workspace/`), and optional **Discord** bot token `DISCORD_BOT_TOKEN_MIA_TECH`.
 
@@ -34,8 +34,8 @@ Flags: `--validate-only`, `--skip-install`, `--no-workspace-init`, `--quiet-pip`
 ## Defaults (config)
 
 - **`restrictToWorkspace`** — set in `config/config.json` (**true** = file tools limited to the workspace; **false** = may read monorepo siblings). Prefer writing long-lived notes under `workspace/agent/`.
-- **MCP:** `registry`, `pytest_runner`, remote **GitHub** MCP (needs `GITHUB_TOKEN` or GitHub App env vars).
-- **`exec`:** enabled (timeout 180s) for `git`, `pytest`, package managers, etc.
+- **MCP:** `registry`, `pytest_runner`, remote **GitHub** MCP (needs `GITHUB_TOKEN` or GitHub App env vars) — **preferred** for GitHub API–backed Git work; **`linux_deploy`** for SSH/rsync to allowlisted Linux hosts (`LINUX_DEPLOY_ALLOWED_HOSTS`).
+- **`exec`:** enabled (timeout 180s) for `pytest`, package managers, **local `git`** when MCP cannot replace it, etc.
 
 ## Related deployment (same monorepo)
 

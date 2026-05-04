@@ -13,7 +13,7 @@
 | `OPENROUTER_API_KEY` | LLM provider |
 | `BRAVE_API_KEY` | `web_search` (Brave provider in config) |
 | `AI_TOOL_SECRET` | Required for **registry** and **pytest_runner** MCP (stdio servers validate on startup) |
-| `GITHUB_TOKEN` | Optional; PAT for GitHub MCP when not using GitHub App |
+| `GITHUB_TOKEN` | PAT (or compatible token) for **GitHub MCP** — Mia tech should **prefer MCP** (`mcp_github_*`) for GitHub-hosted Git operations; use local `git` via **`exec`** only when MCP is insufficient (local tree, advanced CLI-only flows). Optional when GitHub MCP is disabled. |
 
 `start.py` sets `TEST_RUNS_PATH_MIA_TECH` by default to `workspace/agent/test-runs/` when unset or empty.
 
@@ -40,6 +40,10 @@ Discord is **disabled** in the committed default config; enable it only after fi
 - **Docs before “done”:** **`../workspace/admin/DOCUMENTATION_AND_COMPLETION_CHECKLIST.md`** — update documentation, add **`projects/<slug>/docs/`** per module where applicable, and file **`COMPLETION_CHECKLIST.md`**; template under **`../workspace/docs/templates/`**.
 - **English in repo:** **`../workspace/admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`** — comments, docstrings, error/log strings, and **policy-driven documentation** (README, `docs/`, checklists) must be **English** (unless an admin exception is recorded there).
 - **Audit / what Mia tech did:** **`../workspace/admin/AUDIT_LOG_AND_OBSERVABILITY.md`** — session **JSONL** under `workspace/sessions/`, gateway **stdout** logs, **Git** history, and **completion checklists**; not a separate tamper-proof SIEM by default.
+
+## Linux deploy MCP (optional)
+
+If **`linux_deploy`** is enabled in **`config/config.json`**, set **`LINUX_DEPLOY_ALLOWED_HOSTS`** in **`.env`** (comma-separated hosts/IPs). Empty allowlist → **`mcp_linux_deploy_ssh_exec`** / **`mcp_linux_deploy_rsync_upload`** refuse all targets. The gateway needs **`ssh`** and **`rsync`** on `PATH` plus key-based SSH to those hosts.
 
 ## Adding more MCPs
 

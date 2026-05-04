@@ -36,7 +36,7 @@ from mia.config.schema import AgentDefaults
 from mia.providers.base import LLMProvider
 from mia.session.manager import Session, SessionManager
 from mia.utils.helpers import image_placeholder_text, truncate_text as truncate_text_fn
-from mia.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from mia.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE, is_ephemeral_reflection_message
 
 if TYPE_CHECKING:
     from mia.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
@@ -154,6 +154,8 @@ class AgentLoop:
         unified_session: bool = False,
         working_queue_config: Any | None = None,
         config_path: Path | None = None,
+        reflect_after_tools: bool | None = None,
+        reflect_instruction: str | None = None,
     ):
         from mia.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -178,6 +180,16 @@ class AgentLoop:
             else defaults.max_tool_result_chars
         )
         self.provider_retry_mode = provider_retry_mode
+        self._reflect_after_tools = (
+            reflect_after_tools
+            if reflect_after_tools is not None
+            else defaults.reflect_after_tools
+        )
+        self._reflect_instruction = (
+            reflect_instruction
+            if reflect_instruction is not None
+            else defaults.reflect_instruction
+        )
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -199,6 +211,8 @@ class AgentLoop:
             max_tool_result_chars=self.max_tool_result_chars,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            reflect_after_tools=self._reflect_after_tools,
+            reflect_instruction=self._reflect_instruction,
         )
         self._unified_session = unified_session
         self._running = False
@@ -449,6 +463,8 @@ class AgentLoop:
             progress_callback=on_progress,
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
+            reflect_after_tools=self._reflect_after_tools,
+            reflect_instruction=self._reflect_instruction,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -833,6 +849,8 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "user":
+                if isinstance(content, str) and is_ephemeral_reflection_message(entry):
+                    continue
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the entire runtime-context block (including any session summary).
                     # The block is bounded by _RUNTIME_CONTEXT_TAG and _RUNTIME_CONTEXT_END.

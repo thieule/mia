@@ -52,6 +52,8 @@ class SubagentManager:
         web_config: "WebToolsConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        reflect_after_tools: bool = False,
+        reflect_instruction: str | None = None,
     ):
         from mia.config.schema import ExecToolConfig
 
@@ -63,6 +65,8 @@ class SubagentManager:
         self.max_tool_result_chars = max_tool_result_chars
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.reflect_after_tools = reflect_after_tools
+        self.reflect_instruction = reflect_instruction
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -147,6 +151,8 @@ class SubagentManager:
                 max_iterations_message="Task completed but no final response was generated.",
                 error_message=None,
                 fail_on_tool_error=True,
+                reflect_after_tools=self.reflect_after_tools,
+                reflect_instruction=self.reflect_instruction,
             ))
             if result.stop_reason == "tool_error":
                 await self._announce_result(

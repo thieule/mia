@@ -13,7 +13,10 @@
 |----------|------|
 | `OPENROUTER_API_KEY` | LLM |
 | `BRAVE_API_KEY` | `web_search` (Brave) |
-| `AI_TOOL_SECRET` | **registry** + **pytest_runner** (stdio) |
+| `AI_TOOL_SECRET` | **registry** + **pytest_runner** + **linux_deploy** (stdio) |
+| `LINUX_DEPLOY_ALLOWED_HOSTS` | (Tuỳ chọn) Danh sách host/IP được phép cho MCP **linux_deploy** (`ssh_exec`, `rsync_upload`). Để trống → mọi lệnh remote bị từ chối. |
+| `LINUX_DEPLOY_DEFAULT_USER` | User SSH khi agent chỉ truyền hostname (không có `user@`). |
+| `LINUX_DEPLOY_IDENTITY_FILE` | (Tuỳ chọn) Đường dẫn key trên máy chạy gateway (`ssh -i`). |
 | `GITHUB_TOKEN` | GitHub MCP: Actions, issues, nội dung cho CI/CD |
 | `DISCORD_BOT_TOKEN_MIA_DEVOPS` | (khi bật Discord) |
 
@@ -33,7 +36,7 @@ Có thể chạy **cả ba** cùng lúc; mỗi bản một **port** riêng.
 
 - **`tools.exec`:** `enable: true`, **`timeout: 300`** (giây) — dùng build/deploy/apply dài; giảm hoặc tăng tùy policy.
 - **`restrictToWorkspace: false`** — cho phép `read_file` / `grep` ngoài `ai-devops/workspace` (ví dụ kịch bản ở `../`, repo sibling). Với môi trường **công cộng / Discord**, cân nhắc bật **`true`** và siết policy trong `workspace/admin/`.
-- **MCP:** `registry` (tìm tool từ catalog), `pytest_runner` (nếu cần test sau thay code), `github` (PAT hoặc GitHub App qua `start.py` + biến env giốp các line khác).
+- **MCP:** `registry`, `pytest_runner`, `github`, và **`linux_deploy`** (SSH/rsync tới Linux — bắt buộc allowlist `LINUX_DEPLOY_ALLOWED_HOSTS`; gateway cần `ssh`/`rsync` trên PATH và SSH key).
 
 ## Thêm MCP hỗ trợ DevOps (khuyến nghị)
 
@@ -51,6 +54,7 @@ Sau khi cài thêm, dùng **`mcp_registry_list_all_tools`** để xác minh tên
 ## Bảo mật
 
 - `exec` **rất mạnh** (chạy shell như user chạy gateway) — chỉ dùng trên host tin cậy, hoặc siết theo `admin/`.
+- **`linux_deploy` MCP:** chỉ kết nối tới host có trong **`LINUX_DEPLOY_ALLOWED_HOSTS`**; để trống thì mọi **`ssh_exec` / `rsync_upload`** bị từ chối. Vẫn coi là **đặc quyền cao** — giới hạn user/key SSH trên server đích và chỉ bật khi gateway tin cậy.
 - Không đưa **key**, **.pem**, mật khẩu server vào chat; dùng env / secret store phù hợp quy trình tổ chức bạn.
 - Cân nhắc **`restrictToWorkspace: true`** khi mở rộng ra internet (Discord, IP công cộng).
 

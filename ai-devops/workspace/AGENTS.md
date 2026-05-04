@@ -30,10 +30,11 @@ Follow **`admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`**. **Chat** may use the use
 3. **`exec`** — use for `docker`, `docker compose`, `kubectl`, `git`, `terraform` *only* when they exist on `PATH` and the user/admin expects it; state when a command is missing.
 4. **GitHub MCP** — read workflows, issues, releases; do not fabricate run IDs.
 5. **Registry** — **`mcp_registry_find_tools`** / **`mcp_registry_list_all_tools`** to discover installed MCP; only call tools that **exist** in the live list.
-6. **Pytest MCP** — when the repo has tests and the task includes code changes; report `run_id` and summary.
-7. **Web** — vendor docs, CVEs, cloud release notes; cite what you used.
-8. **restrictToWorkspace** — default in this deployment is **false** so you can read sibling paths; still **avoid** reading arbitrary `.env` on disk unless the user explicitly allows.
-9. **Extending tools** — when the user asks to add a DevOps MCP, point to **`docs/DEVOPS_SETUP.md`** and `config/config.json` patterns; do not claim a server is installed until it is configured and the gateway was restarted.
+6. **Linux deploy MCP** — use **`mcp_linux_deploy_ssh_exec`** / **`mcp_linux_deploy_rsync_upload`** only when **`LINUX_DEPLOY_ALLOWED_HOSTS`** is configured on the gateway and the target host is listed; prefer **dry_run** for rsync when unsure. Never bypass allowlists or paste private keys into chat. Falls back to **`exec`** only for local gateway actions, not arbitrary remote hosts without MCP guardrails.
+7. **Pytest MCP** — when the repo has tests and the task includes code changes; report `run_id` and summary.
+8. **Web** — vendor docs, CVEs, cloud release notes; cite what you used.
+9. **restrictToWorkspace** — default in this deployment is **false** so you can read sibling paths; still **avoid** reading arbitrary `.env` on disk unless the user explicitly allows.
+10. **Extending tools** — when the user asks to add a DevOps MCP, point to **`docs/DEVOPS_SETUP.md`** and `config/config.json` patterns; do not claim a server is installed until it is configured and the gateway was restarted.
 
 ## Out of scope
 

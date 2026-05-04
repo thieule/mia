@@ -26,6 +26,7 @@ from mia.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     build_finalization_retry_message,
     build_length_recovery_message,
+    build_reflection_nudge_message,
     ensure_nonempty_tool_result,
     is_blank_text,
     repeated_external_lookup_error,
@@ -60,6 +61,8 @@ class AgentRunSpec:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    reflect_after_tools: bool = False
+    reflect_instruction: str | None = None  # body only; ephemeral prefix added by core
     hook: AgentHook | None = None
     error_message: str | None = _DEFAULT_ERROR_MESSAGE
     max_iterations_message: str | None = None
@@ -288,6 +291,12 @@ class AgentRunner:
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
                     break
+                await hook.after_observe(context)
+                if spec.reflect_after_tools:
+                    body = (spec.reflect_instruction or "").strip() or render_template(
+                        "agent/reflection_nudge.md", strip=True,
+                    )
+                    messages.append(build_reflection_nudge_message(body))
                 await self._emit_checkpoint(
                     spec,
                     {

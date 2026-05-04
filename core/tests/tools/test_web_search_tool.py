@@ -142,6 +142,29 @@ async def test_kagi_search(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wikipedia_search(monkeypatch):
+    async def mock_get(self, url, **kw):
+        assert "wikipedia.org/w/api.php" in url
+        assert kw["params"].get("list") == "search"
+        return _response(
+            json={
+                "query": {
+                    "search": [
+                        {"title": "Python (programming language)", "snippet": "General-purpose language"},
+                    ]
+                }
+            }
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    monkeypatch.setenv("WIKIPEDIA_ORIGIN", "https://en.wikipedia.org")
+    tool = _tool(provider="wikipedia")
+    result = await tool.execute(query="python lang", count=2)
+    assert "Python" in result
+    assert "/wiki/" in result
+
+
+@pytest.mark.asyncio
 async def test_unknown_provider():
     tool = _tool(provider="unknown")
     result = await tool.execute(query="test")

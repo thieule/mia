@@ -73,6 +73,21 @@
           "TEST_RUNS_PATH": "${TEST_RUNS_PATH_MIA_DEVOPS}"
         }
       },
+      "linux_deploy": {
+        "command": "python",
+        "args": [
+          "../ai-tools/servers/linux_deploy/server.py"
+        ],
+        "env": {
+          "AI_TOOL_SECRET": "${AI_TOOL_SECRET}",
+          "LINUX_DEPLOY_ALLOWED_HOSTS": "${LINUX_DEPLOY_ALLOWED_HOSTS}",
+          "LINUX_DEPLOY_DEFAULT_USER": "${LINUX_DEPLOY_DEFAULT_USER}",
+          "LINUX_DEPLOY_IDENTITY_FILE": "${LINUX_DEPLOY_IDENTITY_FILE}",
+          "LINUX_DEPLOY_STRICT_HOST_KEY_CHECKING": "${LINUX_DEPLOY_STRICT_HOST_KEY_CHECKING}",
+          "LINUX_DEPLOY_SSH_PORT": "${LINUX_DEPLOY_SSH_PORT}"
+        },
+        "toolTimeout": 600
+      },
       "github": {
         "url": "${GITHUB_MCP_URL}",
         "headers": {

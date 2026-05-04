@@ -311,7 +311,11 @@ def agile_workflow_template_create(name: str, description: str = "") -> str:
 
 @mcp.tool()
 def agile_project_get(project_id: int) -> str:
-    """Detail of project (includes storage + workflow template metadata, no secrets)."""
+    """Detail of project (includes storage + workflow template metadata, no secrets).
+
+    BA/docs workflows: use ``settings.github_repository``, ``documents_storage_path``, ``storage_overview``,
+    and top-level ``workspace_ref`` to locate where requirements documents should live in Git.
+    """
     with mcp_session() as db:
         p = crud.project_get(db, project_id)
         if p is None:

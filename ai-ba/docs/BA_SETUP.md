@@ -11,11 +11,31 @@
 | Variable | Role |
 |----------|------|
 | `OPENROUTER_API_KEY` | LLM provider |
-| `BRAVE_API_KEY` | `web_search` (Brave provider in config) |
+| `BRAVE_API_KEY` | `web_search` when `provider` is **brave** |
+| `WIKIPEDIA_ORIGIN` | Optional; wiki host for **wikipedia** provider (default `https://en.wikipedia.org`, e.g. `https://vi.wikipedia.org`) |
+| `SEARXNG_BASE_URL` | Required for **searxng** provider when not set in config |
 | `AI_TOOL_SECRET` | Required for **registry** and **pytest_runner** MCP (stdio servers validate on startup) |
 | `GITHUB_TOKEN` | Optional; PAT for GitHub MCP when not using GitHub App |
 
+**Free search providers** (no paid API key): **duckduckgo**, **wikipedia** (reference articles only), **searxng** (self-hosted or public instance URL). Set `tools.web.search.provider` in `config/config.json`.
+
 `start.py` sets `TEST_RUNS_PATH_MIA_BA` by default to `workspace/agent/test-runs/` when unset or empty.
+
+## Model reasoning (`reasoningEffort`)
+
+In **`config/config.json`**, under **`agents.defaults`**, **`reasoningEffort`** is forwarded to the LLM provider as extended reasoning / thinking where the backend supports it (via Mia core `GenerationSettings`). Typical values include **`low`**, **`medium`**, **`high`**; some providers also accept **`minimal`**, **`none`**, or **`adaptive`** (e.g. Anthropic extended thinking budgets).
+
+- **Mia BA default** in-repo is often **`medium`** — a balance of depth and latency/cost.
+- For **maximum analytical depth** on complex BA engagements, try **`high`** (or **`adaptive`** on Anthropic-backed configs).
+- Behaviour is **provider-specific** (Gemini OpenAI-compat, OpenAI reasoning models, Anthropic, DashScope “thinking”, etc.); if the API ignores an unsupported value, rely on the **playbook planning pass** in **`workspace/project/BA_DELIVERY_PLAYBOOK.md`** and **`workspace/AGENTS.md`** for structured visible reasoning.
+
+Restart the gateway after changing **`reasoningEffort`**.
+
+### Iterative reflect (`reflectAfterTools`)
+
+Mia core can inject an **ephemeral** user message after each **successful tool batch** so the model reconciles plan vs observations before the next step (`Plan → Act → Observe → Reflect`). The message is **not saved** to session history.
+
+In **`agents.defaults`**, set **`reflectAfterTools`: true** (optional **`reflectInstruction`** for a custom prompt body). Increases tokens per tool round; default in core is **false**.
 
 ## Ports and isolation
 

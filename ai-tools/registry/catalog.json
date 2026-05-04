@@ -76,5 +76,23 @@
     "server": "pytest_runner",
     "description": "Retrieve the full result of a previous test run by its run_id. Use after test_run() to fetch stored results.",
     "tags": ["testing", "pytest", "results", "history", "run_id"]
+  },
+  {
+    "name": "ssh_exec",
+    "server": "linux_deploy",
+    "description": "Run one shell command on a Linux server via SSH (allowlisted hosts only). Use for git pull, docker compose, systemd reload after LINUX_DEPLOY_ALLOWED_HOSTS is set.",
+    "tags": ["deploy", "ssh", "linux", "remote", "server", "docker", "systemd", "rsync", "release"]
+  },
+  {
+    "name": "rsync_upload",
+    "server": "linux_deploy",
+    "description": "Upload a local file or directory to a Linux host with rsync over SSH (allowlisted hosts). Supports dry_run and optional --delete.",
+    "tags": ["deploy", "rsync", "scp", "linux", "remote", "sync", "artifact", "release"]
+  },
+  {
+    "name": "deploy_allowed_hosts",
+    "server": "linux_deploy",
+    "description": "Show which hosts are configured for linux_deploy MCP (from LINUX_DEPLOY_ALLOWED_HOSTS). Does not open network connections.",
+    "tags": ["deploy", "ssh", "linux", "config", "allowlist", "security"]
   }
 ]

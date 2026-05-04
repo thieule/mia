@@ -6,7 +6,8 @@
 - **MCP (from `config/config.json`):**
   - **`registry`** — `mcp_registry_find_tools`, `mcp_registry_list_all_tools` (catalog; not every entry is installed).
   - **`pytest_runner`** — run suites; reports under `TEST_RUNS_PATH_MIA_TECH` (default `workspace/agent/test-runs/`).
-  - **`github`** — GitHub MCP when `GITHUB_MCP_AUTH_HEADER` is set (PAT or App token via `start.py`).
+  - **`github`** — GitHub MCP when wired in `config/config.json` (e.g. `GITHUB_MCP_URL` + `GITHUB_TOKEN` / App credentials via `start.py`). **Prefer `mcp_github_*` over `exec git`** for remote GitHub actions (issues, PRs, repo contents, branches); use **`exec git`** for local working-tree operations MCP does not expose.
+  - **`linux_deploy`** — **`mcp_linux_deploy_ssh_exec`** / **`mcp_linux_deploy_rsync_upload`** to **allowlisted** Linux servers (`LINUX_DEPLOY_ALLOWED_HOSTS`). Optional; see `EXAMPLE_.env`. Long timeout (600s) for pushes/build steps.
 
 ## Workspace boundary
 

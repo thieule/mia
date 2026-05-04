@@ -38,6 +38,8 @@ _sessions: dict[str, float] = {}
 _session_file: Path | None = None
 _mcp_file: Path | None = None
 _chat_log_file: Path | None = None
+_wq_sync_delivered_file: Path | None = None
+_WQ_SYNC_DELIVERED_MAX = 4000
 
 
 def _load_dotenv(path: Path) -> None:
@@ -77,11 +79,12 @@ def _session_ttl_s() -> float | None:
 
 
 def _init_storage(data_dir: Path) -> None:
-    global _session_file, _mcp_file, _chat_log_file, _sessions
+    global _session_file, _mcp_file, _chat_log_file, _sessions, _wq_sync_delivered_file
     data_dir.mkdir(parents=True, exist_ok=True)
     _session_file = data_dir / "sessions.json"
     _mcp_file = data_dir / "mcp_credentials.json"
     _chat_log_file = data_dir / "chat_dispatch_logs.jsonl"
+    _wq_sync_delivered_file = data_dir / "wq_sync_delivered_task_ids.json"
     _sessions = {}
     if _session_file.is_file():
         try:
@@ -100,6 +103,41 @@ def _persist_sessions() -> None:
     tmp = _session_file.parent / f".{_session_file.name}.{os.getpid()}.tmp"
     tmp.write_text(json.dumps({"version": 1, "sessions": _sessions}, indent=2), encoding="utf-8")
     tmp.replace(_session_file)
+
+
+def _wq_load_sync_delivered_ids() -> set[str]:
+    path = _wq_sync_delivered_file
+    if path is None or not path.is_file():
+        return set()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        ids = raw.get("task_ids") if isinstance(raw, dict) else None
+        if isinstance(ids, list):
+            return {str(x) for x in ids if isinstance(x, str) and x.strip()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return set()
+
+
+def _wq_was_sync_delivered(task_id: str) -> bool:
+    tid = str(task_id or "").strip()
+    return bool(tid) and tid in _wq_load_sync_delivered_ids()
+
+
+def _wq_mark_sync_delivered(task_id: str) -> None:
+    path = _wq_sync_delivered_file
+    tid = str(task_id or "").strip()
+    if path is None or not tid:
+        return
+    cur = _wq_load_sync_delivered_ids()
+    cur.add(tid)
+    lst = sorted(cur)
+    if len(lst) > _WQ_SYNC_DELIVERED_MAX:
+        lst = lst[-_WQ_SYNC_DELIVERED_MAX:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps({"version": 1, "task_ids": lst}, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _create_session(secret: str) -> str | None:
@@ -324,6 +362,7 @@ async def _enqueue_agent_chat_task_direct(
     sender: dict[str, Any],
     message: str,
     payload: dict[str, Any],
+    trace_id: str,
 ) -> tuple[bool, str, str | None]:
     msg = (
         "[Agent chat] User message need to reply.\n"
@@ -357,6 +396,11 @@ async def _enqueue_agent_chat_task_direct(
             "story_context": payload.get("story_context")
             if isinstance(payload.get("story_context"), dict)
             else {},
+            "_reply_meta": {
+                "trace_id": trace_id,
+                "target_agent_id": agent_id,
+                "callback_api_url": payload.get("callback_api_url"),
+            },
         },
         item_kind="task",
         enqueued_by="api-center:chat.dispatch",
@@ -926,6 +970,80 @@ async def _send_reply_via_api(payload: dict[str, Any]) -> tuple[bool, str]:
         return False, f"api_error:{type(e).__name__}"
 
 
+async def _ingest_working_queue_chat_reply(payload: dict[str, Any]) -> dict[str, Any]:
+    """Deliver agent working-queue completion to Hub when sync chat.dispatch wait timed out."""
+    task_id = str(payload.get("task_id") or "").strip()
+    project_id = str(payload.get("project_id") or "").strip()
+    channel_id = str(payload.get("channel_id") or "").strip()
+    channel_type = str(payload.get("channel_type") or "direct").strip().lower()
+    target_agent_id = str(payload.get("target_agent_id") or "").strip() or None
+    trace_id = str(payload.get("trace_id") or task_id).strip()
+    content = str(payload.get("content") or "").strip()
+    delivery_kind = str(payload.get("delivery_kind") or "done").strip().lower()
+    callback_api_url = payload.get("callback_api_url")
+
+    if not task_id or not project_id or not channel_id:
+        raise HTTPException(status_code=400, detail="task_id, project_id, channel_id required")
+    if delivery_kind not in {"done", "failed"}:
+        raise HTTPException(status_code=400, detail="delivery_kind must be done or failed")
+
+    if delivery_kind == "done" and _wq_was_sync_delivered(task_id):
+        return {"ok": True, "skipped": "already_delivered_via_sync_poll", "task_id": task_id}
+
+    if not content:
+        content = "[Agent completed with no visible reply text.]"
+
+    rec = _load_mcp_credentials()
+    records = rec.get("records") if isinstance(rec.get("records"), dict) else {}
+
+    reply_payload = {
+        "event": "chat.agent.reply",
+        "trace_id": trace_id,
+        "project_id": project_id,
+        "channel_id": channel_id,
+        "target_agent_id": target_agent_id,
+        "content": content[:12000],
+        "metadata": {
+            "source": "api-center",
+            "mode": "working_queue_webhook",
+            "task_id": task_id,
+            "delivery_kind": delivery_kind,
+        },
+        "callback_api_url": callback_api_url,
+    }
+    mode, status = await _dispatch_reply(
+        mcp_records=records,
+        target_agent_id=target_agent_id,
+        reply_payload=reply_payload,
+    )
+    _append_chat_log(
+        {
+            "type": "chat.reply.working_queue_webhook",
+            "task_id": task_id,
+            "mode": mode,
+            "status": status,
+            "delivery_kind": delivery_kind,
+        }
+    )
+    return {"ok": True, "task_id": task_id, "delivery_mode": mode, "delivery_status": status}
+
+
+def require_wq_ingest_secret(
+    authorization: Optional[str] = Header(default=None),
+) -> None:
+    expected = (os.environ.get("API_CENTER_WORKING_QUEUE_INGEST_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Set API_CENTER_WORKING_QUEUE_INGEST_SECRET to accept working-queue completion webhooks",
+        )
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization[7:].strip()
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Invalid ingest token")
+
+
 async def _dispatch_reply(
     *,
     mcp_records: dict[str, Any],
@@ -1005,6 +1123,7 @@ async def _process_chat_dispatch(
                 sender=sender,
                 message=message,
                 payload=payload,
+                trace_id=trace_id,
             )
             agent_dispatch_status = enq_status
             agent_task_id = task_id
@@ -1022,20 +1141,18 @@ async def _process_chat_dispatch(
                 agent_dispatch_status = f"{agent_dispatch_status}:{done_state}"
                 if done_state == "done" and done_text.strip():
                     reply_text = done_text[:12000]
+                    _wq_mark_sync_delivered(task_id)
                 elif done_state == "failed":
                     reply_text = f"[{who}] processing error: {done_text}"
                 elif done_state == "timeout":
                     reply_text = (
-                        f"[{who}] No reply within the wait window. "
-                        "The task was enqueued on the selected agent's working queue (`"
-                        f"{who}`); if API Center `--start-agents` only launches other agents, nothing "
-                        "consumes this queue — add this id to `--agent-ids`, or run `python start.py` "
-                        "(Python 3.11+) from that agent's workspace directory. "
-                        f"Task `{task_id}` is still in the queue. "
-                        "Increase `API_CENTER_CHAT_WAIT_TIMEOUT_S` (default 45) if the LLM run is slow. "
-                        "If the agent process is running but this persists, ensure `working_queue.enabled` is "
-                        "true in that agent's `config/config.json` (otherwise the gateway never drains the queue). "
-                        f"Details: {done_text}"
+                        f"[{who}] Still processing (wait window expired). "
+                        f"When the agent finishes, a follow-up reply can be pushed if "
+                        f"`WORKING_QUEUE_REPLY_INGEST_URL` / `WORKING_QUEUE_REPLY_INGEST_SECRET` match "
+                        f"`API_CENTER_WORKING_QUEUE_INGEST_SECRET` on API Center (see api-center EXAMPLE_.env). "
+                        f"Task `{task_id}`. Increase `API_CENTER_CHAT_WAIT_TIMEOUT_S` (default 45) for slower runs. "
+                        "If nothing completes: ensure this agent id is in `--agent-ids`, "
+                        "`working_queue.enabled` is true in `config/config.json`, and the gateway process is running."
                     )
                 else:
                     reply_text = (
@@ -1263,6 +1380,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
                 "agents": f"{base}/v1/agents",
                 "mcp_upsert": f"{base}/v1/mcp/credentials",
                 "chat_dispatch": f"{base}/v1/chat/dispatch",
+                "working_queue_reply_ingest": f"{base}/v1/internal/working-queue-reply",
                 "chat_ws": f"{base}/ws/agent-chat?session_key=<session_key>",
                 "agile_notifications_webhook": f"{base}/v1/webhooks/agile-notifications",
             },
@@ -1442,6 +1560,16 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
             "delivery_mode": delivery_mode,
             "delivery_status": delivery_status,
         }
+
+    @app.post("/v1/internal/working-queue-reply")
+    async def working_queue_completion_ingest(
+        payload: dict[str, Any],
+        _: None = Depends(require_wq_ingest_secret),
+    ) -> dict[str, Any]:
+        """Agent gateway POSTs here when a chat-originated queue task finishes (async follow-up)."""
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Root must be JSON object")
+        return await _ingest_working_queue_chat_reply(payload)
 
     @app.post("/v1/webhooks/agile-notifications")
     async def agile_notifications_webhook(payload: dict[str, Any], _: str = Depends(require_session)) -> dict[str, Any]:

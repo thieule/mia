@@ -76,6 +76,14 @@ class AgentDefaults(Base):
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
+    reflect_after_tools: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("reflectAfterTools", "reflect_after_tools"),
+    )  # Inject ephemeral Plan→Reflect user nudge after each tool batch (not persisted)
+    reflect_instruction: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reflectInstruction", "reflect_instruction"),
+    )  # Overrides default reflection prompt body (prefix is always applied by the runner)
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     session_ttl_minutes: int = Field(
@@ -182,7 +190,7 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    provider: str = "duckduckgo"  # brave, tavily, duckduckgo, searxng, jina, kagi
+    provider: str = "duckduckgo"  # brave, tavily, duckduckgo, searxng, jina, kagi, wikipedia
     api_key: str = ""
     base_url: str = ""  # SearXNG base URL
     max_results: int = 5
