@@ -39,6 +39,32 @@ _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
+
+
+def _assistant_text_implies_missing_tools(text: str) -> bool:
+    """Heuristic: model described repo/file actions but may have omitted tool_calls (common on some APIs)."""
+    if not text or len(text.strip()) < 24:
+        return False
+    low = text.lower()
+    if "read_file" in low or "grep_file" in low or "list_dir" in low:
+        return True
+    if "`" in text and any(s in text for s in ("/", "projects", "docs/", ".md")):
+        return True
+    if "projects/" in low or "/docs/" in low:
+        return True
+    phrases = (
+        "sẽ đọc",
+        "đọc file",
+        "will read",
+        "i'll read",
+        "going to read",
+        "kiểm tra tài liệu",
+        "technical design",
+        "design document",
+    )
+    if any(p in low for p in phrases) and ("/" in text or "`" in text or ".md" in low):
+        return True
+    return False
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
 _COMPACTABLE_TOOLS = frozenset({
@@ -76,6 +102,7 @@ class AgentRunSpec:
     progress_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    text_only_tool_nudge_rounds: int = 1
 
 
 @dataclass(slots=True)
@@ -196,6 +223,7 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        tool_text_nudges_used = 0
 
         for iteration in range(spec.max_iterations):
             try:
@@ -414,14 +442,15 @@ class AgentRunner:
                         len(injections), injection_cycles, _MAX_INJECTION_CYCLES,
                     )
 
-            if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=_injected_after_final)
-
             if _injected_after_final:
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
                 await hook.after_iteration(context)
                 continue
 
             if response.finish_reason == "error":
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=False)
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
@@ -432,6 +461,8 @@ class AgentRunner:
                 await hook.after_iteration(context)
                 break
             if is_blank_text(clean):
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=False)
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
                 stop_reason = "empty_final_response"
                 error = final_content
@@ -441,6 +472,41 @@ class AgentRunner:
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
                 break
+
+            tool_defs = spec.tools.get_definitions()
+            will_tool_nudge = (
+                spec.text_only_tool_nudge_rounds > 0
+                and tool_text_nudges_used < spec.text_only_tool_nudge_rounds
+                and tool_defs
+                and not response.has_tool_calls
+                and _assistant_text_implies_missing_tools(clean or "")
+            )
+            if will_tool_nudge:
+                tool_text_nudges_used += 1
+                logger.info(
+                    "Injecting tool-round nudge after text-only repo-oriented reply ({}/{})",
+                    tool_text_nudges_used,
+                    spec.text_only_tool_nudge_rounds,
+                )
+                messages.append(
+                    assistant_message
+                    or build_assistant_message(
+                        clean,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
+                )
+                messages.append({
+                    "role": "user",
+                    "content": render_template("agent/tool_round_nudge.md", strip=True),
+                })
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                await hook.after_iteration(context)
+                continue
+
+            if hook.wants_streaming():
+                await hook.on_stream_end(context, resuming=False)
 
             messages.append(assistant_message or build_assistant_message(
                 clean,

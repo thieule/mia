@@ -2410,3 +2410,95 @@ async def test_dispatch_republishes_leftover_queue_messages(tmp_path):
     contents = [m.content for m in msgs]
     assert "leftover-1" in contents
     assert "leftover-2" in contents
+
+
+def test_assistant_text_implies_missing_tools_heuristic():
+    from mia.agent.runner import _assistant_text_implies_missing_tools
+
+    assert not _assistant_text_implies_missing_tools("")
+    assert not _assistant_text_implies_missing_tools("Hello.")
+    assert _assistant_text_implies_missing_tools(
+        "Con sẽ đọc file `projects/hello/docs/hello_world_technical_design.md` trước ạ."
+    )
+    assert _assistant_text_implies_missing_tools(
+        "I will read projects/foo/docs/bar.md and summarize."
+    )
+
+
+def test_runner_text_only_reply_triggers_tool_nudge_second_llm_call():
+    from mia.agent.runner import AgentRunSpec, AgentRunner
+
+    async def _run() -> None:
+        provider = MagicMock()
+        call_count = {"n": 0}
+
+        async def chat_with_retry(*, messages, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return LLMResponse(
+                    content="Con sẽ đọc file `projects/hello/docs/hello.md` trước ạ.",
+                    tool_calls=[],
+                    usage={},
+                )
+            return LLMResponse(content="Đã hiểu.", tool_calls=[], usage={})
+
+        provider.chat_with_retry = chat_with_retry
+        tools = MagicMock()
+        tools.get_definitions.return_value = [{"type": "function", "function": {"name": "read_file"}}]
+        tools.execute = AsyncMock(return_value="unused")
+
+        runner = AgentRunner(provider)
+        result = await runner.run(AgentRunSpec(
+            initial_messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "go"},
+            ],
+            tools=tools,
+            model="test-model",
+            max_iterations=5,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            text_only_tool_nudge_rounds=1,
+        ))
+
+        assert call_count["n"] >= 2
+        user_contents = [m.get("content", "") for m in result.messages if m.get("role") == "user"]
+        assert any("tool round required" in str(c).lower() for c in user_contents)
+
+    asyncio.run(_run())
+
+
+def test_runner_text_only_nudge_disabled_single_llm_call():
+    from mia.agent.runner import AgentRunSpec, AgentRunner
+
+    async def _run() -> None:
+        provider = MagicMock()
+        call_count = {"n": 0}
+
+        async def chat_with_retry(*, messages, **kwargs):
+            call_count["n"] += 1
+            return LLMResponse(
+                content="Con sẽ đọc file `projects/hello/docs/hello.md` trước ạ.",
+                tool_calls=[],
+                usage={},
+            )
+
+        provider.chat_with_retry = chat_with_retry
+        tools = MagicMock()
+        tools.get_definitions.return_value = [{"type": "function", "function": {"name": "read_file"}}]
+
+        runner = AgentRunner(provider)
+        await runner.run(AgentRunSpec(
+            initial_messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "go"},
+            ],
+            tools=tools,
+            model="test-model",
+            max_iterations=5,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            text_only_tool_nudge_rounds=0,
+        ))
+
+        assert call_count["n"] == 1
+
+    asyncio.run(_run())

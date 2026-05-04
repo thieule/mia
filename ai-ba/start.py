@@ -37,6 +37,8 @@ Canonical policies for this Mia BA deployment. The agent must not modify these f
 _AGENT_README = """# Agent area (autonomous)
 
 BA artefacts, workshop notes, and drafts the agent may create; subject to `../admin/` policy.
+
+**Deliverable packs:** for each coherent set of BA specs you hand off (e.g. `projects/<slug>/…` or an agreed folder), put **`README.md` at the root of that pack** with a table of contents (relative paths + one-line summary) so other agents read that README first—not scattered files alone.
 """
 
 
@@ -246,7 +248,7 @@ def validate_config() -> None:
 
 
 def run_gateway() -> None:
-    subprocess.run(
+    cp = subprocess.run(
         [
             sys.executable,
             "-m",
@@ -259,6 +261,10 @@ def run_gateway() -> None:
         cwd=ROOT,
         check=False,
     )
+    rc = cp.returncode
+    if rc:
+        print(f"Mia BA: gateway process exited with code {rc}", file=sys.stderr, flush=True)
+        sys.exit(rc if isinstance(rc, int) else 1)
 
 
 def main() -> None:

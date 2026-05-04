@@ -60,6 +60,8 @@ class WorkingQueueService:
         self._running = False
         self._task: asyncio.Task | None = None
         self._run_lock = asyncio.Lock()
+        # Limits concurrent process_direct runs; created in start() when the loop exists.
+        self._job_sem: asyncio.Semaphore | None = None
 
     async def start(self) -> None:
         if not self.enabled:
@@ -67,6 +69,7 @@ class WorkingQueueService:
             return
         if self._running:
             return
+        self._job_sem = asyncio.Semaphore(self.max_tasks_per_tick)
         self._running = True
         self._task = asyncio.create_task(self._loop())
         logger.info("Working queue poller: started (every {}s)", self.interval_s)
@@ -90,8 +93,8 @@ class WorkingQueueService:
                 logger.error("Working queue poller error: {}", e)
 
     async def _tick(self) -> None:
-        # Claim up to max_tasks_per_tick without awaiting LLM work between claims.
-        # Otherwise one hung task blocks all newer pending items until it finishes.
+        # Claim quickly, then schedule work without awaiting it here — otherwise _loop is
+        # blocked for the whole LLM run and no further pending items are ever claimed.
         batch: list[tuple[Path, WorkingQueueTaskPayload]] = []
         async with self._run_lock:
             for _ in range(self.max_tasks_per_tick):
@@ -101,9 +104,36 @@ class WorkingQueueService:
                 batch.append(claimed)
         if not batch:
             return
-        await asyncio.gather(
-            *[self._process_one(proc_path, wtask) for proc_path, wtask in batch],
-        )
+        logger.info("Working queue: claimed {} pending task(s)", len(batch))
+        sem = self._job_sem
+        if sem is None:
+            return
+
+        def _spawn(proc_path: Path, wtask: WorkingQueueTaskPayload) -> None:
+            async def _runner() -> None:
+                async with sem:
+                    try:
+                        await self._process_one(proc_path, wtask)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Working queue: background task failed for {}", wtask.id)
+
+            t = asyncio.create_task(_runner())
+
+            def _done(task: asyncio.Task) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # Already logged in _runner; avoid "Task exception was never retrieved"
+                    pass
+
+            t.add_done_callback(_done)
+
+        for proc_path, wtask in batch:
+            _spawn(proc_path, wtask)
 
     async def _process_one(self, processing_path: Path, wtask: Any) -> None:
         if not isinstance(wtask, WorkingQueueTaskPayload):

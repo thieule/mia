@@ -156,6 +156,7 @@ class AgentLoop:
         config_path: Path | None = None,
         reflect_after_tools: bool | None = None,
         reflect_instruction: str | None = None,
+        text_only_tool_nudge_rounds: int | None = None,
     ):
         from mia.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -189,6 +190,11 @@ class AgentLoop:
             reflect_instruction
             if reflect_instruction is not None
             else defaults.reflect_instruction
+        )
+        self._text_only_tool_nudge_rounds = (
+            text_only_tool_nudge_rounds
+            if text_only_tool_nudge_rounds is not None
+            else defaults.text_only_tool_nudge_rounds
         )
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
@@ -465,6 +471,7 @@ class AgentLoop:
             injection_callback=_drain_pending,
             reflect_after_tools=self._reflect_after_tools,
             reflect_instruction=self._reflect_instruction,
+            text_only_tool_nudge_rounds=self._text_only_tool_nudge_rounds,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":

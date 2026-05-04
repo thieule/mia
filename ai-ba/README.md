@@ -4,6 +4,8 @@
 
 Standalone deployment for **Mia BA** — a **business analysis** assistant: customer needs analysis, requirements discovery, **research** (web + GitHub MCP when configured), **long-form specs** (markdown under `workspace/agent/`), **phased planning** and traceability, user stories, acceptance criteria, process and data flows (Mermaid), stakeholder comms, gap analysis, and prioritisation. Deep engagements follow **`workspace/project/BA_DELIVERY_PLAYBOOK.md`**. Project specs should live in **Git** using **`agile_project_get`** / **`agile_projects_list`** (Agile Studio MCP) for `github_repository`, `documents_storage_path`, and related settings — not guessed paths.
 
+**Deliverable convention:** each **BA output pack** (a folder you hand off—often under `workspace/projects/<slug>/` or the path from Agile) must include a **`README.md` at the pack root** with an **index table** of every spec file so other AIs (e.g. Mia tech) open that README first. Policy: [workspace/AGENTS.md](./workspace/AGENTS.md).
+
 Uses the same **mia** package as other deployments (`../core`), **separate gateway** (default port **18793**), **separate workspace** (`workspace/`), and optional **Discord** bot token `DISCORD_BOT_TOKEN_MIA_BA`.
 
 ## Repo layout
@@ -15,7 +17,7 @@ ai-ba/                     # this directory (Mia BA deployment)
   config/config.json
   start.py
   EXAMPLE_.env
-  workspace/        # BA workspace (AGENTS.md, TOOLS.md, …)
+  workspace/        # BA workspace (policies, drafts, projects/…)
   docs/
 ```
 
@@ -30,7 +32,8 @@ Flags: `--validate-only`, `--skip-install`, `--no-workspace-init`, `--quiet-pip`
 
 ## Documentation
 
-- [docs/README.md](./docs/README.md) — index
+- [workspace/README.md](./workspace/README.md) — workspace orientation (vs **deliverable** packs; each pack has its own `README.md` index per [workspace/AGENTS.md](./workspace/AGENTS.md))
+- [docs/README.md](./docs/README.md) — operator doc index
 - [docs/BA_SETUP.md](./docs/BA_SETUP.md) — ports, tools, security notes
 - **Governance:** same pattern as Mia tech — see [workspace/admin/](./workspace/admin/)
 

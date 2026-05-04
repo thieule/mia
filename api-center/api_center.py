@@ -1278,6 +1278,17 @@ def _pick_agents_to_start(merged_agents: list[dict[str, Any]], raw_ids: str) -> 
     return out
 
 
+def _agent_subprocess_env() -> dict[str, str]:
+    """Ensure child gateways import this repo's ``core/mia`` (editable layout), not an older site-packages ``mia``."""
+    env = os.environ.copy()
+    core_dir = Path(os.environ.get("API_CENTER_CORE_DIR") or (ROOT.parent / "core")).resolve()
+    if core_dir.is_dir():
+        prev = (env.get("PYTHONPATH") or "").strip()
+        prefix = str(core_dir)
+        env["PYTHONPATH"] = prefix if not prev else f"{prefix}{os.pathsep}{prev}"
+    return env
+
+
 def _start_agent_processes(merged_agents: list[dict[str, Any]], args: argparse.Namespace) -> list[subprocess.Popen[Any]]:
     if not args.start_agents:
         return []
@@ -1314,11 +1325,19 @@ def _start_agent_processes(merged_agents: list[dict[str, Any]], args: argparse.N
             continue
         cmd = [sys.executable, str(launcher), *extra]
         try:
-            p = subprocess.Popen(cmd, cwd=str(root))
+            p = subprocess.Popen(cmd, cwd=str(root), env=_agent_subprocess_env())
             procs.append(p)
-            print(f"[api-center] started agent {aid} pid={p.pid} cmd={' '.join(cmd)}", flush=True)
+            print(
+                f"[api-center] started agent {aid} pid={p.pid} cwd={root} cmd={' '.join(cmd)}",
+                flush=True,
+            )
         except Exception as e:
             print(f"[api-center] failed to start agent {aid}: {type(e).__name__}: {e}", flush=True)
+    if procs:
+        print(
+            "[api-center] Nếu một agent tắt ngay: `python3 start.py --skip-install` trong ai-ba/ hoặc ai-tech/ để xem lỗi.",
+            flush=True,
+        )
     return procs
 
 

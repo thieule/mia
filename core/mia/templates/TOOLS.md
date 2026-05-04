@@ -3,6 +3,10 @@
 Tool signatures are provided automatically via function calling.
 This file documents non-obvious constraints and usage patterns.
 
+## Same-turn execution (critical)
+
+The host ends the turn as soon as you return **final natural language** without tool calls. If you need file contents, search results, or command output, **invoke the matching tool in the same assistant response** (together with any short preamble the API allows). **Do not** close the turn with only phrases like “I will read …”, “I am going to run …”, or “Let me check …” **without** the actual `read_file` / `grep` / `exec` / etc. calls — from the user’s perspective nothing runs after that.
+
 ## exec — Safety Limits
 
 - Commands have a configurable timeout (default 60s)

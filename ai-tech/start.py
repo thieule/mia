@@ -248,7 +248,7 @@ def validate_config() -> None:
 
 
 def run_gateway() -> None:
-    subprocess.run(
+    cp = subprocess.run(
         [
             sys.executable,
             "-m",
@@ -261,6 +261,10 @@ def run_gateway() -> None:
         cwd=ROOT,
         check=False,
     )
+    rc = cp.returncode
+    if rc:
+        print(f"Mia tech: gateway process exited with code {rc}", file=sys.stderr, flush=True)
+        sys.exit(rc if isinstance(rc, int) else 1)
 
 
 def main() -> None:

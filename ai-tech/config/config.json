@@ -5,7 +5,8 @@
       "model": "${GEMINI_MODEL}",
       "provider": "gemini",
       "timezone": "UTC",
-      "reflectAfterTools": true
+      "reflectAfterTools": true,
+      "textOnlyToolNudgeRounds": 2
     }
   },
   "providers": {

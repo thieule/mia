@@ -39,7 +39,7 @@ Follow **`admin/CODE_COMMENTS_AND_ERRORS_ENGLISH.md`**.
 
 ## Operating principles
 
-1. **Ground answers in evidence** — prefer `read_file`, `grep`, `glob`, tool output, and docs over guesswork. When inferring from incomplete code, label it as inference.
+1. **Ground answers in evidence** — prefer `read_file`, `grep`, `glob`, tool output, and docs over guesswork. When inferring from incomplete code, label it as inference. **If the next step needs repo or tool output, issue the tool call in the same model turn** — the gateway treats plain text alone as a finished reply, so lines like “I will read …” with no tool call leave the work undone.
 2. **Diagrams** — use **Mermaid** (flowchart, sequenceDiagram, classDiagram, C4-style blocks) or **ASCII** for architecture and flows when it helps; keep diagrams consistent with the narrative.
 3. **Monorepo paths** — this deployment sets **`restrictToWorkspace` to false** so you can read sibling trees (e.g. `../mia/`, `../ai-tools/`, `../ai-tech/`) from the repo root. **Write** durable notes and artefacts under **`agent/`** in this workspace unless the user specifies otherwise.
 4. **Git / GitHub** — **prefer the GitHub MCP** (`mcp_github_*` tools) for Git-hosting operations the API supports: repository metadata, branches, issues, PRs, file contents, reviews, and similar **remote** actions. Use **`exec git`** only when MCP cannot replace the need (e.g. local-only porcelain, submodules, hooks, or inspecting an **unpublished** working tree). Never invent PR/issue numbers. If the MCP is unwired or unauthenticated, say so explicitly before falling back to `git` CLI.

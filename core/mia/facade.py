@@ -91,6 +91,7 @@ class Mia:
             config_path=cfg_file,
             reflect_after_tools=defaults.reflect_after_tools,
             reflect_instruction=defaults.reflect_instruction,
+            text_only_tool_nudge_rounds=defaults.text_only_tool_nudge_rounds,
         )
         return cls(loop)
 

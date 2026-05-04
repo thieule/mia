@@ -84,6 +84,12 @@ class AgentDefaults(Base):
         default=None,
         validation_alias=AliasChoices("reflectInstruction", "reflect_instruction"),
     )  # Overrides default reflection prompt body (prefix is always applied by the runner)
+    text_only_tool_nudge_rounds: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        validation_alias=AliasChoices("textOnlyToolNudgeRounds", "text_only_tool_nudge_rounds"),
+    )  # When the model returns repo-oriented prose without tool_calls, inject one user nudge and retry (0 = off)
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     session_ttl_minutes: int = Field(

@@ -116,14 +116,25 @@ class ContextBuilder:
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
-        parts = []
+        """Load bootstrap markdown from the workspace, falling back to packaged templates.
+
+        Workspaces often ship only ``AGENTS.md``; missing ``TOOLS.md`` would drop generic
+        tool guidance entirely. Template fallback keeps notes like same-turn execution
+        without requiring every deployment to duplicate files.
+        """
+        parts: list[str] = []
+        template_root = Path(__file__).resolve().parent.parent / "templates"
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+            else:
+                tmpl = template_root / filename
+                if not tmpl.is_file():
+                    continue
+                content = tmpl.read_text(encoding="utf-8")
+            parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 
