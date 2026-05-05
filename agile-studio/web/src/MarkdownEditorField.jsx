@@ -9,6 +9,9 @@ export default function MarkdownEditorField({
   placeholder,
   className = "",
   textareaProps,
+  /** "edit" | "live" | "preview" — live = edit + preview side by side */
+  previewMode = "edit",
+  previewOptions,
 }) {
   return (
     <div data-color-mode="light" className={`as-md-editor ${className}`.trim()}>
@@ -16,8 +19,9 @@ export default function MarkdownEditorField({
         value={value || ""}
         onChange={(next) => onChange?.(next ?? "")}
         height={height}
-        preview="edit"
-        visibleDragbar={false}
+        preview={previewMode}
+        previewOptions={previewOptions}
+        visibleDragbar={previewMode === "live"}
         textareaProps={{
           placeholder,
           ...textareaProps,

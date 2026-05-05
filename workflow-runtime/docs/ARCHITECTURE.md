@@ -2,7 +2,7 @@
 
 Tích hợp từ **client ứng dụng (Agile Studio, v.v.):** [CLIENT_INTEGRATION.md](./CLIENT_INTEGRATION.md)
 
-Tài liệu mô tả cách **workflow-runtime** (CLI `main.py`) phối hợp với từng bộ **agent** (`ai-ba`, `ai-tech`, `ai-dev`, `ai-qc`, `ai-devops`, `ai-pm`…) — kênh hội thoại `workflow`, tùy chọn **chế độ file queue** tích hợp với `working_queue` (core mia).
+Tài liệu mô tả cách **workflow-runtime** (CLI `main.py`) phối hợp với từng bộ **agent** dưới `agents/` (`agents/ai-ba`, `agents/ai-tech`, …) — kênh hội thoại `workflow`, tùy chọn **chế độ file queue** tích hợp với `working_queue` (core mia).
 
 ## Thành phần tổng quan
 
@@ -23,10 +23,10 @@ flowchart TB
   subgraph wr["workflow-runtime"]
     Y[YAML: steps + agent_profiles]
     S1[Bước 1: build_instruction]
-    M1["Mia (ví dụ ai-ba)"]
+    M1["Mia (ví dụ agents/ai-ba)"]
     J1[OpsCenter.run_job]
     S2[Bước 2: + previous_output]
-    M2["Mia (ví dụ ai-tech)"]
+    M2["Mia (ví dụ agents/ai-tech)"]
     J2[run_job]
   end
   Y --> S1 --> M1 --> J1 --> S2 --> M2 --> J2
@@ -96,7 +96,7 @@ flowchart LR
 | `workflow-runtime/workflow_yaml.py` | Tải YAML, phân nhánh inline / queue, `build_instruction` |
 | `workflow-runtime/workflow_queue_mode.py` | Chế độ queue: enqueue, poll, state file |
 | `workflow-runtime/ops_center.py` | `WorkflowJob`, `WorkflowResult`, kênh `workflow` |
-| `core/mia/working_queue/` | Lưu file JSON, `WorkingQueueService` (poll trong gateway) |
+| `agents/core/mia/working_queue/` | Lưu file JSON, `WorkingQueueService` (poll trong gateway) |
 | `workflow-runtime/workflow_human_approval.py` | Phê duyệt con người: `decision.json` (approve / reject + feedback), làm lại cùng bước khi reject |
 
 ## Phê duyệt con người (`human_approval`)
@@ -108,6 +108,6 @@ flowchart LR
 
 ## Điều kiện cần (tóm tắt)
 
-- Cài mia: `pip install -e ../core` (cùng venv).  
+- Cài mia: `pip install -e ../agents/core` (cùng venv).  
 - **Queue**: mỗi agent đích cần gateway sống, `config` có `workingQueue.enabled: true` và cùng `working_queue` subdir (mặc định tên thư mục).  
 - `agent_profiles` mỗi bước phải ánh `role` tới entry có `config` (và tùy `workspace` khi cấu trúc thư mục không mặc định).

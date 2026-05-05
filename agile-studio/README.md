@@ -1,6 +1,6 @@
 # Agile Studio
 
-Hệ thống quản lý Agile **tách service** khỏi `agent/core`: **cùng MySQL host** với backend/agent (trong Docker: service `mysql`, cổng nội bộ `3306`), **database riêng `agile_studio`** — khác `ai_workflow`. HTTP API riêng. Dùng để lưu **dự án**, **member** (người hoặc AI), **gán member vào dự án**, **user story** (trạng thái), **comment** — agent/workspace chỉ cần gọi API hoặc đồng bộ qua `workspace_ref`.
+Hệ thống quản lý Agile **tách service** khỏi `agents/core` (gói mia): **cùng MySQL host** với backend/agent (trong Docker: service `mysql`, cổng nội bộ `3306`), **database riêng `agile_studio`** — khác `ai_workflow`. HTTP API riêng. Dùng để lưu **dự án**, **member** (người hoặc AI), **gán member vào dự án**, **user story** (trạng thái), **comment** — agent/workspace chỉ cần gọi API hoặc đồng bộ qua `workspace_ref`.
 
 ## Mô hình dữ liệu
 
@@ -10,6 +10,8 @@ Hệ thống quản lý Agile **tách service** khỏi `agent/core`: **cùng MyS
 | `projects` | `slug` duy nhất, `workspace_ref`, cột JSON `settings_json` (GitHub, Slack/Discord webhook, `documents_storage_path`, `notes`, …). |
 | `project_members` | Gán member vào dự án + `role` (`owner`, `admin`, `member`, `viewer`, …). |
 | `stories` | Story theo từng project, số `story_number` tăng tự động; khóa hiển thị `{slug}-{number}`; `status` gồm `icebox` (mặc định), `backlog`, luồng làm (`ready` / `in_progress` / `review`), `done`, `cancelled`. |
+| `story_tasks` | Task trong story: `title`, markdown `body`, `done`, `sort_order`, `reporter_id` (member báo cáo); không phải thẻ Kanban. |
+| `story_task_assignees` | Nhiều người/AI được giao cho một task (`task_id`, `member_id`); member phải thuộc project của story. |
 | `story_comments` | Comment trên story; `author_member_id` phải là member của **cùng dự án**. |
 | `users` | Đăng nhập web: `email` (duy nhất), `password_hash` (bcrypt), `display_name`, liên kết 1–1 `member_id` (member `human` tạo khi đăng ký). |
 
@@ -27,6 +29,14 @@ mysql -h127.0.0.1 -P3307 -uroot -proot < schema/init_mysql.sql
 ```
 
 Nếu DB **đã tạo trước** khi có `settings_json`, chạy thêm: `schema/migrate_project_settings_json.sql` (một lần).
+
+Nếu DB **đã có trước** khi có bảng checklist/subtask cũ hoặc cần tạo `story_tasks`: `mysql ... < schema/migrate_story_tasks.sql` (một lần; script drop `story_subtasks` nếu tồn tại rồi tạo `story_tasks` + `story_task_assignees`).
+
+Nếu DB đã có `story_tasks` **chưa có** `reporter_id` / `story_task_assignees`: `mysql ... < schema/migrate_story_task_assignees_reporter.sql` (một lần).
+
+Nếu wiki vẫn dùng cột `wiki_documents.story_id` (cũ) và cần **nhiều story → một doc**: chạy một lần `schema/migrate_wiki_document_stories.sql` (tạo `wiki_document_stories`, copy dữ liệu, bỏ `story_id` khỏi `wiki_documents`).
+
+Nếu cần **thư mục (cây) cho tài liệu wiki**: chạy một lần `schema/migrate_wiki_folders.sql` (bảng `wiki_folders`, cột `wiki_documents.folder_id`).
 
 URL kết nối — **cùng host, khác database** so với backend:
 
@@ -89,8 +99,22 @@ PYTHONPATH=. uvicorn agile_hub.main:app --host 127.0.0.1 --port 9120
 | `AGILE_DATABASE_URL` | Bắt buộc — SQLAlchemy URL (MySQL khuyến nghị). |
 | `AGILE_LISTEN_PORT` | Cổng HTTP (mặc định 9120). |
 | `AGILE_LISTEN_HOST` | Host bind (mặc định 127.0.0.1). |
+| `AGILE_CHAT_SERVICE_URL` | Base URL **chat-service** (vd. `http://127.0.0.1:3001`). Cần để ghi tin nhắn agent (kể cả qua HTTP callback từ API Center). |
+| `AGILE_AGENT_REPLY_TOKEN` | Chuỗi bí mật dùng cho `Authorization: Bearer` khi **API Center** gọi `POST /api/v1/integrations/api-center/agent-reply`. Phải **trùng** với `API_CENTER_AGILE_REPLY_TOKEN` trên process `api_center`. Khi đặt hai biến và `API_CENTER_AGILE_REPLY_URL=http://127.0.0.1:9120/api/v1/integrations/api-center/agent-reply`, phản hồi agent được đẩy vào chat ổn định (không chỉ dựa vào WebSocket trình duyệt). |
 
 Khi API khởi động, service gọi `Base.metadata.create_all()` (bảng chưa có thì tạo; đã có từ `init_mysql.sql` thì thường không đổi). Có thể chỉ dùng một trong hai: **chỉ SQL init** hoặc **chỉ để app tạo bảng** (dev).
+
+## MCP server (`mcp_server/`)
+
+Server MCP (FastMCP) truy cập **cùng database** Agile Studio qua `AGILE_DATABASE_URL`, không dùng JWT. Cài dependency MCP: `pip install -r requirements-mcp.txt`. Cách chạy và transport (stdio / HTTP / SSE): xem `mcp_server/START.txt`.
+
+**Tài liệu tool:** `mcp_server/MCP_TOOLS_REFERENCE.md`.
+
+REST wiki (`/projects/{id}/docs`) trả mỗi doc kèm `story_ids` / `story_keys`: nhiều story có thể trỏ cùng một tài liệu; `story_id` / `story_key` vẫn là story đầu tiên (tương thích).
+
+**Ngữ cảnh cho AI (tiếng Anh):** `docs/AI_AGILE_STUDIO_CONTEXT.md` — copy vào prompt hoặc đính kèm trong session; không bắt buộc (và không nên) hard‑link từ repo agent vì Agile Studio có thể tách khỏi monorepo.
+
+**Story tasks (CRUD qua MCP):** `agile_story_tasks_list`, `agile_story_task_get`, `agile_story_task_create`, `agile_story_task_update`, `agile_story_task_delete`. Mỗi task có `assignee_ids` (nhiều member project), `reporter_id`, `title`, `body` (markdown), `done`. Các tool `agile_story_get`, `agile_story_create`, `agile_story_update` trả story kèm mảng `tasks` đầy đủ.
 
 ## Kết nối agent / workspace runtime (bước tiếp)
 
@@ -104,7 +128,10 @@ Khi API khởi động, service gọi `Base.metadata.create_all()` (bảng chưa
 agile-studio/
   README.md
   requirements.txt
+  requirements-mcp.txt
   web/                 # UI Vite + React
+  docs/                # AI context (English), ví dụ AI_AGILE_STUDIO_CONTEXT.md
+  mcp_server/          # MCP FastMCP (DB trực tiếp)
   schema/
     init_mysql.sql
   agile_hub/

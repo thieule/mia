@@ -257,3 +257,89 @@ def schedule_dispatch_after_mcp_chat_message(
             log.warning("chat_api_center_bridge background task: %s", e)
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def _dm_room_user_id_from_pair(
+    project_id: int,
+    channel_id: str,
+    human_sender_id: int,
+) -> int:
+    """Cạnh DM: peer (room.userId) khi biết người gửi tin gốc (human)."""
+    m = re.match(rf"^{int(project_id)}_dm_(\d+)_(\d+)$", (channel_id or "").strip())
+    if not m:
+        return 0
+    a, b = int(m.group(1)), int(m.group(2))
+    hs = int(human_sender_id or 0)
+    if hs == a:
+        return b
+    if hs == b:
+        return a
+    return max(a, b)
+
+
+def ingest_api_center_agent_reply(db: Session, body: dict[str, Any]) -> dict[str, Any]:
+    """
+    Nhận POST từ API Center (callback HTTP) khi MCP không giao được reply — ghi tin agent vào chat-service.
+    Body cùng shape ``reply_payload`` (event, trace_id, project_id, channel_id, content, target_agent_id, metadata.sender).
+    """
+    project_id = int(str(body.get("project_id") or "0").strip() or "0")
+    channel_id = str(body.get("channel_id") or "").strip()
+    content = str(body.get("content") or "").strip()
+    target_agent_id = _normalize_catalog_agent_id(str(body.get("target_agent_id") or "").strip())
+    meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    sender = meta.get("sender") if isinstance(meta.get("sender"), dict) else {}
+    try:
+        human_sender_id = int(sender.get("id") or 0)
+    except (TypeError, ValueError):
+        human_sender_id = 0
+
+    if project_id <= 0 or not channel_id or not content or not target_agent_id:
+        raise ValueError("project_id, channel_id, content, target_agent_id required")
+
+    mmap = crud.project_ai_agent_member_ids_map(db, project_id)
+    agent_mid: int | None = None
+    for k, v in mmap.items():
+        if _normalize_catalog_agent_id(str(k)) == target_agent_id:
+            agent_mid = int(v)
+            break
+    if agent_mid is None or agent_mid <= 0:
+        raise ValueError(f"no project AI member for target_agent_id={target_agent_id!r}")
+
+    mem = crud.member_get(db, agent_mid)
+    sender_name = ((getattr(mem, "display_name", None) or "").strip() if mem else "") or target_agent_id
+
+    m_dm = re.match(rf"^{project_id}_dm_(\d+)_(\d+)$", channel_id)
+    if m_dm:
+        room_uid = _dm_room_user_id_from_pair(project_id, channel_id, human_sender_id)
+        if room_uid <= 0:
+            raise ValueError("invalid DM channel_id")
+        _post_agent_reply_to_chat_service(
+            project_id=project_id,
+            target_kind="private_user",
+            channel_name=None,
+            user_id=room_uid,
+            original_sender_id=human_sender_id,
+            agent_member_id=agent_mid,
+            sender_name=sender_name,
+            content=content,
+        )
+        return {"ok": True, "routed": "private_user", "trace_id": body.get("trace_id")}
+
+    m_pc = re.match(rf"^{project_id}_(.+)$", channel_id)
+    if m_pc:
+        rest = str(m_pc.group(1) or "").strip()
+        if not rest or rest.startswith("dm_"):
+            raise ValueError("invalid channel_id for project channel")
+        _post_agent_reply_to_chat_service(
+            project_id=project_id,
+            target_kind="project_channel",
+            channel_name=rest,
+            user_id=0,
+            original_sender_id=human_sender_id or 0,
+            agent_member_id=agent_mid,
+            sender_name=sender_name,
+            content=content,
+        )
+        return {"ok": True, "routed": "project_channel", "trace_id": body.get("trace_id")}
+
+    raise ValueError("channel_id format not recognized (expected {pid}_dm_a_b or {pid}_channelName)")

@@ -4,11 +4,12 @@ from datetime import datetime, time
 from decimal import Decimal
 import re
 import secrets
+import uuid
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from . import models
+from . import models, wiki_embedding
 from .schemas import (
     CommentCreate,
     CommentUpdate,
@@ -20,8 +21,14 @@ from .schemas import (
     WorkflowTemplateCreate,
     StoryCreate,
     StoryPatch,
+    StoryTaskCreate,
+    StoryTaskPatch,
     ReleaseCreate,
     ReleasePatch,
+    WikiFolderCreate,
+    WikiFolderPatch,
+    WikiDocCreate,
+    WikiDocPatch,
 )
 
 _COMMENT_MENTION_RE = re.compile(r"@([A-Za-z0-9._-]+)")
@@ -705,6 +712,190 @@ def story_status_events_list(db: Session, story_id: int, *, limit: int = 100) ->
     )
 
 
+def story_touch_updated(db: Session, story_id: int) -> None:
+    s = story_get(db, story_id)
+    if s is None:
+        return
+    s.updated_at = datetime.utcnow()
+    db.add(s)
+    db.flush()
+
+
+def story_tasks_list(db: Session, story_id: int) -> list[models.StoryTask]:
+    return list(
+        db.scalars(
+            select(models.StoryTask)
+            .where(models.StoryTask.story_id == story_id)
+            .order_by(models.StoryTask.sort_order, models.StoryTask.id)
+        ).all()
+    )
+
+
+def _validate_task_reporter(reporter_id: int | None, project_member_ids_set: set[int]) -> None:
+    if reporter_id is None:
+        return
+    if reporter_id not in project_member_ids_set:
+        raise ValueError("reporter must be a project member in this project")
+
+
+def story_task_assignee_ids_get(db: Session, task_id: int) -> list[int]:
+    rows = db.scalars(
+        select(models.StoryTaskAssignee.member_id)
+        .where(models.StoryTaskAssignee.task_id == task_id)
+        .order_by(models.StoryTaskAssignee.member_id)
+    ).all()
+    return [int(x) for x in rows]
+
+
+def story_task_assignee_ids_map_for_tasks(db: Session, task_ids: list[int]) -> dict[int, list[int]]:
+    if not task_ids:
+        return {}
+    rows = db.execute(
+        select(models.StoryTaskAssignee.task_id, models.StoryTaskAssignee.member_id)
+        .where(models.StoryTaskAssignee.task_id.in_(task_ids))
+        .order_by(models.StoryTaskAssignee.task_id, models.StoryTaskAssignee.member_id)
+    ).all()
+    out: dict[int, list[int]] = {}
+    for tid, mid in rows:
+        out.setdefault(int(tid), []).append(int(mid))
+    return out
+
+
+def story_task_set_assignees(
+    db: Session, task: models.StoryTask, member_ids: list[int], project_member_ids_set: set[int]
+) -> None:
+    for mid in member_ids:
+        if mid not in project_member_ids_set:
+            raise ValueError("task assignee must be a project member in this project")
+    ordered = _dedupe_preserve(member_ids)
+    db.execute(delete(models.StoryTaskAssignee).where(models.StoryTaskAssignee.task_id == task.id))
+    for mid in ordered:
+        db.add(models.StoryTaskAssignee(task_id=task.id, member_id=mid))
+    db.flush()
+
+
+def story_task_to_out(db: Session, task: models.StoryTask) -> dict:
+    aids = story_task_assignee_ids_get(db, task.id)
+    aid0 = aids[0] if aids else None
+    return {
+        "id": task.id,
+        "story_id": task.story_id,
+        "title": task.title,
+        "body": task.body,
+        "done": task.done,
+        "sort_order": task.sort_order,
+        "assignee_ids": aids,
+        "assignee_id": aid0,
+        "reporter_id": task.reporter_id,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
+def story_tasks_out_list(db: Session, story_id: int) -> list[dict]:
+    rows = story_tasks_list(db, story_id)
+    if not rows:
+        return []
+    amap = story_task_assignee_ids_map_for_tasks(db, [x.id for x in rows])
+    out: list[dict] = []
+    for x in rows:
+        aids = amap.get(x.id, [])
+        aid0 = aids[0] if aids else None
+        out.append(
+            {
+                "id": x.id,
+                "story_id": x.story_id,
+                "title": x.title,
+                "body": x.body,
+                "done": x.done,
+                "sort_order": x.sort_order,
+                "assignee_ids": aids,
+                "assignee_id": aid0,
+                "reporter_id": x.reporter_id,
+                "created_at": x.created_at,
+                "updated_at": x.updated_at,
+            }
+        )
+    return out
+
+
+def _next_story_task_sort_order(db: Session, story_id: int) -> int:
+    m = db.scalar(
+        select(func.coalesce(func.max(models.StoryTask.sort_order), -1)).where(
+            models.StoryTask.story_id == story_id
+        )
+    )
+    return int(m) + 1
+
+
+def story_task_create(db: Session, story_id: int, body: StoryTaskCreate) -> models.StoryTask:
+    s = story_get(db, story_id)
+    if s is None:
+        raise ValueError("Story not found")
+    mids = project_member_ids(db, s.project_id)
+    _validate_task_reporter(body.reporter_id, mids)
+    ord_ = body.sort_order if body.sort_order is not None else _next_story_task_sort_order(db, story_id)
+    raw_body = body.body
+    body_clean = raw_body.strip() if isinstance(raw_body, str) else None
+    want_aids = _dedupe_preserve(list(body.assignee_ids))
+    st = models.StoryTask(
+        story_id=story_id,
+        title=body.title.strip(),
+        body=body_clean or None,
+        done=bool(body.done),
+        sort_order=ord_,
+        reporter_id=body.reporter_id,
+    )
+    db.add(st)
+    db.flush()
+    story_task_set_assignees(db, st, want_aids, mids)
+    story_touch_updated(db, story_id)
+    return st
+
+
+def story_task_get(db: Session, task_id: int) -> models.StoryTask | None:
+    return db.get(models.StoryTask, task_id)
+
+
+def story_task_patch(db: Session, st: models.StoryTask, body: StoryTaskPatch) -> models.StoryTask:
+    s = story_get(db, st.story_id)
+    if s is None:
+        raise ValueError("Story not found")
+    mids = project_member_ids(db, s.project_id)
+    data = body.model_dump(exclude_unset=True)
+    if "assignee_ids" in data:
+        mlist = _dedupe_preserve([int(x) for x in (data.get("assignee_ids") or [])])
+        story_task_set_assignees(db, st, mlist, mids)
+    if "reporter_id" in data:
+        rid = data["reporter_id"]
+        _validate_task_reporter(rid, mids)
+        st.reporter_id = rid
+    if "title" in data and data["title"] is not None:
+        st.title = str(data["title"]).strip()
+    if "body" in data:
+        b = data["body"]
+        if b is None:
+            st.body = None
+        else:
+            t = str(b).strip()
+            st.body = t or None
+    if "done" in data and data["done"] is not None:
+        st.done = bool(data["done"])
+    if "sort_order" in data and data["sort_order"] is not None:
+        st.sort_order = int(data["sort_order"])
+    db.add(st)
+    db.flush()
+    story_touch_updated(db, st.story_id)
+    return st
+
+
+def story_task_delete(db: Session, st: models.StoryTask) -> None:
+    sid = st.story_id
+    db.delete(st)
+    db.flush()
+    story_touch_updated(db, sid)
+
+
 def user_get_by_email(db: Session, email: str) -> models.User | None:
     e = email.strip().lower()
     return db.scalar(select(models.User).where(models.User.email == e))
@@ -723,13 +914,18 @@ def user_create(db: Session, *, email: str, password_hash: str, display_name: st
 
 
 def story_to_out(
-    s: models.Story, project_slug: str, db: Session, assignee_ids: list[int] | None = None
+    s: models.Story,
+    project_slug: str,
+    db: Session,
+    assignee_ids: list[int] | None = None,
+    *,
+    include_tasks: bool = False,
 ) -> dict:
     aids = assignee_ids if assignee_ids is not None else story_assignee_ids_get(db, s.id)
     if not aids and s.assignee_id is not None:
         aids = [s.assignee_id]
     aid0 = aids[0] if aids else None
-    return {
+    out: dict = {
         "id": s.id,
         "project_id": s.project_id,
         "story_key": f"{project_slug}-{s.story_number}",
@@ -746,4 +942,466 @@ def story_to_out(
         "reporter_id": s.reporter_id,
         "created_at": s.created_at,
         "updated_at": s.updated_at,
+        "tasks": [],
+    }
+    if include_tasks:
+        out["tasks"] = story_tasks_out_list(db, s.id)
+    return out
+
+
+# --- Wiki documents ---
+
+_SLUG_PART = re.compile(r"[^a-z0-9]+")
+
+
+def wiki_slugify(raw: str) -> str:
+    s = _SLUG_PART.sub("-", (raw or "").lower().strip())
+    s = re.sub(r"-+", "-", s).strip("-")
+    return (s or "doc")[:128]
+
+
+def wiki_unique_slug(db: Session, project_id: int, base: str) -> str:
+    b = wiki_slugify(base)[:120]
+    for i in range(0, 2000):
+        cand = b if i == 0 else f"{b}-{i}"
+        hit = db.scalar(
+            select(models.WikiDocument.id).where(
+                models.WikiDocument.project_id == project_id,
+                models.WikiDocument.slug == cand,
+            )
+        )
+        if hit is None:
+            return cand
+    return f"{b}-{uuid.uuid4().hex[:10]}"
+
+
+def _wiki_story_must_be_in_project(db: Session, project_id: int, story_id: int | None) -> None:
+    if story_id is None:
+        return
+    s = story_get(db, story_id)
+    if s is None or s.project_id != project_id:
+        raise ValueError("story does not exist or is not in this project")
+
+
+def _wiki_story_ids_from_create(body: WikiDocCreate) -> list[int]:
+    raw: list[int] = []
+    for x in body.story_ids or []:
+        if x is not None and int(x) > 0:
+            raw.append(int(x))
+    if body.story_id is not None and int(body.story_id) > 0:
+        raw.append(int(body.story_id))
+    out: list[int] = []
+    seen: set[int] = set()
+    for x in raw:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    out.sort()
+    return out
+
+
+def wiki_folder_get(db: Session, folder_id: int) -> models.WikiFolder | None:
+    return db.get(models.WikiFolder, folder_id)
+
+
+def wiki_folder_for_project(db: Session, project_id: int, folder_id: int) -> models.WikiFolder | None:
+    f = wiki_folder_get(db, folder_id)
+    if f is None or f.project_id != project_id:
+        return None
+    return f
+
+
+def _wiki_folder_name_unique(
+    db: Session,
+    project_id: int,
+    parent_id: int | None,
+    name: str,
+    *,
+    exclude_id: int | None = None,
+) -> None:
+    stmt = select(models.WikiFolder.id).where(
+        models.WikiFolder.project_id == project_id,
+        models.WikiFolder.name == name,
+    )
+    if parent_id is None:
+        stmt = stmt.where(models.WikiFolder.parent_id.is_(None))
+    else:
+        stmt = stmt.where(models.WikiFolder.parent_id == parent_id)
+    if exclude_id is not None:
+        stmt = stmt.where(models.WikiFolder.id != exclude_id)
+    hit = db.scalar(stmt)
+    if hit is not None:
+        raise ValueError("folder name already exists in this location")
+
+
+def wiki_folders_list_all(db: Session, project_id: int) -> list[models.WikiFolder]:
+    return list(
+        db.scalars(
+            select(models.WikiFolder)
+            .where(models.WikiFolder.project_id == project_id)
+            .order_by(models.WikiFolder.sort_order, models.WikiFolder.name)
+        ).all()
+    )
+
+
+def wiki_folders_build_tree(rows: list[models.WikiFolder]) -> list[dict]:
+    by_parent: dict[int | None, list[models.WikiFolder]] = {}
+    for f in rows:
+        by_parent.setdefault(f.parent_id, []).append(f)
+    for lst in by_parent.values():
+        lst.sort(key=lambda x: (x.sort_order, x.name.lower()))
+
+    def walk(pid: int | None) -> list[dict]:
+        out: list[dict] = []
+        for f in by_parent.get(pid, []):
+            out.append(
+                {
+                    "id": f.id,
+                    "parent_id": f.parent_id,
+                    "name": f.name,
+                    "sort_order": f.sort_order,
+                    "children": walk(f.id),
+                }
+            )
+        return out
+
+    return walk(None)
+
+
+def wiki_folder_create(db: Session, project_id: int, body: WikiFolderCreate) -> models.WikiFolder:
+    name = (body.name or "").strip()
+    if not name:
+        raise ValueError("folder name required")
+    par = body.parent_id
+    if par is not None:
+        if wiki_folder_for_project(db, project_id, int(par)) is None:
+            raise ValueError("parent folder not found")
+    _wiki_folder_name_unique(db, project_id, par, name)
+    if par is None:
+        q = select(func.coalesce(func.max(models.WikiFolder.sort_order), -1)).where(
+            models.WikiFolder.project_id == project_id,
+            models.WikiFolder.parent_id.is_(None),
+        )
+    else:
+        q = select(func.coalesce(func.max(models.WikiFolder.sort_order), -1)).where(
+            models.WikiFolder.project_id == project_id,
+            models.WikiFolder.parent_id == par,
+        )
+    so = int(db.scalar(q) or -1) + 1
+    fold = models.WikiFolder(project_id=project_id, parent_id=par, name=name, sort_order=so)
+    db.add(fold)
+    db.flush()
+    return fold
+
+
+def wiki_folder_patch(db: Session, fold: models.WikiFolder, body: WikiFolderPatch) -> models.WikiFolder:
+    data = body.model_dump(exclude_unset=True)
+    if "name" in data and data["name"] is not None:
+        nn = data["name"].strip()
+        if not nn:
+            raise ValueError("folder name required")
+        _wiki_folder_name_unique(db, fold.project_id, fold.parent_id, nn, exclude_id=fold.id)
+        fold.name = nn
+    db.add(fold)
+    db.flush()
+    return fold
+
+
+def wiki_folder_delete(db: Session, fold: models.WikiFolder) -> None:
+    db.delete(fold)
+    db.flush()
+
+
+def wiki_doc_set_linked_stories(db: Session, doc: models.WikiDocument, story_ids: list[int]) -> None:
+    """Thay toàn bộ liên kết story cho doc; mỗi story phải thuộc cùng project."""
+    for sid in story_ids:
+        _wiki_story_must_be_in_project(db, doc.project_id, sid)
+    db.execute(delete(models.WikiDocumentStory).where(models.WikiDocumentStory.wiki_document_id == doc.id))
+    db.flush()
+    # Core delete() xóa DB nhưng instance WikiDocumentStory vẫn nằm trong doc.story_links (trạng thái deleted).
+    # expire để không còn tham chiếu tới object đã xóa trước khi db.add(doc) ở wiki_doc_patch.
+    db.expire(doc, ["story_links"])
+    for sid in story_ids:
+        db.add(models.WikiDocumentStory(wiki_document_id=doc.id, story_id=sid))
+    db.flush()
+
+
+def wiki_doc_recompute_embedding(doc: models.WikiDocument) -> list[float]:
+    blob = f"{doc.title}\n\n{doc.content}"
+    return wiki_embedding.embed_text(blob)
+
+
+def wiki_doc_create(db: Session, project_id: int, body: WikiDocCreate, author_member_id: int) -> models.WikiDocument:
+    link_ids = _wiki_story_ids_from_create(body)
+    doc_folder_id: int | None = None
+    if body.folder_id is not None:
+        if wiki_folder_for_project(db, project_id, int(body.folder_id)) is None:
+            raise ValueError("folder not found")
+        doc_folder_id = int(body.folder_id)
+    slug_in = (body.slug or "").strip()
+    if slug_in:
+        slug = wiki_slugify(slug_in)
+        hit = db.scalar(
+            select(models.WikiDocument.id).where(
+                models.WikiDocument.project_id == project_id,
+                models.WikiDocument.slug == slug,
+            )
+        )
+        if hit is not None:
+            raise ValueError("slug already exists in this project")
+    else:
+        slug = wiki_unique_slug(db, project_id, body.title)
+    tags = [str(x).strip() for x in (body.tags or []) if str(x).strip()]
+    doc = models.WikiDocument(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        folder_id=doc_folder_id,
+        slug=slug,
+        title=body.title.strip(),
+        content=body.content or "",
+        tags_json=tags if tags else None,
+        author_member_id=author_member_id,
+        is_draft=bool(body.is_draft),
+        embedding_json=None,
+    )
+    doc.embedding_json = wiki_doc_recompute_embedding(doc)
+    db.add(doc)
+    db.flush()
+    if link_ids:
+        wiki_doc_set_linked_stories(db, doc, link_ids)
+    db.refresh(doc)
+    return doc
+
+
+def wiki_doc_get(db: Session, doc_id: str) -> models.WikiDocument | None:
+    return db.scalar(
+        select(models.WikiDocument)
+        .options(selectinload(models.WikiDocument.story_links))
+        .where(models.WikiDocument.id == doc_id)
+    )
+
+
+def wiki_doc_get_by_slug(db: Session, project_id: int, slug: str) -> models.WikiDocument | None:
+    s = wiki_slugify(slug)
+    return db.scalar(
+        select(models.WikiDocument)
+        .options(selectinload(models.WikiDocument.story_links))
+        .where(
+            models.WikiDocument.project_id == project_id,
+            models.WikiDocument.slug == s,
+        )
+    )
+
+
+def wiki_doc_patch(db: Session, doc: models.WikiDocument, body: WikiDocPatch) -> models.WikiDocument:
+    data = body.model_dump(exclude_unset=True)
+    if "title" in data and data["title"] is not None:
+        doc.title = data["title"].strip()
+    if "content" in data and data["content"] is not None:
+        doc.content = data["content"]
+    if "story_ids" in data:
+        raw = data["story_ids"]
+        ids = [int(x) for x in (raw or []) if x is not None and int(x) > 0]
+        ids = sorted(set(ids))
+        wiki_doc_set_linked_stories(db, doc, ids)
+    elif "story_id" in data:
+        sid = data["story_id"]
+        wiki_doc_set_linked_stories(db, doc, [] if sid is None else [int(sid)])
+    if "folder_id" in data:
+        fd = data["folder_id"]
+        if fd is not None:
+            if wiki_folder_for_project(db, doc.project_id, int(fd)) is None:
+                raise ValueError("folder not found")
+            doc.folder_id = int(fd)
+        else:
+            doc.folder_id = None
+    if "is_draft" in data and data["is_draft"] is not None:
+        doc.is_draft = bool(data["is_draft"])
+    if "tags" in data and data["tags"] is not None:
+        tags = [str(x).strip() for x in data["tags"] if str(x).strip()]
+        doc.tags_json = tags if tags else None
+    if "slug" in data and data["slug"] is not None:
+        ns = wiki_slugify(data["slug"])
+        if not ns:
+            raise ValueError("invalid slug")
+        hit = db.scalar(
+            select(models.WikiDocument.id).where(
+                models.WikiDocument.project_id == doc.project_id,
+                models.WikiDocument.slug == ns,
+                models.WikiDocument.id != doc.id,
+            )
+        )
+        if hit is not None:
+            raise ValueError("slug already exists in this project")
+        doc.slug = ns
+    emb_refresh = "title" in data or "content" in data
+    if emb_refresh:
+        doc.embedding_json = wiki_doc_recompute_embedding(doc)
+    db.add(doc)
+    db.flush()
+    db.refresh(doc)
+    return doc
+
+
+def wiki_doc_delete(db: Session, doc: models.WikiDocument) -> None:
+    db.delete(doc)
+    db.flush()
+
+
+def wiki_documents_list(
+    db: Session,
+    project_id: int,
+    *,
+    story_id: int | None = None,
+    folder_id: int | None = None,
+    unfiled_only: bool = False,
+    q: str | None = None,
+    tag: str | None = None,
+    limit: int = 100,
+) -> list[models.WikiDocument]:
+    limit = min(max(limit, 1), 500)
+    stmt = (
+        select(models.WikiDocument)
+        .options(selectinload(models.WikiDocument.story_links))
+        .where(models.WikiDocument.project_id == project_id)
+    )
+    if unfiled_only:
+        stmt = stmt.where(models.WikiDocument.folder_id.is_(None))
+    elif folder_id is not None:
+        stmt = stmt.where(models.WikiDocument.folder_id == folder_id)
+    if story_id is not None:
+        wds = models.WikiDocumentStory
+        stmt = (
+            stmt.join(wds, wds.wiki_document_id == models.WikiDocument.id)
+            .where(wds.story_id == story_id)
+            .distinct()
+        )
+    if (q or "").strip():
+        qq = f"%{(q or '').strip()}%"
+        stmt = stmt.where(or_(models.WikiDocument.title.like(qq), models.WikiDocument.content.like(qq)))
+    stmt = stmt.order_by(models.WikiDocument.updated_at.desc()).limit(limit)
+    rows = list(db.scalars(stmt).all())
+    if (tag or "").strip() and rows:
+        tl = (tag or "").strip().lower()
+        rows = [
+            r
+            for r in rows
+            if r.tags_json
+            and isinstance(r.tags_json, list)
+            and any(str(x).strip().lower() == tl for x in r.tags_json)
+        ]
+    return rows
+
+
+def wiki_docs_semantic_search(
+    db: Session,
+    project_id: int,
+    query: str,
+    *,
+    story_id: int | None = None,
+    top_k: int = 10,
+) -> list[tuple[float, models.WikiDocument]]:
+    top_k = min(max(top_k, 1), 50)
+    qv = wiki_embedding.embed_text(query)
+    stmt = select(models.WikiDocument).where(models.WikiDocument.project_id == project_id)
+    if story_id is not None:
+        wds = models.WikiDocumentStory
+        stmt = (
+            stmt.join(wds, wds.wiki_document_id == models.WikiDocument.id)
+            .where(wds.story_id == story_id)
+            .distinct()
+        )
+    stmt = stmt.options(selectinload(models.WikiDocument.story_links))
+    rows = list(db.scalars(stmt).all())
+    scored: list[tuple[float, models.WikiDocument]] = []
+    for r in rows:
+        ej = r.embedding_json
+        if not ej or not isinstance(ej, list):
+            continue
+        try:
+            vec = [float(x) for x in ej]
+        except (TypeError, ValueError):
+            continue
+        if len(vec) != len(qv):
+            continue
+        sc = wiki_embedding.cosine_similarity(qv, vec)
+        scored.append((sc, r))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:top_k]
+
+
+def wiki_context_for_story(db: Session, project_id: int, story_id: int, *, limit: int = 16) -> list[dict]:
+    """Ngữ cảnh tài liệu cho story: doc gắn story trước, bổ sung semantic trong cùng project."""
+    st = story_get(db, story_id)
+    if st is None or st.project_id != project_id:
+        raise ValueError("invalid story")
+    p = project_get(db, project_id)
+    pslug = p.slug if p else ""
+    limit = min(max(limit, 1), 80)
+    attached = wiki_documents_list(db, project_id, story_id=story_id, limit=80)
+    blob = f"{st.title}\n\n{(st.description or '')[:6000]}"
+    sem = wiki_docs_semantic_search(db, project_id, blob, story_id=None, top_k=limit + len(attached))
+    seen: set[str] = set()
+    out: list[dict] = []
+    for d in attached:
+        seen.add(d.id)
+        out.append(
+            {
+                **wiki_doc_to_out(db, d, project_slug=pslug, semantic_score=None),
+                "context_role": "attached_to_story",
+            }
+        )
+    for sc, d in sem:
+        if d.id in seen:
+            continue
+        seen.add(d.id)
+        out.append(
+            {
+                **wiki_doc_to_out(db, d, project_slug=pslug, semantic_score=sc),
+                "context_role": "semantic",
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def wiki_doc_to_out(
+    db: Session,
+    doc: models.WikiDocument,
+    *,
+    project_slug: str,
+    semantic_score: float | None = None,
+) -> dict:
+    tags: list[str] = []
+    if doc.tags_json and isinstance(doc.tags_json, list):
+        tags = [str(x) for x in doc.tags_json if x is not None]
+    link_ids = [ls.story_id for ls in (doc.story_links or [])]
+    link_ids.sort()
+    story_keys: list[str] = []
+    for sid in link_ids:
+        st = story_get(db, sid)
+        if st:
+            story_keys.append(f"{project_slug}-{st.story_number}")
+    sk0 = story_keys[0] if story_keys else None
+    emb_len = len(doc.embedding_json) if isinstance(doc.embedding_json, list) else None
+    return {
+        "id": doc.id,
+        "project_id": doc.project_id,
+        "folder_id": doc.folder_id,
+        "story_id": link_ids[0] if link_ids else None,
+        "story_ids": link_ids,
+        "story_keys": story_keys,
+        "slug": doc.slug,
+        "title": doc.title,
+        "content": doc.content,
+        "tags": tags,
+        "author_member_id": doc.author_member_id,
+        "is_draft": bool(doc.is_draft),
+        "created_at": doc.created_at,
+        "updated_at": doc.updated_at,
+        "story_key": sk0,
+        "semantic_score": semantic_score,
+        "embedding_dims": emb_len,
     }

@@ -223,7 +223,7 @@ Các tool project trả `project` theo shape mở rộng:
 ### `agile_story_get(story_id)`
 - **Params**:
   - `story_id: int`
-- **Response success**: `StoryOut`
+- **Response success**: `StoryOut` (gồm `tasks: StoryTaskOut[]` — `assignee_ids`, `reporter_id`, title, optional `body`, `done`, …)
 - **Response error**:
   - `{"error":"not_found","story_id":<int>}`
 
@@ -236,7 +236,7 @@ Các tool project trả `project` theo shape mở rộng:
     - `release_id`, `release_label`
     - `assignee_id` (legacy), `assignee_ids`
     - `reporter_id`
-- **Response success**: `StoryOut`
+- **Response success**: `StoryOut` (luôn gồm `tasks[]` đầy đủ — story mới thường `tasks` rỗng)
 - **Response error**:
   - `{"error":"not_found","project_id":<int>}`
   - `{"error":"..."}`
@@ -245,11 +245,42 @@ Các tool project trả `project` theo shape mở rộng:
 - **Params**:
   - `story_id: int`
   - `patch_json: string(JSON)` theo `StoryPatch`, chỉ gửi field cần update
-- **Response success**: `StoryOut`
+- **Response success**: `StoryOut` (luôn gồm `tasks[]` đầy đủ sau khi cập nhật)
 - **Response error**:
   - `{"error":"not_found","story_id":<int>}`
   - `{"error":"project missing","story_id":<int>}`
   - `{"error":"..."}`
+
+### Tasks (trong story)
+
+### `agile_story_tasks_list(story_id)`
+- **Params**: `story_id: int`
+- **Response success**: `StoryTaskOut[]`
+- **Response error**: `{"error":"not_found","story_id":<int>}`
+
+### `agile_story_task_get(story_id, task_id)`
+- **Params**: `story_id: int`, `task_id: int`
+- **Response success**: `StoryTaskOut`
+- **Response error**: `{"error":"not_found","story_id":<int>}` hoặc `{"error":"not_found","task_id":<int>}`
+
+### `agile_story_task_create(story_id, create_json)`
+- **Params**: `story_id: int`, `create_json: string(JSON)`
+- **create_json**: `{ "title": "...", "body"?: string | null, "done"?: bool, "sort_order"?: int, "assignee_ids"?: int[], "reporter_id"?: int | null }`  
+  - `assignee_ids` / `reporter_id`: chỉ **member đã thêm vào project** (human hoặc AI).
+- **Response success**: `StoryTaskOut`
+- **Response error**: `{"error":"not_found","story_id":<int>}` hoặc `{"error":"..."}`
+
+### `agile_story_task_update(story_id, task_id, patch_json="{}")`
+- **Params**: `story_id: int`, `task_id: int`, `patch_json: string` (mặc định `"{}"`)
+- **patch_json**: `{ "title"?, "body"?, "done"?, "sort_order"?, "assignee_ids"?, "reporter_id"? }`  
+  - `assignee_ids: []` xóa hết người được giao; `reporter_id: null` gỡ reporter.
+- **Response success**: `StoryTaskOut`
+- **Response error**: `{"error":"not_found",...}` hoặc `{"error":"..."}`
+
+### `agile_story_task_delete(story_id, task_id)`
+- **Params**: `story_id: int`, `task_id: int`
+- **Response success**: `{ "ok": true, "task_id": <int> }`
+- **Response error**: `{"error":"not_found",...}`
 
 ---
 
@@ -303,7 +334,37 @@ Các tool project trả `project` theo shape mở rộng:
 
 ---
 
-## 9) Gợi ý chuẩn hoá khi gọi tool từ AI
+## 9) Wiki / Docs (project_id bắt buộc)
+
+Lưu vector embedding trong MySQL (`embedding_json`). Có thể trỏ `AGILE_EMBEDDING_HTTP_URL` (OpenAI-style) + `AGILE_EMBEDDING_HTTP_KEY` + tùy `AGILE_EMBEDDING_DIM`; nếu không, dùng embedding deterministic nội bộ.
+
+### `agile_wiki_read_doc(project_id, doc_id)`
+- Đọc một tài liệu theo UUID `doc_id`.
+
+### `agile_wiki_write_doc(project_id, title, content, author_member_id, story_id=None, story_ids_csv="", folder_id=None, clear_folder=False, doc_id="", slug="", is_draft=True, tags="")`
+- Tạo mới nếu `doc_id` rỗng; ngược lại PATCH. `author_member_id` phải thuộc project.
+- Liên kết story: dùng `story_ids_csv` (vd. `12,34`) và/hoặc `story_id`.
+- **Thư mục:** gọi `agile_wiki_folder_tree` để lấy `folder_id`. Khi **tạo**, truyền `folder_id` để đặt doc vào thư mục đó. Khi **cập nhật**, truyền `folder_id` (số dương) để chuyển thư mục, hoặc `clear_folder=True` để đưa doc về gốc (unfiled).
+- `tags`: danh sách phân tách dấu phẩy.
+
+### `agile_wiki_folder_create(project_id, name, parent_folder_id=None)`
+- Tạo thư mục wiki. `parent_folder_id` để trống = thư mục gốc; tên không trùng trong cùng cấp cha.
+
+### `agile_wiki_folder_tree(project_id)`
+- Trả JSON `{ tree: [ { id, name, parent_id, sort_order, children: [...] } ] }` để chọn `folder_id` khi tạo/sửa doc.
+
+### `agile_wiki_semantic_search(project_id, query, top_k=10, story_id=None)`
+- Tìm kiếm ngữ nghĩa (cosine trên vector đã lưu).
+
+### `agile_wiki_story_context(project_id, story_id, limit=16)`
+- Context cho AI: doc gắn story + kết quả semantic trong project.
+
+### `agile_wiki_list_docs(project_id, story_id=None, in_folder_id=None, unfiled_only=False, q="", limit=50)`
+- Liệt kê / lọc theo `story_id`, từ khóa `q`, và hoặc `in_folder_id` (doc trong thư mục đó) hoặc `unfiled_only` (không thư mục) — không dùng đồng thời `in_folder_id` với `unfiled_only`.
+
+---
+
+## 10) Gợi ý chuẩn hoá khi gọi tool từ AI
 
 - Luôn parse response dưới dạng JSON object/array.
 - Kiểm tra key `error` trước khi dùng dữ liệu.

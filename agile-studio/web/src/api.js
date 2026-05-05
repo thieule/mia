@@ -94,6 +94,16 @@ export async function apiPatch(path, body) {
   return handleResponse(res, path, data);
 }
 
+export async function apiPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(body),
+  });
+  const data = await parseJson(res);
+  return handleResponse(res, path, data);
+}
+
 export async function apiDelete(path) {
   const res = await fetch(`${API_BASE}${path}`, { method: "DELETE", headers: { ...authHeaders() } });
   if (res.status === 204) return null;

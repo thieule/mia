@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -163,7 +164,7 @@ def _session_valid(key: str) -> bool:
     return True
 
 
-def _load_agents(path: Path) -> dict[str, dict[str, Any]]:
+def _load_agents(path: Path, *, allow_empty: bool = False) -> dict[str, dict[str, Any]]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("agents file must be object")
@@ -171,7 +172,7 @@ def _load_agents(path: Path) -> dict[str, dict[str, Any]]:
     for k, v in raw.items():
         if isinstance(k, str) and k.strip() and isinstance(v, dict):
             out[k.strip()] = dict(v)
-    if not out:
+    if not out and not allow_empty:
         raise ValueError("agents file is empty")
     return out
 
@@ -217,9 +218,15 @@ def _merge_agents(agents: dict[str, dict[str, Any]], catalog: dict[str, dict[str
         rows.append(
             {
                 "id": aid,
-                "name": str(c.get("displayName") or c.get("name") or f"Mia {aid}"),
-                "role": str(c.get("role") or "AI assistant"),
-                "description": str(c.get("description") or ""),
+                "name": str(
+                    a.get("display_name")
+                    or a.get("displayName")
+                    or c.get("displayName")
+                    or c.get("name")
+                    or f"Mia {aid}"
+                ),
+                "role": str(a.get("role") or c.get("role") or "AI assistant"),
+                "description": str(a.get("description") or c.get("description") or ""),
                 "workspace": str(a.get("workspace") or ""),
                 "supported_item_kinds": c.get("supportedItemKinds")
                 if isinstance(c.get("supportedItemKinds"), list)
@@ -296,7 +303,7 @@ def _agent_workspace_path(agent: dict[str, Any]) -> Path | None:
 
 
 def _ensure_core_import_path() -> None:
-    core_dir = Path(os.environ.get("API_CENTER_CORE_DIR") or (ROOT.parent / "core")).resolve()
+    core_dir = Path(os.environ.get("API_CENTER_CORE_DIR") or (ROOT.parent / "agents" / "core")).resolve()
     if str(core_dir) not in sys.path:
         sys.path.insert(0, str(core_dir))
 
@@ -1008,6 +1015,8 @@ async def _ingest_working_queue_chat_reply(payload: dict[str, Any]) -> dict[str,
             "mode": "working_queue_webhook",
             "task_id": task_id,
             "delivery_kind": delivery_kind,
+            "sender": payload.get("sender"),
+            "channel_type": channel_type,
         },
         "callback_api_url": callback_api_url,
     }
@@ -1281,7 +1290,7 @@ def _pick_agents_to_start(merged_agents: list[dict[str, Any]], raw_ids: str) -> 
 def _agent_subprocess_env() -> dict[str, str]:
     """Ensure child gateways import this repo's ``core/mia`` (editable layout), not an older site-packages ``mia``."""
     env = os.environ.copy()
-    core_dir = Path(os.environ.get("API_CENTER_CORE_DIR") or (ROOT.parent / "core")).resolve()
+    core_dir = Path(os.environ.get("API_CENTER_CORE_DIR") or (ROOT.parent / "agents" / "core")).resolve()
     if core_dir.is_dir():
         prev = (env.get("PYTHONPATH") or "").strip()
         prefix = str(core_dir)
@@ -1335,7 +1344,7 @@ def _start_agent_processes(merged_agents: list[dict[str, Any]], args: argparse.N
             print(f"[api-center] failed to start agent {aid}: {type(e).__name__}: {e}", flush=True)
     if procs:
         print(
-            "[api-center] Nếu một agent tắt ngay: `python3 start.py --skip-install` trong ai-ba/ hoặc ai-tech/ để xem lỗi.",
+            "[api-center] Nếu một agent tắt ngay: `python3 start.py --skip-install` trong agents/ai-ba/ hoặc agents/ai-tech/ để xem lỗi.",
             flush=True,
         )
     return procs
@@ -1366,7 +1375,20 @@ def _normalize_public_http_base(env_val: str | None, request: Request) -> str:
     return f"http://{s.lstrip('/')}".rstrip("/")
 
 
-def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
+def _reload_runtime_agents(agents_runtime: dict[str, Any], agents_path: Path, catalog_path: Path) -> None:
+    """Đọc lại agents.json + catalog và cập nhật MCP vào config (sau khi admin tạo/xóa agent)."""
+    agent_map = _load_agents(agents_path, allow_empty=True)
+    catp = catalog_path if catalog_path.is_file() else None
+    catalog = _load_catalog(catp)
+    agents_runtime["merged"] = _merge_agents(agent_map, catalog)
+    _sync_agile_mcp_to_managed_agents(agents_runtime["merged"])
+
+
+def create_app(
+    agents_runtime: dict[str, Any],
+    agents_path: Path,
+    catalog_path: Path,
+) -> FastAPI:
     app = FastAPI(title="API Center", version="1")
 
     def _base_urls(request: Request) -> tuple[str, str]:
@@ -1397,6 +1419,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
                 "session_create": f"{base}/v1/sessions",
                 "session_reconnect": f"{base}/v1/sessions/reconnect",
                 "agents": f"{base}/v1/agents",
+                "admin_agents": f"{base}/v1/admin/agents",
                 "mcp_upsert": f"{base}/v1/mcp/credentials",
                 "chat_dispatch": f"{base}/v1/chat/dispatch",
                 "working_queue_reply_ingest": f"{base}/v1/internal/working-queue-reply",
@@ -1439,7 +1462,8 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
 
     @app.get("/v1/agents")
     async def agents(_: str = Depends(require_session)) -> dict[str, Any]:
-        return {"agents": merged_agents, "count": len(merged_agents)}
+        mg = agents_runtime["merged"]
+        return {"agents": mg, "count": len(mg)}
 
     @app.post("/v1/mcp/credentials", status_code=201)
     async def mcp_upsert(payload: dict[str, Any], _: str = Depends(require_session)) -> dict[str, Any]:
@@ -1485,7 +1509,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
         agent_sync: dict[str, Any] | None = None
         if server_id == "agile-studio":
             agent_sync = _inject_agile_studio_mcp_into_agent_configs(
-                merged_agents, tools_url=mcp_tools, api_key=api_key
+                agents_runtime["merged"], tools_url=mcp_tools, api_key=api_key
             )
             print(
                 "[api-center] agile MCP: injected into agent configs "
@@ -1535,7 +1559,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
     async def chat_dispatch(payload: dict[str, Any], _: str = Depends(require_session)) -> dict[str, Any]:
         if isinstance(payload, dict):
             _console_inbound_chat(payload, "http")
-        result = await _process_chat_dispatch(payload=payload, merged_agents=merged_agents)
+        result = await _process_chat_dispatch(payload=payload, merged_agents=agents_runtime["merged"])
         _chat_dbg(
             "http_dispatch_result",
             f"should_respond={result.get('should_respond')}",
@@ -1594,7 +1618,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
     async def agile_notifications_webhook(payload: dict[str, Any], _: str = Depends(require_session)) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Root must be JSON object")
-        return await _process_notification_webhook(payload=payload, merged_agents=merged_agents)
+        return await _process_notification_webhook(payload=payload, merged_agents=agents_runtime["merged"])
 
     @app.websocket("/ws/agent-chat")
     async def ws_agent_chat(websocket: WebSocket) -> None:
@@ -1635,7 +1659,7 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
                     continue
                 _console_inbound_chat(payload, "ws")
                 try:
-                    result = await _process_chat_dispatch(payload=payload, merged_agents=merged_agents)
+                    result = await _process_chat_dispatch(payload=payload, merged_agents=agents_runtime["merged"])
                 except HTTPException as he:
                     _chat_dbg("ws_dispatch_http_exc", he.status_code, str(he.detail))
                     await websocket.send_json({"event": "chat.agent.error", "error": str(he.detail), "status": he.status_code})
@@ -1659,7 +1683,12 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
                         "channel_id": result["channel_id"],
                         "target_agent_id": result["selected_agent_id"],
                         "content": result["reply_text"],
-                        "metadata": {"source": "api-center", "mode": "ws"},
+                        "metadata": {
+                            "source": "api-center",
+                            "mode": "ws",
+                            "sender": payload.get("sender"),
+                            "channel_type": payload.get("channel_type"),
+                        },
                         "callback_api_url": payload.get("callback_api_url"),
                     }
                     mode, status = await _dispatch_reply(
@@ -1684,6 +1713,226 @@ def create_app(merged_agents: list[dict[str, Any]]) -> FastAPI:
             await websocket.send_json({"event": "chat.agent.error", "error": f"{type(e).__name__}: {e}"})
             await websocket.close(code=1011)
 
+    def _require_admin_secret(
+        x_api_center_admin_secret: str | None = Header(default=None, alias="X-Api-Center-Admin-Secret"),
+    ) -> None:
+        exp = (os.environ.get("API_CENTER_ADMIN_SECRET") or "").strip()
+        if not exp:
+            raise HTTPException(status_code=503, detail="API_CENTER_ADMIN_SECRET is not set")
+        if not x_api_center_admin_secret or not secrets.compare_digest(
+            x_api_center_admin_secret.strip(), exp
+        ):
+            raise HTTPException(status_code=401, detail="Invalid admin secret")
+
+    def _restart_agent_children(request: Request) -> None:
+        args = getattr(request.app.state, "args", None)
+        if not args or not getattr(args, "start_agents", False):
+            return
+        procs = getattr(request.app.state, "agent_procs", None)
+        if procs is None:
+            return
+        _stop_agent_processes(procs)
+        request.app.state.agent_procs = _start_agent_processes(agents_runtime["merged"], args)
+
+    import agent_management as _am
+
+    @app.get("/v1/admin/agents")
+    async def admin_list_agents(
+        _: None = Depends(_require_admin_secret),
+    ) -> dict[str, Any]:
+        db_rows: list[dict[str, Any]] | None = None
+        try:
+            db_rows = _am.db_list_agents()
+        except RuntimeError:
+            db_rows = None
+        return {"agents": agents_runtime["merged"], "db_agents": db_rows}
+
+    @app.post("/v1/admin/agents", status_code=201)
+    async def admin_create_agent(
+        payload: dict[str, Any],
+        request: Request,
+        _: None = Depends(_require_admin_secret),
+    ) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Root must be JSON object")
+        try:
+            agent_id = _am.validate_agent_id(str(payload.get("id") or ""))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        display_name = str(payload.get("display_name") or payload.get("name") or agent_id).strip()
+        pfx = _am.AGENTS_DEPLOYMENTS_DIR + "/"
+        folder = str(payload.get("workspace_folder") or _am.default_folder_name(agent_id)).strip().lower()
+        if folder.startswith(pfx):
+            folder = folder[len(pfx) :]
+        template = str(payload.get("template") or "ai-tech").strip()
+        if template.startswith(pfx):
+            template = template[len(pfx) :]
+        raw_port = payload.get("gateway_port")
+        if raw_port is None or str(raw_port).strip() == "":
+            raise HTTPException(status_code=400, detail="gateway_port is required")
+        try:
+            gateway_port = int(raw_port)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="gateway_port must be an integer") from e
+        repo = _am.repo_root_from_api_center(ROOT)
+        dst: Path | None = None
+        try:
+            data = _am.agents_json_read(agents_path)
+        except (OSError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=500, detail=f"Cannot read agents file: {e}") from e
+        if agent_id in data:
+            raise HTTPException(status_code=409, detail="Agent id already exists in agents.json")
+        try:
+            dst = _am.scaffold_agent_deployment(
+                repo, folder_name=folder, template=template, gateway_port=gateway_port
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        ws_rel = _am.agent_workspace_rel(folder)
+        cfg_rel = _am.agent_config_rel(folder)
+        entry: dict[str, Any] = {"workspace": ws_rel, "display_name": display_name}
+        if isinstance(payload.get("role"), str) and str(payload.get("role")).strip():
+            entry["role"] = str(payload.get("role")).strip()
+        if isinstance(payload.get("description"), str) and str(payload.get("description")).strip():
+            entry["description"] = str(payload.get("description")).strip()
+        data[agent_id] = entry
+        try:
+            _am.agents_json_write(agents_path, data)
+        except OSError as e:
+            if dst is not None and dst.is_dir():
+                shutil.rmtree(dst, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=f"Cannot write agents file: {e}") from e
+        try:
+            _am.db_upsert_agent(
+                agent_id=agent_id,
+                display_name=display_name,
+                workspace_rel=ws_rel,
+                config_rel=cfg_rel,
+                gateway_port=gateway_port,
+                metadata={"template": template, "folder": folder},
+            )
+        except RuntimeError as e:
+            data.pop(agent_id, None)
+            try:
+                _am.agents_json_write(agents_path, data)
+            except OSError:
+                pass
+            if dst is not None and dst.is_dir():
+                shutil.rmtree(dst, ignore_errors=True)
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except Exception as e:
+            data.pop(agent_id, None)
+            try:
+                _am.agents_json_write(agents_path, data)
+            except OSError:
+                pass
+            if dst is not None and dst.is_dir():
+                shutil.rmtree(dst, ignore_errors=True)
+            raise HTTPException(status_code=502, detail=f"Database error: {e}") from e
+        _reload_runtime_agents(agents_runtime, agents_path, catalog_path)
+        _restart_agent_children(request)
+        return {
+            "ok": True,
+            "id": agent_id,
+            "workspace_folder": folder,
+            "workspace": ws_rel,
+            "gateway_port": gateway_port,
+        }
+
+    @app.delete("/v1/admin/agents/{agent_id}")
+    async def admin_delete_agent(
+        agent_id: str,
+        request: Request,
+        purge_workspace: bool = False,
+        _: None = Depends(_require_admin_secret),
+    ) -> dict[str, Any]:
+        aid = agent_id.strip().lower()
+        try:
+            data = _am.agents_json_read(agents_path)
+        except (OSError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=500, detail=f"Cannot read agents file: {e}") from e
+        if aid not in data:
+            raise HTTPException(status_code=404, detail="Agent not found in agents.json")
+        entry = dict(data[aid])
+        ws_rel = str(entry.get("workspace") or "").strip()
+        folder: str | None = None
+        if ws_rel.endswith("/workspace"):
+            folder = ws_rel[: -len("/workspace")]
+        data.pop(aid, None)
+        try:
+            _am.agents_json_write(agents_path, data)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Cannot write agents file: {e}") from e
+        try:
+            _am.db_delete_agent(aid)
+        except RuntimeError:
+            pass
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Database error: {e}") from e
+        _reload_runtime_agents(agents_runtime, agents_path, catalog_path)
+        _restart_agent_children(request)
+        purged = False
+        if purge_workspace and folder:
+            target = _am.repo_root_from_api_center(ROOT) / folder
+            if target.is_dir():
+                try:
+                    shutil.rmtree(target)
+                    purged = True
+                except OSError as e:
+                    raise HTTPException(status_code=500, detail=f"purge_workspace failed: {e}") from e
+        return {"ok": True, "id": aid, "removed_from_agents_json": True, "purged_workspace": purged}
+
+    @app.get("/v1/admin/agents/{agent_id}/prompts")
+    async def admin_list_prompts(agent_id: str, _: None = Depends(_require_admin_secret)) -> dict[str, Any]:
+        aid = agent_id.strip().lower()
+        try:
+            rows = _am.db_list_prompts(aid)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        return {"agent_id": aid, "prompts": rows}
+
+    @app.post("/v1/admin/agents/{agent_id}/prompts", status_code=201)
+    async def admin_upsert_prompt(
+        agent_id: str,
+        payload: dict[str, Any],
+        _: None = Depends(_require_admin_secret),
+    ) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Root must be JSON object")
+        aid = agent_id.strip().lower()
+        kind = str(payload.get("kind") or "").strip()
+        label = str(payload.get("label") or "").strip()
+        content = str(payload.get("content") if payload.get("content") is not None else "")
+        if not kind or not label:
+            raise HTTPException(status_code=400, detail="kind and label are required")
+        try:
+            _am.db_upsert_prompt(aid, kind, label, content)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Database error: {e}") from e
+        return {"ok": True, "agent_id": aid, "kind": kind, "label": label}
+
+    @app.delete("/v1/admin/agents/{agent_id}/prompts")
+    async def admin_delete_prompt(
+        agent_id: str,
+        kind: str,
+        label: str,
+        _: None = Depends(_require_admin_secret),
+    ) -> dict[str, Any]:
+        aid = agent_id.strip().lower()
+        k = kind.strip()
+        lb = label.strip()
+        if not k or not lb:
+            raise HTTPException(status_code=400, detail="kind and label query params are required")
+        try:
+            n = _am.db_delete_prompt(aid, k, lb)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Database error: {e}") from e
+        return {"ok": True, "agent_id": aid, "deleted": n}
+
     return app
 
 
@@ -1699,6 +1948,8 @@ def main() -> int:
     agents_path = (args.agents or Path(os.environ.get("API_CENTER_AGENTS_FILE", str(ROOT / "agents.json")))).expanduser().resolve()
     catalog_raw = os.environ.get("API_CENTER_CATALOG_FILE", "").strip()
     catalog_path = args.catalog or (Path(catalog_raw).expanduser().resolve() if catalog_raw else (ROOT / "agents.catalog.json"))
+    if isinstance(catalog_path, Path):
+        catalog_path = catalog_path.resolve()
     try:
         agent_map = _load_agents(agents_path)
         catalog = _load_catalog(catalog_path if isinstance(catalog_path, Path) else None)
@@ -1707,8 +1958,10 @@ def main() -> int:
         print(f"Failed loading agents metadata: {e}")
         return 1
 
+    agents_runtime: dict[str, Any] = {"merged": merged_agents}
+
     _init_storage((args.data_dir or DATA_DIR_DEFAULT).resolve())
-    _sync_agile_mcp_to_managed_agents(merged_agents)
+    _sync_agile_mcp_to_managed_agents(agents_runtime["merged"])
     env_file = (args.env or ROOT / ".env").resolve()
     print(
         "[api-center] startup"
@@ -1721,8 +1974,9 @@ def main() -> int:
         "[api-center] Khi có chat @agent, terminal sẽ có [api-center][chat-inbound] và [api-center][chat-result].",
         flush=True,
     )
-    app = create_app(merged_agents)
-    agent_procs = _start_agent_processes(merged_agents, args)
+    app = create_app(agents_runtime, agents_path, catalog_path)
+    app.state.args = args
+    app.state.agent_procs = _start_agent_processes(agents_runtime["merged"], args)
     try:
         uvicorn.run(
             app,
@@ -1734,7 +1988,7 @@ def main() -> int:
             ws_ping_timeout=25.0,
         )
     finally:
-        _stop_agent_processes(agent_procs)
+        _stop_agent_processes(app.state.agent_procs)
     return 0
 
 

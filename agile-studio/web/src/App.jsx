@@ -1,11 +1,15 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { io } from "socket.io-client";
 import { apiDelete, apiGet, apiPatch, apiPost, clearAuth, getStoredUser } from "./api.js";
 import KanbanBoard from "./KanbanBoard.jsx";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
+import { MermaidBlock } from "./MermaidBlock.jsx";
+import ProjectWikiPage from "./ProjectWikiPage.jsx";
+import StoryDocsTab from "./StoryDocsTab.jsx";
 import {
   loadNotifications,
   makeNotification,
@@ -17,9 +21,25 @@ import {
 
 /** LLM đôi khi dùng ¶ thay cho xuống dòng — đưa về newline để remark không lỗi cấu trúc. */
 function normalizeChatMarkdownSource(raw) {
-  return String(raw || "")
+  let s = String(raw || "")
     .replace(/\u00b6/g, "\n")
     .replace(/\r\n/g, "\n");
+  // Literal `\n` / `\r` (two-char escapes from APIs or double-encoded JSON) → real newlines
+  if (s.includes("\\n") || s.includes("\\r")) {
+    s = s.replace(/\\r\\n/g, "\n").replace(/\\r/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+  }
+  return s;
+}
+
+/** Lấy text thuần từ children của react-markdown `code` (fenced block). */
+function markdownCodeChildrenToString(node) {
+  if (node == null) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(markdownCodeChildrenToString).join("");
+  if (typeof node === "object" && node.props != null && node.props.children != null) {
+    return markdownCodeChildrenToString(node.props.children);
+  }
+  return String(node);
 }
 
 function formatChatMessageTime(iso) {
@@ -67,6 +87,18 @@ class ChatMarkdownErrorBoundary extends Component {
 /** Markdown trong bubble chat — link mở tab mới; giữ @mention tách khỏi MD để highlight. */
 const CHAT_MARKDOWN_COMPONENTS = {
   a: ({ node: _n, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+  pre: ({ children, ...props }) => {
+    const child = Array.isArray(children) ? children[0] : children;
+    const cls =
+      child && typeof child === "object" && child.props != null
+        ? String(child.props.className || "")
+        : "";
+    if (cls.includes("language-mermaid")) {
+      const chart = markdownCodeChildrenToString(child.props.children).replace(/\n$/, "");
+      return <MermaidBlock chart={chart} />;
+    }
+    return <pre {...props}>{children}</pre>;
+  },
 };
 
 /**
@@ -84,7 +116,7 @@ function renderMarkdownWithMentions(content, mentionIndex) {
       return (
         <div key={idx} className="as-chat-md">
           <ChatMarkdownErrorBoundary source={md}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={CHAT_MARKDOWN_COMPONENTS}>
+            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={CHAT_MARKDOWN_COMPONENTS}>
               {md}
             </ReactMarkdown>
           </ChatMarkdownErrorBoundary>
@@ -435,15 +467,18 @@ const TABS = {
   masterData: { id: "master-data", label: "Master data", icon: "bi-diagram-3" },
   chat: { id: "chat", label: "Chat", icon: "bi-chat-dots" },
   releases: { id: "releases", label: "Releases", icon: "bi-rocket-takeoff" },
+  wiki: { id: "wiki", label: "Docs", icon: "bi-journal-text" },
   settings: { id: "settings", label: "Settings", icon: "bi-gear" },
 };
 
-/** URL sync: `/`, `/team`, `/master-data`, `/p/:id/board|team|chat|releases|settings`, `/p/:id/story/:storyId`. */
+/** URL sync: `/`, `/team`, `/master-data`, `/p/:id/board|…|wiki|settings`, `/p/:id/story/:storyId`, `/p/:id/wiki/:slug?`. */
 function parseWorkspacePath(pathname) {
   const p = (pathname || "/").replace(/\/+$/, "") || "/";
   const sm = p.match(/^\/p\/(\d+)\/story\/(\d+)$/);
   if (sm) return { projectId: Number(sm[1]), tab: "story", storyId: Number(sm[2]) };
-  const m = p.match(/^\/p\/(\d+)\/(board|team|chat|releases|settings)$/);
+  const wm = p.match(/^\/p\/(\d+)\/wiki(?:\/([^/]+))?$/);
+  if (wm) return { projectId: Number(wm[1]), tab: "wiki", wikiSlug: wm[2] != null && wm[2] !== "" ? wm[2] : null };
+  const m = p.match(/^\/p\/(\d+)\/(board|team|chat|releases|settings|wiki)$/);
   if (m) return { projectId: Number(m[1]), tab: m[2] };
   if (p === "/team") return { projectId: null, tab: "team" };
   if (p === "/master-data") return { projectId: null, tab: "master-data" };
@@ -463,9 +498,13 @@ function StoryDetailBody({
   onPatchStoryDetails,
   onPatchStoryRelease,
   onPatchStoryAssignees,
+  onCreateTask,
+  onPatchTask,
+  onDeleteTask,
   onPostComment,
   onPatchComment,
   onDeleteComment,
+  setErr,
 }) {
   const me = getStoredUser();
   const onProject = me?.member_id != null && projectMembers.some((row) => row.member_id === me.member_id);
@@ -474,6 +513,13 @@ function StoryDetailBody({
   const [editingStoryMeta, setEditingStoryMeta] = useState(false);
   const [storyTitleDraft, setStoryTitleDraft] = useState("");
   const [storyDescDraft, setStoryDescDraft] = useState("");
+  const [taskModalOpen, setTaskModalOpen] = useState(false);
+  const [taskModalEditingId, setTaskModalEditingId] = useState(null);
+  const [taskModalTitle, setTaskModalTitle] = useState("");
+  const [taskModalBody, setTaskModalBody] = useState("");
+  const [taskModalAssigneeIds, setTaskModalAssigneeIds] = useState([]);
+  const [taskModalReporterId, setTaskModalReporterId] = useState("");
+  const [storySectionTab, setStorySectionTab] = useState("overview");
   const commentMentionMembers = useMemo(
     () =>
       (Array.isArray(projectMembers) ? projectMembers : [])
@@ -544,7 +590,90 @@ function StoryDetailBody({
     setEditingStoryMeta(false);
     setStoryTitleDraft("");
     setStoryDescDraft("");
+    setTaskModalOpen(false);
+    setTaskModalEditingId(null);
+    setTaskModalTitle("");
+    setTaskModalBody("");
+    setTaskModalAssigneeIds([]);
+    setTaskModalReporterId("");
+    setStorySectionTab("overview");
   }, [storyDetail.id]);
+
+  const openCreateTaskModal = () => {
+    setTaskModalEditingId(null);
+    setTaskModalTitle("");
+    setTaskModalBody("");
+    setTaskModalAssigneeIds([]);
+    setTaskModalReporterId("");
+    setTaskModalOpen(true);
+  };
+
+  const openEditTaskModal = (t) => {
+    const aids = Array.isArray(t.assignee_ids)
+      ? t.assignee_ids
+      : t.assignee_id != null
+        ? [t.assignee_id]
+        : [];
+    setTaskModalEditingId(t.id);
+    setTaskModalTitle(t.title ?? "");
+    setTaskModalBody(t.body ?? "");
+    setTaskModalAssigneeIds(aids);
+    setTaskModalReporterId(t.reporter_id != null ? String(t.reporter_id) : "");
+    setTaskModalOpen(true);
+  };
+
+  const closeTaskModal = () => {
+    setTaskModalOpen(false);
+    setTaskModalEditingId(null);
+    setTaskModalTitle("");
+    setTaskModalBody("");
+    setTaskModalAssigneeIds([]);
+    setTaskModalReporterId("");
+  };
+
+  const submitTaskModal = async (e) => {
+    e.preventDefault();
+    const title = taskModalTitle.trim();
+    if (!title) return;
+    const rawBody = taskModalBody.trim();
+    const body = rawBody.length ? rawBody : null;
+    const assignee_ids = Array.isArray(taskModalAssigneeIds) ? taskModalAssigneeIds.map(Number) : [];
+    const reporter_id = taskModalReporterId === "" ? null : Number(taskModalReporterId);
+    try {
+      if (taskModalEditingId == null) {
+        await onCreateTask(storyDetail.id, { title, body, assignee_ids, reporter_id });
+      } else {
+        await onPatchTask(storyDetail.id, taskModalEditingId, {
+          title,
+          body,
+          assignee_ids,
+          reporter_id,
+        });
+      }
+      closeTaskModal();
+    } catch {
+      /* error surfaced via setErr */
+    }
+  };
+
+  const formatTaskMemberNames = (ids) => {
+    const list = Array.isArray(ids) ? ids : [];
+    if (!list.length) return "—";
+    return list
+      .map(
+        (id) =>
+          projectMembers.find((r) => r.member_id === id)?.member?.display_name ??
+          `Member #${id}`
+      )
+      .join(", ");
+  };
+
+  const formatTaskReporterName = (rid) => {
+    if (rid == null) return "—";
+    return (
+      projectMembers.find((r) => r.member_id === rid)?.member?.display_name ?? `Member #${rid}`
+    );
+  };
 
   const startEdit = (c) => {
     setEditingCommentId(c.id);
@@ -565,6 +694,30 @@ function StoryDetailBody({
 
   return (
     <>
+      <ul className="nav nav-tabs mb-3">
+        <li className="nav-item">
+          <button
+            type="button"
+            className={`nav-link ${storySectionTab === "overview" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("overview")}
+          >
+            Overview
+          </button>
+        </li>
+        <li className="nav-item">
+          <button
+            type="button"
+            className={`nav-link ${storySectionTab === "docs" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("docs")}
+          >
+            Docs
+          </button>
+        </li>
+      </ul>
+      {storySectionTab === "docs" ? (
+        <StoryDocsTab projectId={storyDetail.project_id} storyId={storyDetail.id} setErr={setErr} />
+      ) : (
+        <>
       <div className="d-flex align-items-start justify-content-between gap-2 mb-3">
         {editingStoryMeta ? (
           <form className="flex-grow-1 min-w-0" onSubmit={saveStoryMeta}>
@@ -744,6 +897,171 @@ function StoryDetailBody({
           <div className="form-text">Hold Cmd/Ctrl to select more than one member.</div>
         ) : null}
       </div>
+      <div className="border-top pt-3 mb-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
+        <h3 className="h6 text-secondary mb-0">Tasks</h3>
+        {onProject ? (
+          <button type="button" className="btn btn-link btn-sm p-0" onClick={openCreateTaskModal}>
+            Add task
+          </button>
+        ) : null}
+      </div>
+      {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : []).length === 0 ? (
+        <p className="small text-secondary fst-italic mb-3">No tasks yet.</p>
+      ) : null}
+      <ul className="list-unstyled small mb-4">
+        {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : [])
+          .slice()
+          .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id))
+          .map((t) => (
+            <li key={t.id} className="mb-3 pb-3 border-bottom">
+              <div className="d-flex align-items-start gap-2">
+                <input
+                  type="checkbox"
+                  className="form-check-input mt-1 flex-shrink-0"
+                  checked={!!t.done}
+                  disabled={!onProject}
+                  onChange={(e) => onPatchTask(storyDetail.id, t.id, { done: e.target.checked })}
+                  aria-label={t.done ? "Mark task as not done" : "Mark task as done"}
+                />
+                <div className="flex-grow-1 min-w-0">
+                  <div className={`fw-semibold ${t.done ? "text-decoration-line-through text-secondary" : ""}`}>{t.title}</div>
+                  {t.body ? (
+                    <div className={`as-story-body as-story-desc-md mt-1 small ${t.done ? "text-secondary" : ""}`}>
+                      {renderMarkdownWithMentions(t.body, commentMentionIndex)}
+                    </div>
+                  ) : null}
+                  <div className="small text-secondary mt-1">
+                    <span className="text-nowrap">Assignees: </span>
+                    <span>{formatTaskMemberNames(t.assignee_ids?.length ? t.assignee_ids : t.assignee_id != null ? [t.assignee_id] : [])}</span>
+                    <span className="text-nowrap"> · Reporter: </span>
+                    <span>{formatTaskReporterName(t.reporter_id)}</span>
+                  </div>
+                </div>
+                {onProject ? (
+                  <div className="d-flex gap-1 flex-shrink-0">
+                    <button
+                      type="button"
+                      className="btn btn-outline-secondary btn-sm p-1 lh-1"
+                      onClick={() => openEditTaskModal(t)}
+                      title="Edit task"
+                      aria-label="Edit task"
+                    >
+                      <i className="bi bi-pencil" aria-hidden />
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline-danger btn-sm p-1 lh-1"
+                      onClick={() => onDeleteTask(storyDetail.id, t.id)}
+                      title="Delete task"
+                      aria-label="Delete task"
+                    >
+                      <i className="bi bi-trash" aria-hidden />
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            </li>
+          ))}
+      </ul>
+      {!onProject && getStoredUser() ? (
+        <p className="small text-secondary mb-4">
+          Add yourself to the project <strong>Team</strong> to create or update tasks.
+        </p>
+      ) : null}
+      {taskModalOpen ? (
+        <>
+          <div
+            className="modal fade show d-block"
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="as-task-modal-title"
+          >
+            <div className="modal-dialog modal-lg modal-dialog-scrollable">
+              <div className="modal-content">
+                <form onSubmit={submitTaskModal}>
+                  <div className="modal-header">
+                    <h5 className="modal-title" id="as-task-modal-title">
+                      {taskModalEditingId == null ? "Create task" : "Edit task"}
+                    </h5>
+                    <button type="button" className="btn-close" onClick={closeTaskModal} aria-label="Close" />
+                  </div>
+                  <div className="modal-body">
+                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-title-input">
+                      Title
+                    </label>
+                    <input
+                      id="as-task-modal-title-input"
+                      className="form-control mb-3"
+                      value={taskModalTitle}
+                      onChange={(e) => setTaskModalTitle(e.target.value)}
+                      maxLength={500}
+                      required
+                      autoFocus
+                    />
+                    <label className="form-label small text-secondary mb-1">Assignees</label>
+                    <select
+                      className="form-select mb-3"
+                      multiple
+                      size={Math.max(2, Math.min(6, projectMembers.length || 2))}
+                      value={taskModalAssigneeIds.map(String)}
+                      onChange={(e) =>
+                        setTaskModalAssigneeIds(Array.from(e.target.selectedOptions, (o) => Number(o.value)))
+                      }
+                      aria-label="Task assignees"
+                    >
+                      {projectMembers.map((row) => (
+                        <option key={row.member_id} value={row.member_id}>
+                          {row.member?.display_name ?? `Member #${row.member_id}`}
+                          {row.member?.member_type === "ai" ? " (AI)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="form-text mb-3">Hold Cmd/Ctrl to select multiple people or AI agents.</div>
+                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-reporter">
+                      Reporter
+                    </label>
+                    <select
+                      id="as-task-modal-reporter"
+                      className="form-select mb-3"
+                      value={taskModalReporterId}
+                      onChange={(e) => setTaskModalReporterId(e.target.value)}
+                      aria-label="Reporter task"
+                    >
+                      <option value="">— None —</option>
+                      {projectMembers.map((row) => (
+                        <option key={row.member_id} value={row.member_id}>
+                          {row.member?.display_name ?? `Member #${row.member_id}`}
+                          {row.member?.member_type === "ai" ? " (AI)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-body">
+                      Description
+                    </label>
+                    <MarkdownEditorField
+                      value={taskModalBody}
+                      onChange={setTaskModalBody}
+                      height={220}
+                      placeholder="Markdown (optional)"
+                      textareaProps={{ id: "as-task-modal-body" }}
+                    />
+                  </div>
+                  <div className="modal-footer">
+                    <button type="button" className="btn btn-outline-secondary" onClick={closeTaskModal}>
+                      Cancel
+                    </button>
+                    <button type="submit" className="btn btn-primary" disabled={!taskModalTitle.trim()}>
+                      Save
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+          <div className="modal-backdrop fade show" />
+        </>
+      ) : null}
       <h3 className="h6 text-secondary border-top pt-3 mb-3">Comments</h3>
       <ul className="list-unstyled small mb-4">
         {comments.map((c) => {
@@ -845,6 +1163,8 @@ function StoryDetailBody({
           Post comment
         </button>
       </form>
+        </>
+      )}
     </>
   );
 }
@@ -973,7 +1293,9 @@ export default function App() {
   const workspace = parseWorkspacePath(location.pathname);
   const isStoryPage = workspace?.tab === "story";
   const mainTab =
-    workspace && ["board", "team", "master-data", "chat", "releases", "settings"].includes(workspace.tab) ? workspace.tab : "board";
+    workspace && ["board", "team", "master-data", "chat", "releases", "wiki", "settings"].includes(workspace.tab)
+      ? workspace.tab
+      : "board";
 
   const refreshProjects = useCallback(async () => {
     setErr(null);
@@ -1963,6 +2285,20 @@ export default function App() {
           return;
         }
 
+        /** API Center đã POST reply vào chat-service qua HTTP callback — tránh gửi trùng. */
+        if (isAgentReply) {
+          const dmode = String(data?.delivery_mode || "");
+          const dst = String(data?.delivery_status || "");
+          if (dmode === "api" && /^api:2/.test(dst)) {
+            stopTypingIfOurReply();
+            if (replyTrace) {
+              postedAgentReplyTraceIdsRef.current.add(replyTrace);
+              if (postedAgentReplyTraceIdsRef.current.size > 200) postedAgentReplyTraceIdsRef.current.clear();
+            }
+            return;
+          }
+        }
+
         const traceId = replyTrace;
         if (traceId && postedAgentReplyTraceIdsRef.current.has(traceId)) {
           stopTypingIfOurReply();
@@ -2588,6 +2924,50 @@ export default function App() {
     }
   };
 
+  const onCreateTask = async (sid, { title, body, assignee_ids, reporter_id }) => {
+    const t = (title || "").trim();
+    if (!projectId || !sid || !t) return;
+    setErr(null);
+    try {
+      await apiPost(`/stories/${sid}/tasks`, {
+        title: t,
+        body: body ?? null,
+        assignee_ids: Array.isArray(assignee_ids) ? assignee_ids : [],
+        reporter_id: reporter_id ?? null,
+      });
+      await loadProject(projectId, { preserveStory: true });
+      if (storyId === sid) await loadStory(sid);
+    } catch (e2) {
+      setErr(e2.message);
+      throw e2;
+    }
+  };
+
+  const onPatchTask = async (sid, taskId, patch) => {
+    if (!projectId || !sid) return;
+    setErr(null);
+    try {
+      await apiPatch(`/stories/${sid}/tasks/${taskId}`, patch);
+      await loadProject(projectId, { preserveStory: true });
+      if (storyId === sid) await loadStory(sid);
+    } catch (e2) {
+      setErr(e2.message);
+      throw e2;
+    }
+  };
+
+  const onDeleteTask = async (sid, taskId) => {
+    if (!projectId || !sid || !window.confirm("Delete this task?")) return;
+    setErr(null);
+    try {
+      await apiDelete(`/stories/${sid}/tasks/${taskId}`);
+      await loadProject(projectId, { preserveStory: true });
+      if (storyId === sid) await loadStory(sid);
+    } catch (e2) {
+      setErr(e2.message);
+    }
+  };
+
   const onSaveProjectSettings = async (e) => {
     e.preventDefault();
     if (!projectId) return;
@@ -2896,6 +3276,16 @@ export default function App() {
             <i className={TABS.settings.icon} aria-hidden />
             {TABS.settings.label}
           </button>
+          <button
+            type="button"
+            className={`as-nav-btn mb-1 ${mainTab === TABS.wiki.id ? "active" : ""}`}
+            disabled={!projectId}
+            onClick={() => projectId && navigate(`/p/${projectId}/wiki`)}
+            title="Docs and wiki for this project"
+          >
+            <i className={TABS.wiki.icon} aria-hidden />
+            {TABS.wiki.label}
+          </button>
           <div className="as-sidenav-footer">
             {selectedProject ? (
               <>
@@ -2977,9 +3367,13 @@ export default function App() {
                         onPatchStoryDetails={onPatchStoryDetails}
                         onPatchStoryRelease={onPatchStoryRelease}
                         onPatchStoryAssignees={onPatchStoryAssignees}
+                        onCreateTask={onCreateTask}
+                        onPatchTask={onPatchTask}
+                        onDeleteTask={onDeleteTask}
                         onPostComment={onPostComment}
                         onPatchComment={onPatchComment}
                         onDeleteComment={onDeleteComment}
+                        setErr={setErr}
                       />
                     </div>
                   </div>
@@ -3850,6 +4244,23 @@ export default function App() {
             </>
           )}
 
+          {mainTab === "wiki" && (
+            <>
+              {!projectId ? (
+                <div className="as-page-head mb-3">
+                  <h1 className="as-page-title">Docs</h1>
+                  <p className="as-page-desc mb-0">Select a project to open the wiki.</p>
+                </div>
+              ) : (
+                <ProjectWikiPage
+                  projectId={projectId}
+                  initialSlug={workspace?.wikiSlug != null ? workspace.wikiSlug : null}
+                  setErr={setErr}
+                />
+              )}
+            </>
+          )}
+
           {mainTab === "settings" && (
             <div className="as-settings-layout">
               <div className="as-page-head d-flex flex-wrap justify-content-between align-items-start gap-2">
@@ -4195,9 +4606,13 @@ export default function App() {
                 onPatchStoryDetails={onPatchStoryDetails}
                 onPatchStoryRelease={onPatchStoryRelease}
                 onPatchStoryAssignees={onPatchStoryAssignees}
+                onCreateTask={onCreateTask}
+                onPatchTask={onPatchTask}
+                onDeleteTask={onDeleteTask}
                 onPostComment={onPostComment}
                 onPatchComment={onPatchComment}
                 onDeleteComment={onDeleteComment}
+                setErr={setErr}
               />
             </div>
           </aside>

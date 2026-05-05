@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import INTEGER
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -191,6 +191,56 @@ class Story(Base):
     assignments: Mapped[list["StoryAssignee"]] = relationship(
         back_populates="story", cascade="all, delete-orphan", passive_deletes=True, order_by="StoryAssignee.member_id"
     )
+    tasks: Mapped[list["StoryTask"]] = relationship(
+        back_populates="story",
+        cascade="all, delete-orphan",
+        order_by="StoryTask.sort_order, StoryTask.id",
+    )
+
+
+class StoryTask(Base):
+    """Work tasks under a story (title + body); not separate Kanban cards."""
+
+    __tablename__ = "story_tasks"
+
+    id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
+    story_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("stories.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    sort_order: Mapped[int] = mapped_column(MUInt, nullable=False, default=0)
+    reporter_id: Mapped[Optional[int]] = mapped_column(
+        MUInt, ForeignKey("members.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
+    )
+
+    story: Mapped["Story"] = relationship(back_populates="tasks")
+    assignments: Mapped[list["StoryTaskAssignee"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="StoryTaskAssignee.member_id",
+    )
+
+
+class StoryTaskAssignee(Base):
+    """Many assignees per story task (members of the same project)."""
+
+    __tablename__ = "story_task_assignees"
+
+    task_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("story_tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    member_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("members.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    task: Mapped["StoryTask"] = relationship(back_populates="assignments")
 
 
 class StoryAssignee(Base):
@@ -239,3 +289,70 @@ class StoryStatusEvent(Base):
 
     story: Mapped["Story"] = relationship(back_populates="status_events")
     actor: Mapped["Member"] = relationship(foreign_keys=[actor_member_id])
+
+
+class WikiFolder(Base):
+    """Thư mục tài liệu wiki (cây, scoped theo project)."""
+
+    __tablename__ = "wiki_folders"
+
+    id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(MUInt, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    parent_id: Mapped[Optional[int]] = mapped_column(
+        MUInt, ForeignKey("wiki_folders.id", ondelete="CASCADE"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
+    )
+
+    project: Mapped["Project"] = relationship()
+
+
+class WikiDocument(Base):
+    """Tài liệu Markdown (wiki) scoped theo project; story qua bảng wiki_document_stories (n–n)."""
+
+    __tablename__ = "wiki_documents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[int] = mapped_column(MUInt, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    folder_id: Mapped[Optional[int]] = mapped_column(
+        MUInt, ForeignKey("wiki_folders.id", ondelete="SET NULL"), nullable=True
+    )
+    slug: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    tags_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    author_member_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("members.id", ondelete="RESTRICT"), nullable=False
+    )
+    is_draft: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    embedding_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
+    )
+
+    project: Mapped["Project"] = relationship()
+    folder: Mapped[Optional["WikiFolder"]] = relationship()
+    author: Mapped["Member"] = relationship()
+    story_links: Mapped[list["WikiDocumentStory"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+
+
+class WikiDocumentStory(Base):
+    """Liên kết nhiều story ↔ một wiki doc (cùng project)."""
+
+    __tablename__ = "wiki_document_stories"
+
+    wiki_document_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("wiki_documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    story_id: Mapped[int] = mapped_column(MUInt, ForeignKey("stories.id", ondelete="CASCADE"), primary_key=True)
+
+    document: Mapped["WikiDocument"] = relationship(back_populates="story_links")
+    story: Mapped["Story"] = relationship()

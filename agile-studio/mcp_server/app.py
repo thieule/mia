@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Nạp agile-studio/.env (không ghi đè biến môi trường đã export).
 _ROOT = Path(__file__).resolve().parent.parent
@@ -51,8 +51,16 @@ from agile_hub.schemas import (
     StoryCreate,
     StoryOut,
     StoryPatch,
+    StoryTaskCreate,
+    StoryTaskOut,
+    StoryTaskPatch,
     WorkflowTemplateCreate,
     WorkflowTemplateOut,
+    WikiDocCreate,
+    WikiDocPatch,
+    WikiDocSearchOut,
+    WikiFolderCreate,
+    WikiFolderOut,
     project_to_out,
 )
 
@@ -89,6 +97,7 @@ mcp = FastMCP(
     port=_MCP_PORT,
     instructions="MCP access to Agile Studio DB (same schema as API). Set AGILE_DATABASE_URL environment variable. "
     "Comment needs author_member_id (member must be in project). No JWT required. "
+    "Wiki tools require project_id. Use agile_wiki_read_doc / agile_wiki_write_doc / agile_wiki_folder_tree / agile_wiki_folder_create / agile_wiki_semantic_search / agile_wiki_story_context. "
     "Releases: planning window via starts_at/ends_at (ISO-8601 or YYYY-MM-DD); if only starts_at is set, end is end-of-that-day (same as API).",
     streamable_http_path=_MCP_HTTP_PATH,
     stateless_http=_MCP_STATELESS,
@@ -567,10 +576,12 @@ def agile_release_delete(release_id: int) -> str:
 # --- stories ---
 
 
-def _story_out_for(db, s: models.Story) -> dict[str, Any]:
+def _story_out_for(db, s: models.Story, *, include_tasks: bool = False) -> dict[str, Any]:
     p = crud.project_get(db, s.project_id)
     slug = p.slug if p else "?"
-    return StoryOut.model_validate(crud.story_to_out(s, slug, db)).model_dump(mode="json")
+    return StoryOut.model_validate(
+        crud.story_to_out(s, slug, db, include_tasks=include_tasks)
+    ).model_dump(mode="json")
 
 
 @mcp.tool()
@@ -586,12 +597,12 @@ def agile_stories_list(project_id: int, status: str = "") -> str:
 
 @mcp.tool()
 def agile_story_get(story_id: int) -> str:
-    """Detail of story."""
+    """Detail of story including full ``tasks`` list (assignee_ids, reporter_id, title, body, done, …)."""
     with mcp_session() as db:
         s = crud.story_get(db, story_id)
         if s is None:
             return json_out({"error": "not_found", "story_id": story_id})
-        return json_out(_story_out_for(db, s))
+        return json_out(_story_out_for(db, s, include_tasks=True))
 
 
 @mcp.tool()
@@ -609,7 +620,9 @@ def agile_story_create(project_id: int, create_json: str) -> str:
             s = crud.story_create(db, project_id, body)
         except ValueError as e:
             return json_out({"error": str(e)})
-        return json_out(StoryOut.model_validate(crud.story_to_out(s, p.slug, db)).model_dump(mode="json"))
+        return json_out(
+            StoryOut.model_validate(crud.story_to_out(s, p.slug, db, include_tasks=True)).model_dump(mode="json")
+        )
 
 
 @mcp.tool()
@@ -632,7 +645,90 @@ def agile_story_update(story_id: int, patch_json: str = "{}") -> str:
             crud.story_patch(db, s, body, project_member_ids_set=mids)
         except ValueError as e:
             return json_out({"error": str(e)})
-        return json_out(StoryOut.model_validate(crud.story_to_out(s, p.slug, db)).model_dump(mode="json"))
+        return json_out(
+            StoryOut.model_validate(crud.story_to_out(s, p.slug, db, include_tasks=True)).model_dump(mode="json")
+        )
+
+
+@mcp.tool()
+def agile_story_tasks_list(story_id: int) -> str:
+    """
+    List all tasks on a story.
+
+    Each item is StoryTaskOut: id, story_id, title, body (markdown), done, sort_order,
+    assignee_ids, assignee_id (first), reporter_id, timestamps.
+    Assignees and reporter must be project members (human or AI).
+    """
+    with mcp_session() as db:
+        s = crud.story_get(db, story_id)
+        if s is None:
+            return json_out({"error": "not_found", "story_id": story_id})
+        rows = crud.story_tasks_out_list(db, story_id)
+        return json_out([StoryTaskOut.model_validate(x).model_dump(mode="json") for x in rows])
+
+
+@mcp.tool()
+def agile_story_task_create(story_id: int, create_json: str) -> str:
+    """Create task. create_json: { title, body?, done?, sort_order?, assignee_ids?, reporter_id? }"""
+    pobj = _load_json(create_json)
+    body = StoryTaskCreate.model_validate(pobj)
+    with mcp_session() as db:
+        if crud.story_get(db, story_id) is None:
+            return json_out({"error": "not_found", "story_id": story_id})
+        try:
+            st = crud.story_task_create(db, story_id, body)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st)).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_story_task_update(story_id: int, task_id: int, patch_json: str = "{}") -> str:
+    """
+    PATCH a story task (only send fields to change).
+
+    patch_json: title?, body?, done?, sort_order?, assignee_ids?, reporter_id?
+    Use assignee_ids: [] to clear assignees; reporter_id: null to clear reporter.
+    """
+    pobj = _load_json(patch_json)
+    body = StoryTaskPatch.model_validate(pobj)
+    with mcp_session() as db:
+        s = crud.story_get(db, story_id)
+        if s is None:
+            return json_out({"error": "not_found", "story_id": story_id})
+        st = crud.story_task_get(db, task_id)
+        if st is None or st.story_id != story_id:
+            return json_out({"error": "not_found", "task_id": task_id})
+        try:
+            st2 = crud.story_task_patch(db, st, body)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st2)).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_story_task_delete(story_id: int, task_id: int) -> str:
+    """Delete a task (removes assignee rows). On success returns ok=true and task_id."""
+    with mcp_session() as db:
+        if crud.story_get(db, story_id) is None:
+            return json_out({"error": "not_found", "story_id": story_id})
+        st = crud.story_task_get(db, task_id)
+        if st is None or st.story_id != story_id:
+            return json_out({"error": "not_found", "task_id": task_id})
+        crud.story_task_delete(db, st)
+        return json_out({"ok": True, "task_id": task_id})
+
+
+@mcp.tool()
+def agile_story_task_get(story_id: int, task_id: int) -> str:
+    """Return one task (StoryTaskOut) by story_id and task_id."""
+    with mcp_session() as db:
+        if crud.story_get(db, story_id) is None:
+            return json_out({"error": "not_found", "story_id": story_id})
+        st = crud.story_task_get(db, task_id)
+        if st is None or st.story_id != story_id:
+            return json_out({"error": "not_found", "task_id": task_id})
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st)).model_dump(mode="json"))
 
 
 # --- comments ---
@@ -956,6 +1052,235 @@ def agile_chat_typing(
         return json_out(data)
     except Exception as e:
         return json_out({"error": str(e)})
+
+
+# --- Wiki / Docs (project_id required) ---
+@mcp.tool()
+def agile_wiki_read_doc(project_id: int, doc_id: str) -> str:
+    """Đọc tài liệu wiki theo doc_id (UUID). project_id bắt buộc (AC7)."""
+    pid = int(project_id or 0)
+    did = (doc_id or "").strip()
+    if pid <= 0 or not did:
+        return json_out({"error": "invalid_argument", "detail": "project_id and doc_id required"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        doc = crud.wiki_doc_get(db, did)
+        if doc is None or doc.project_id != pid:
+            return json_out({"error": "not_found", "doc_id": did})
+        return json_out(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
+
+
+def _parse_story_ids_csv(story_ids_csv: str, story_id: Optional[int]) -> list[int]:
+    raw: list[int] = []
+    for part in (story_ids_csv or "").split(","):
+        p = part.strip()
+        if not p or not p.isdigit():
+            continue
+        n = int(p)
+        if n > 0 and n not in raw:
+            raw.append(n)
+    if story_id is not None and int(story_id) > 0:
+        n = int(story_id)
+        if n not in raw:
+            raw.append(n)
+    raw.sort()
+    return raw
+
+
+@mcp.tool()
+def agile_wiki_write_doc(
+    project_id: int,
+    title: str,
+    content: str,
+    author_member_id: int,
+    story_id: Optional[int] = None,
+    story_ids_csv: str = "",
+    folder_id: Optional[int] = None,
+    clear_folder: bool = False,
+    doc_id: str = "",
+    slug: str = "",
+    is_draft: bool = True,
+    tags: str = "",
+) -> str:
+    """Create or update a wiki doc. ``project_id`` and ``author_member_id`` (project member) required; empty ``doc_id`` = create.
+    Stories: ``story_id`` and/or ``story_ids_csv`` (e.g. ``1,2,3``).
+    Folders: call ``agile_wiki_folder_tree`` for ids. On create, optional ``folder_id`` saves the doc in that folder.
+    On update: set ``folder_id`` to a positive id to move, or ``clear_folder=True`` for library root (unfiled)."""
+    pid = int(project_id or 0)
+    aid = int(author_member_id or 0)
+    if pid <= 0 or aid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id and author_member_id must be > 0"})
+    sid = int(story_id) if story_id is not None and int(story_id) > 0 else None
+    merged_ids = _parse_story_ids_csv(story_ids_csv, story_id)
+    tag_list = [x.strip() for x in (tags or "").split(",") if x.strip()]
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        if aid not in crud.project_member_ids(db, pid):
+            return json_out({"error": "author_not_in_project", "author_member_id": aid})
+        did = (doc_id or "").strip()
+        if did:
+            doc = crud.wiki_doc_get(db, did)
+            if doc is None or doc.project_id != pid:
+                return json_out({"error": "not_found", "doc_id": did})
+            pdata: dict[str, Any] = {"content": content, "is_draft": bool(is_draft)}
+            if (title or "").strip():
+                pdata["title"] = title.strip()
+            if (story_ids_csv or "").strip():
+                pdata["story_ids"] = _parse_story_ids_csv(story_ids_csv, None)
+            elif story_id is not None:
+                pdata["story_ids"] = [] if sid is None else [sid]
+            if (slug or "").strip():
+                pdata["slug"] = slug.strip()
+            if tag_list:
+                pdata["tags"] = tag_list
+            if clear_folder:
+                pdata["folder_id"] = None
+            elif folder_id is not None and int(folder_id) > 0:
+                pdata["folder_id"] = int(folder_id)
+            patch = WikiDocPatch(**pdata)
+            try:
+                doc2 = crud.wiki_doc_patch(db, doc, patch)
+            except ValueError as e:
+                return json_out({"error": str(e)})
+            return json_out(crud.wiki_doc_to_out(db, doc2, project_slug=p.slug))
+        fid_create: int | None = None
+        if not clear_folder and folder_id is not None and int(folder_id) > 0:
+            fid_create = int(folder_id)
+        body = WikiDocCreate(
+            title=(title or "Untitled").strip(),
+            content=content or "",
+            slug=(slug or None) or None,
+            story_id=sid,
+            story_ids=merged_ids,
+            folder_id=fid_create,
+            tags=tag_list,
+            is_draft=bool(is_draft),
+        )
+        try:
+            doc = crud.wiki_doc_create(db, pid, body, aid)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
+
+
+@mcp.tool()
+def agile_wiki_folder_create(
+    project_id: int,
+    name: str,
+    parent_folder_id: Optional[int] = None,
+) -> str:
+    """Create a wiki folder under a project. ``parent_folder_id`` None = root level. Names must be unique among siblings."""
+    pid = int(project_id or 0)
+    if pid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id required"})
+    nm = (name or "").strip()
+    if not nm:
+        return json_out({"error": "invalid_argument", "detail": "name required"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        body = WikiFolderCreate(name=nm, parent_id=parent_folder_id)
+        try:
+            fold = crud.wiki_folder_create(db, pid, body)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out(WikiFolderOut.model_validate(fold).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_wiki_folder_tree(project_id: int) -> str:
+    """Return the wiki folder tree `{ tree: [ { id, name, parent_id, sort_order, children: [...] } ] }` for choosing ``folder_id`` in ``agile_wiki_write_doc``."""
+    pid = int(project_id or 0)
+    if pid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id required"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        rows = crud.wiki_folders_list_all(db, pid)
+        tree = crud.wiki_folders_build_tree(rows)
+        return json_out({"tree": tree})
+
+
+@mcp.tool()
+def agile_wiki_semantic_search(
+    project_id: int,
+    query: str,
+    top_k: int = 10,
+    story_id: Optional[int] = None,
+) -> str:
+    """Tìm kiếm ngữ nghĩa trong wiki của project (vector lưu MySQL). project_id bắt buộc."""
+    pid = int(project_id or 0)
+    if pid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id required"})
+    q = (query or "").strip()
+    if not q:
+        return json_out({"error": "invalid_argument", "detail": "query required"})
+    tk = min(max(int(top_k or 10), 1), 50)
+    sid = int(story_id) if story_id is not None and int(story_id) > 0 else None
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        pairs = crud.wiki_docs_semantic_search(db, pid, q, story_id=sid, top_k=tk)
+        results = [crud.wiki_doc_to_out(db, d, project_slug=p.slug, semantic_score=float(sc)) for sc, d in pairs]
+        return json_out(WikiDocSearchOut(query=None, semantic_query=q, results=results).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_wiki_story_context(project_id: int, story_id: int, limit: int = 16) -> str:
+    """Context fetch (AC6): doc gắn story + semantic liên quan trong project. project_id bắt buộc."""
+    pid = int(project_id or 0)
+    sid = int(story_id or 0)
+    if pid <= 0 or sid <= 0:
+        return json_out({"error": "invalid_argument"})
+    lim = min(max(int(limit or 16), 1), 80)
+    with mcp_session() as db:
+        try:
+            rows = crud.wiki_context_for_story(db, pid, sid, limit=lim)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out({"results": rows})
+
+
+@mcp.tool()
+def agile_wiki_list_docs(
+    project_id: int,
+    story_id: Optional[int] = None,
+    in_folder_id: Optional[int] = None,
+    unfiled_only: bool = False,
+    q: str = "",
+    limit: int = 50,
+) -> str:
+    """List wiki docs. Optional ``in_folder_id`` (folder id) or ``unfiled_only`` (docs without folder); do not use both.
+    Optional ``story_id`` and text ``q`` (LIKE title/content)."""
+    pid = int(project_id or 0)
+    if pid <= 0:
+        return json_out({"error": "invalid_argument"})
+    if unfiled_only and in_folder_id is not None:
+        return json_out({"error": "invalid_argument", "detail": "use only one of unfiled_only and in_folder_id"})
+    sid = int(story_id) if story_id is not None and int(story_id) > 0 else None
+    fid = int(in_folder_id) if in_folder_id is not None and int(in_folder_id) > 0 else None
+    lim = min(max(int(limit or 50), 1), 200)
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found"})
+        rows = crud.wiki_documents_list(
+            db,
+            pid,
+            story_id=sid,
+            folder_id=fid,
+            unfiled_only=unfiled_only,
+            q=q or None,
+            limit=lim,
+        )
+        return json_out([crud.wiki_doc_to_out(db, r, project_slug=p.slug) for r in rows])
 
 
 def mcp_base_url() -> str:

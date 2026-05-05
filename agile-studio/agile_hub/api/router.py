@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,9 @@ from ..schemas import (
     StoryStatusEventOut,
     StoryOut,
     StoryPatch,
+    StoryTaskCreate,
+    StoryTaskOut,
+    StoryTaskPatch,
     ApiCenterAgentOut,
     ApiCenterAllowMcpIn,
     ApiCenterConnectIn,
@@ -38,6 +41,15 @@ from ..schemas import (
     ApiCenterChatDispatchIn,
     ApiCenterAgileNotificationIn,
     project_to_out,
+    WikiDocCreate,
+    WikiDocOut,
+    WikiDocPatch,
+    WikiDocSearchOut,
+    WikiFolderCreate,
+    WikiFolderOut,
+    WikiFolderPatch,
+    WikiFolderTreeNode,
+    WikiFolderTreeResponse,
 )
 from .deps import get_current_user, get_db
 
@@ -75,6 +87,11 @@ def _release_or_404(db: Session, release_id: int) -> models.Release:
     if r is None:
         raise HTTPException(404, "Release not found")
     return r
+
+
+def _require_project_member(db: Session, project_id: int, member_id: int) -> None:
+    if member_id not in crud.project_member_ids(db, project_id):
+        raise HTTPException(403, "Not a member of this project")
 
 
 def _require_project_workflow_selected(db: Session, p: models.Project) -> None:
@@ -594,7 +611,55 @@ def list_stories(project_id: int, db: Session = Depends(get_db), status: Optiona
 def get_story(story_id: int, db: Session = Depends(get_db)) -> StoryOut:
     s = _story_or_404(db, story_id)
     p = _project_or_404(db, s.project_id)
-    return StoryOut.model_validate(crud.story_to_out(s, p.slug, db))
+    return StoryOut.model_validate(crud.story_to_out(s, p.slug, db, include_tasks=True))
+
+
+@router.get("/stories/{story_id}/tasks", response_model=list[StoryTaskOut])
+def list_story_tasks(story_id: int, db: Session = Depends(get_db)) -> list[StoryTaskOut]:
+    _story_or_404(db, story_id)
+    return [StoryTaskOut.model_validate(x) for x in crud.story_tasks_out_list(db, story_id)]
+
+
+@router.post("/stories/{story_id}/tasks", response_model=StoryTaskOut)
+def create_story_task(
+    story_id: int,
+    body: StoryTaskCreate,
+    db: Session = Depends(get_db),
+) -> StoryTaskOut:
+    _story_or_404(db, story_id)
+    try:
+        st = crud.story_task_create(db, story_id, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return StoryTaskOut.model_validate(crud.story_task_to_out(db, st))
+
+
+@router.patch("/stories/{story_id}/tasks/{task_id}", response_model=StoryTaskOut)
+def patch_story_task(
+    story_id: int,
+    task_id: int,
+    body: StoryTaskPatch,
+    db: Session = Depends(get_db),
+) -> StoryTaskOut:
+    _story_or_404(db, story_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.story_id != story_id:
+        raise HTTPException(404, "Task not found")
+    try:
+        st2 = crud.story_task_patch(db, st, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return StoryTaskOut.model_validate(crud.story_task_to_out(db, st2))
+
+
+@router.delete("/stories/{story_id}/tasks/{task_id}", status_code=204)
+def delete_story_task(story_id: int, task_id: int, db: Session = Depends(get_db)) -> Response:
+    _story_or_404(db, story_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.story_id != story_id:
+        raise HTTPException(404, "Task not found")
+    crud.story_task_delete(db, st)
+    return Response(status_code=204)
 
 
 @router.patch("/stories/{story_id}", response_model=StoryOut)
@@ -643,7 +708,7 @@ def patch_story(
                 "patched_field_names": keys,
             },
         )
-    return StoryOut.model_validate(crud.story_to_out(s, p.slug, db))
+    return StoryOut.model_validate(crud.story_to_out(s, p.slug, db, include_tasks=True))
 
 
 @router.get("/stories/{story_id}/status-events", response_model=list[StoryStatusEventOut])
@@ -817,4 +882,253 @@ def delete_comment(
         "story.comment.deleted",
         {"comment_id": cid},
     )
+    return Response(status_code=204)
+
+
+# --- Wiki / Docs ---
+@router.get("/projects/{project_id}/wiki-folders/tree", response_model=WikiFolderTreeResponse)
+def wiki_folders_tree(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiFolderTreeResponse:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    rows = crud.wiki_folders_list_all(db, project_id)
+    tree_raw = crud.wiki_folders_build_tree(rows)
+    return WikiFolderTreeResponse(
+        tree=[WikiFolderTreeNode.model_validate(n) for n in tree_raw],
+    )
+
+
+@router.post("/projects/{project_id}/wiki-folders", response_model=WikiFolderOut)
+def wiki_folder_create(
+    project_id: int,
+    body: WikiFolderCreate,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiFolderOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    try:
+        fold = crud.wiki_folder_create(db, project_id, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return WikiFolderOut.model_validate(fold)
+
+
+@router.patch("/projects/{project_id}/wiki-folders/{folder_id}", response_model=WikiFolderOut)
+def wiki_folder_patch_route(
+    project_id: int,
+    folder_id: int,
+    body: WikiFolderPatch,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiFolderOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    fold = crud.wiki_folder_for_project(db, project_id, folder_id)
+    if fold is None:
+        raise HTTPException(404, "folder not found")
+    try:
+        fold2 = crud.wiki_folder_patch(db, fold, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return WikiFolderOut.model_validate(fold2)
+
+
+@router.delete("/projects/{project_id}/wiki-folders/{folder_id}", status_code=204)
+def wiki_folder_delete_route(
+    project_id: int,
+    folder_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    fold = crud.wiki_folder_for_project(db, project_id, folder_id)
+    if fold is None:
+        raise HTTPException(404, "folder not found")
+    crud.wiki_folder_delete(db, fold)
+    return Response(status_code=204)
+
+
+@router.post("/projects/{project_id}/docs", response_model=WikiDocOut)
+def wiki_doc_create(
+    project_id: int,
+    body: WikiDocCreate,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiDocOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    try:
+        doc = crud.wiki_doc_create(db, project_id, body, current.member_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return WikiDocOut.model_validate(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
+
+
+@router.get("/projects/{project_id}/docs", response_model=list[WikiDocOut])
+def wiki_doc_list(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+    story_id: Optional[int] = None,
+    in_folder: Optional[int] = Query(None, description="Only documents in this folder id"),
+    unfiled: bool = Query(False, description="Only documents without a folder"),
+    q: Optional[str] = None,
+    tag: Optional[str] = None,
+    limit: int = 100,
+) -> list[WikiDocOut]:
+    if unfiled and in_folder is not None:
+        raise HTTPException(400, "use either unfiled or in_folder, not both")
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    rows = crud.wiki_documents_list(
+        db,
+        project_id,
+        story_id=story_id,
+        folder_id=in_folder,
+        unfiled_only=unfiled,
+        q=q,
+        tag=tag,
+        limit=limit,
+    )
+    return [WikiDocOut.model_validate(crud.wiki_doc_to_out(db, r, project_slug=p.slug)) for r in rows]
+
+
+@router.get("/projects/{project_id}/docs/search", response_model=WikiDocSearchOut)
+def wiki_doc_search(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+    query: Optional[str] = None,
+    semantic_query: Optional[str] = None,
+    story_id: Optional[int] = None,
+    in_folder: Optional[int] = Query(None),
+    unfiled: bool = Query(False),
+    tag: Optional[str] = None,
+    top_k: int = 15,
+) -> WikiDocSearchOut:
+    if unfiled and in_folder is not None:
+        raise HTTPException(400, "use either unfiled or in_folder, not both")
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    top_k = min(max(top_k, 1), 50)
+    sem_q = (semantic_query or "").strip()
+    kw_q = (query or "").strip()
+
+    if sem_q:
+        pairs = crud.wiki_docs_semantic_search(db, project_id, sem_q, story_id=story_id, top_k=top_k)
+        results: list[WikiDocOut] = []
+        tl = (tag or "").strip().lower()
+        for sc, d in pairs:
+            if tl:
+                if not d.tags_json or not any(str(x).strip().lower() == tl for x in d.tags_json):
+                    continue
+            results.append(
+                WikiDocOut.model_validate(
+                    crud.wiki_doc_to_out(db, d, project_slug=p.slug, semantic_score=float(sc)),
+                )
+            )
+        return WikiDocSearchOut(query=kw_q or None, semantic_query=sem_q, results=results[:top_k])
+
+    rows = crud.wiki_documents_list(
+        db,
+        project_id,
+        story_id=story_id,
+        folder_id=in_folder,
+        unfiled_only=unfiled,
+        q=kw_q or None,
+        tag=tag,
+        limit=top_k,
+    )
+    return WikiDocSearchOut(
+        query=kw_q or None,
+        semantic_query=None,
+        results=[WikiDocOut.model_validate(crud.wiki_doc_to_out(db, r, project_slug=p.slug)) for r in rows],
+    )
+
+
+@router.get("/projects/{project_id}/docs/context", response_model=list[WikiDocOut])
+def wiki_doc_context(
+    project_id: int,
+    story_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+    limit: int = 16,
+) -> list[WikiDocOut]:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    try:
+        rows = crud.wiki_context_for_story(db, project_id, story_id, limit=min(limit, 80))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return [WikiDocOut.model_validate(x) for x in rows]
+
+
+@router.get("/projects/{project_id}/docs/slug/{slug}", response_model=WikiDocOut)
+def wiki_doc_get_by_slug_route(
+    project_id: int,
+    slug: str,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiDocOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get_by_slug(db, project_id, slug)
+    if doc is None:
+        raise HTTPException(404, "Document not found")
+    return WikiDocOut.model_validate(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
+
+
+@router.get("/projects/{project_id}/docs/{doc_id}", response_model=WikiDocOut)
+def wiki_doc_get(
+    project_id: int,
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiDocOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    return WikiDocOut.model_validate(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
+
+
+@router.put("/projects/{project_id}/docs/{doc_id}", response_model=WikiDocOut)
+def wiki_doc_put(
+    project_id: int,
+    doc_id: str,
+    body: WikiDocPatch,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiDocOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    try:
+        doc2 = crud.wiki_doc_patch(db, doc, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return WikiDocOut.model_validate(crud.wiki_doc_to_out(db, doc2, project_slug=p.slug))
+
+
+@router.delete("/projects/{project_id}/docs/{doc_id}", status_code=204)
+def wiki_doc_delete(
+    project_id: int,
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    crud.wiki_doc_delete(db, doc)
     return Response(status_code=204)
