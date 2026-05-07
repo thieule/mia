@@ -7,9 +7,15 @@ import { io } from "socket.io-client";
 import { apiDelete, apiGet, apiPatch, apiPost, clearAuth, getStoredUser } from "./api.js";
 import KanbanBoard from "./KanbanBoard.jsx";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
-import { MermaidBlock } from "./MermaidBlock.jsx";
+import { MarkdownPreviewPre } from "./markdownMermaidPreview.jsx";
 import ProjectWikiPage from "./ProjectWikiPage.jsx";
 import StoryDocsTab from "./StoryDocsTab.jsx";
+import {
+  AgileMarkdownAnchor,
+  AgileMarkdownProjectContext,
+  agileMarkdownUrlTransform,
+  linkifyAgileStandaloneShortLinks,
+} from "./agileMarkdownLink.jsx";
 import {
   loadNotifications,
   makeNotification,
@@ -29,17 +35,6 @@ function normalizeChatMarkdownSource(raw) {
     s = s.replace(/\\r\\n/g, "\n").replace(/\\r/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
   }
   return s;
-}
-
-/** Lấy text thuần từ children của react-markdown `code` (fenced block). */
-function markdownCodeChildrenToString(node) {
-  if (node == null) return "";
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(markdownCodeChildrenToString).join("");
-  if (typeof node === "object" && node.props != null && node.props.children != null) {
-    return markdownCodeChildrenToString(node.props.children);
-  }
-  return String(node);
 }
 
 function formatChatMessageTime(iso) {
@@ -84,21 +79,10 @@ class ChatMarkdownErrorBoundary extends Component {
   }
 }
 
-/** Markdown trong bubble chat — link mở tab mới; giữ @mention tách khỏi MD để highlight. */
+/** Markdown trong bubble chat — link nội bộ SPA; ngoài app → tab mới; @mention tách khỏi MD. */
 const CHAT_MARKDOWN_COMPONENTS = {
-  a: ({ node: _n, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
-  pre: ({ children, ...props }) => {
-    const child = Array.isArray(children) ? children[0] : children;
-    const cls =
-      child && typeof child === "object" && child.props != null
-        ? String(child.props.className || "")
-        : "";
-    if (cls.includes("language-mermaid")) {
-      const chart = markdownCodeChildrenToString(child.props.children).replace(/\n$/, "");
-      return <MermaidBlock chart={chart} />;
-    }
-    return <pre {...props}>{children}</pre>;
-  },
+  a: AgileMarkdownAnchor,
+  pre: MarkdownPreviewPre,
 };
 
 /**
@@ -112,11 +96,15 @@ function renderMarkdownWithMentions(content, mentionIndex) {
   return parts.map((p, idx) => {
     if (!p.startsWith("@")) {
       if (!p) return null;
-      const md = normalizeChatMarkdownSource(p);
+      const md = linkifyAgileStandaloneShortLinks(normalizeChatMarkdownSource(p));
       return (
-        <div key={idx} className="as-chat-md">
+        <div key={idx} className="as-chat-md as-md-prose-view">
           <ChatMarkdownErrorBoundary source={md}>
-            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={CHAT_MARKDOWN_COMPONENTS}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm, remarkBreaks]}
+              components={CHAT_MARKDOWN_COMPONENTS}
+              urlTransform={agileMarkdownUrlTransform}
+            >
               {md}
             </ReactMarkdown>
           </ChatMarkdownErrorBoundary>
@@ -707,6 +695,15 @@ function StoryDetailBody({
         <li className="nav-item">
           <button
             type="button"
+            className={`nav-link ${storySectionTab === "tasks" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("tasks")}
+          >
+            Tasks
+          </button>
+        </li>
+        <li className="nav-item">
+          <button
+            type="button"
             className={`nav-link ${storySectionTab === "docs" ? "active" : ""}`}
             onClick={() => setStorySectionTab("docs")}
           >
@@ -715,7 +712,86 @@ function StoryDetailBody({
         </li>
       </ul>
       {storySectionTab === "docs" ? (
-        <StoryDocsTab projectId={storyDetail.project_id} storyId={storyDetail.id} setErr={setErr} />
+        <StoryDocsTab
+          projectId={storyDetail.project_id}
+          storyId={storyDetail.id}
+          onProject={onProject}
+          setErr={setErr}
+        />
+      ) : storySectionTab === "tasks" ? (
+        <>
+          <div className="mb-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <h2 className="h6 text-secondary mb-0">Tasks</h2>
+            {onProject ? (
+              <button type="button" className="btn btn-link btn-sm p-0" onClick={openCreateTaskModal}>
+                Add task
+              </button>
+            ) : null}
+          </div>
+          {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : []).length === 0 ? (
+            <p className="small text-secondary fst-italic mb-3">No tasks yet.</p>
+          ) : null}
+          <ul className="list-unstyled small mb-0">
+            {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : [])
+              .slice()
+              .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id))
+              .map((t) => (
+                <li key={t.id} className="mb-3 pb-3 border-bottom">
+                  <div className="d-flex align-items-start gap-2">
+                    <input
+                      type="checkbox"
+                      className="form-check-input mt-1 flex-shrink-0"
+                      checked={!!t.done}
+                      disabled={!onProject}
+                      onChange={(e) => onPatchTask(storyDetail.id, t.id, { done: e.target.checked })}
+                      aria-label={t.done ? "Mark task as not done" : "Mark task as done"}
+                    />
+                    <div className="flex-grow-1 min-w-0">
+                      <div className={`fw-semibold ${t.done ? "text-decoration-line-through text-secondary" : ""}`}>{t.title}</div>
+                      {t.body ? (
+                        <div className={`as-story-body as-story-desc-md mt-1 small ${t.done ? "text-secondary" : ""}`}>
+                          {renderMarkdownWithMentions(t.body, commentMentionIndex)}
+                        </div>
+                      ) : null}
+                      <div className="small text-secondary mt-1">
+                        <span className="text-nowrap">Assignees: </span>
+                        <span>{formatTaskMemberNames(t.assignee_ids?.length ? t.assignee_ids : t.assignee_id != null ? [t.assignee_id] : [])}</span>
+                        <span className="text-nowrap"> · Reporter: </span>
+                        <span>{formatTaskReporterName(t.reporter_id)}</span>
+                      </div>
+                    </div>
+                    {onProject ? (
+                      <div className="d-flex gap-1 flex-shrink-0">
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm p-1 lh-1"
+                          onClick={() => openEditTaskModal(t)}
+                          title="Edit task"
+                          aria-label="Edit task"
+                        >
+                          <i className="bi bi-pencil" aria-hidden />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm p-1 lh-1"
+                          onClick={() => onDeleteTask(storyDetail.id, t.id)}
+                          title="Delete task"
+                          aria-label="Delete task"
+                        >
+                          <i className="bi bi-trash" aria-hidden />
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+          </ul>
+          {!onProject && getStoredUser() ? (
+            <p className="small text-secondary mt-3 mb-0">
+              Add yourself to the project <strong>Team</strong> to create or update tasks.
+            </p>
+          ) : null}
+        </>
       ) : (
         <>
       <div className="d-flex align-items-start justify-content-between gap-2 mb-3">
@@ -742,6 +818,8 @@ function StoryDetailBody({
               height={220}
               placeholder="Optional"
               textareaProps={{ id: "as-story-edit-desc" }}
+              insertToolbar
+              projectId={storyDetail.project_id}
             />
             <div className="d-flex gap-2">
               <button className="btn btn-primary btn-sm" type="submit" disabled={!storyTitleDraft.trim()}>
@@ -897,77 +975,117 @@ function StoryDetailBody({
           <div className="form-text">Hold Cmd/Ctrl to select more than one member.</div>
         ) : null}
       </div>
-      <div className="border-top pt-3 mb-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
-        <h3 className="h6 text-secondary mb-0">Tasks</h3>
-        {onProject ? (
-          <button type="button" className="btn btn-link btn-sm p-0" onClick={openCreateTaskModal}>
-            Add task
-          </button>
-        ) : null}
-      </div>
-      {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : []).length === 0 ? (
-        <p className="small text-secondary fst-italic mb-3">No tasks yet.</p>
-      ) : null}
+      <h3 className="h6 text-secondary border-top pt-3 mb-3">Comments</h3>
       <ul className="list-unstyled small mb-4">
-        {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : [])
-          .slice()
-          .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id))
-          .map((t) => (
-            <li key={t.id} className="mb-3 pb-3 border-bottom">
-              <div className="d-flex align-items-start gap-2">
-                <input
-                  type="checkbox"
-                  className="form-check-input mt-1 flex-shrink-0"
-                  checked={!!t.done}
-                  disabled={!onProject}
-                  onChange={(e) => onPatchTask(storyDetail.id, t.id, { done: e.target.checked })}
-                  aria-label={t.done ? "Mark task as not done" : "Mark task as done"}
-                />
-                <div className="flex-grow-1 min-w-0">
-                  <div className={`fw-semibold ${t.done ? "text-decoration-line-through text-secondary" : ""}`}>{t.title}</div>
-                  {t.body ? (
-                    <div className={`as-story-body as-story-desc-md mt-1 small ${t.done ? "text-secondary" : ""}`}>
-                      {renderMarkdownWithMentions(t.body, commentMentionIndex)}
-                    </div>
-                  ) : null}
-                  <div className="small text-secondary mt-1">
-                    <span className="text-nowrap">Assignees: </span>
-                    <span>{formatTaskMemberNames(t.assignee_ids?.length ? t.assignee_ids : t.assignee_id != null ? [t.assignee_id] : [])}</span>
-                    <span className="text-nowrap"> · Reporter: </span>
-                    <span>{formatTaskReporterName(t.reporter_id)}</span>
-                  </div>
+        {comments.map((c) => {
+          const isAuthor = me?.member_id != null && c.author_member_id === me.member_id;
+          const edited =
+            c.updated_at &&
+            c.created_at &&
+            new Date(c.updated_at).getTime() - new Date(c.created_at).getTime() > 1500;
+          return (
+            <li key={c.id} className="mb-3 pb-3 border-bottom">
+              <div className="text-secondary mb-1 d-flex flex-wrap align-items-center justify-content-between gap-2">
+                <div>
+                  <strong className="text-dark">{c.author?.display_name ?? `Member #${c.author_member_id}`}</strong>
+                  {c.author?.member_type === "ai" ? <span className="badge bg-secondary ms-1 small">AI</span> : null}
+                  <span className="text-muted"> · {new Date(c.created_at).toLocaleString()}</span>
+                  {edited ? <span className="text-muted fst-italic ms-1">(edited)</span> : null}
                 </div>
-                {onProject ? (
+                {isAuthor && editingCommentId !== c.id ? (
                   <div className="d-flex gap-1 flex-shrink-0">
                     <button
                       type="button"
                       className="btn btn-outline-secondary btn-sm p-1 lh-1"
-                      onClick={() => openEditTaskModal(t)}
-                      title="Edit task"
-                      aria-label="Edit task"
+                      onClick={() => startEdit(c)}
+                      title="Edit comment"
+                      aria-label="Edit comment"
                     >
                       <i className="bi bi-pencil" aria-hidden />
                     </button>
                     <button
                       type="button"
                       className="btn btn-outline-danger btn-sm p-1 lh-1"
-                      onClick={() => onDeleteTask(storyDetail.id, t.id)}
-                      title="Delete task"
-                      aria-label="Delete task"
+                      onClick={() => onDeleteComment(c.id)}
+                      title="Delete comment"
+                      aria-label="Delete comment"
                     >
                       <i className="bi bi-trash" aria-hidden />
                     </button>
                   </div>
                 ) : null}
               </div>
+              {editingCommentId === c.id ? (
+                <form className="vstack gap-2 mt-1" onSubmit={saveEdit}>
+                  {editCommentMentionSuggestions.length > 0 ? (
+                    <div className="as-chat-mention-suggest mb-1">
+                      {editCommentMentionSuggestions.map((m) => (
+                        <button key={m.id} type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onPickCommentMention(m.name, "edit")}>
+                          @{mentionKeyFromName(m.name)}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                  <MarkdownEditorField
+                    value={editDraft}
+                    onChange={setEditDraft}
+                    height={160}
+                    textareaProps={{ required: true }}
+                  />
+                  <div className="d-flex gap-2">
+                    <button className="btn btn-primary btn-sm" type="submit" disabled={!editDraft.trim()}>
+                      Save
+                    </button>
+                    <button className="btn btn-outline-secondary btn-sm" type="button" onClick={cancelEdit}>
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="mt-1 as-comment-md">{renderCommentContent(c.body)}</div>
+              )}
             </li>
-          ))}
+          );
+        })}
       </ul>
-      {!onProject && getStoredUser() ? (
-        <p className="small text-secondary mb-4">
-          Add yourself to the project <strong>Team</strong> to create or update tasks.
-        </p>
-      ) : null}
+      <form onSubmit={onPostComment} className="vstack gap-2">
+        {me ? (
+          <p className="small text-secondary mb-0">
+            Posting as <strong>{me.display_name}</strong>.
+            {!onProject ? (
+              <span className="d-block text-warning mt-1">You are not on this project — add yourself in Team before commenting.</span>
+            ) : null}
+          </p>
+        ) : null}
+        {createCommentMentionSuggestions.length > 0 ? (
+          <div className="as-chat-mention-suggest mb-1">
+            {createCommentMentionSuggestions.map((m) => (
+              <button key={m.id} type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onPickCommentMention(m.name, "create")}>
+                @{mentionKeyFromName(m.name)}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        <MarkdownEditorField
+          value={cmBody}
+          onChange={setCmBody}
+          height={170}
+          placeholder="Comment"
+          textareaProps={{ required: true }}
+          insertToolbar
+          projectId={storyDetail.project_id}
+        />
+        <button
+          className="btn btn-primary btn-sm"
+          type="submit"
+          disabled={!cmBody.trim() || (me != null && !onProject)}
+          title={me != null && !onProject ? "Join this project in Team to comment" : undefined}
+        >
+          Post comment
+        </button>
+      </form>
+        </>
+      )}
       {taskModalOpen ? (
         <>
           <div
@@ -1062,109 +1180,6 @@ function StoryDetailBody({
           <div className="modal-backdrop fade show" />
         </>
       ) : null}
-      <h3 className="h6 text-secondary border-top pt-3 mb-3">Comments</h3>
-      <ul className="list-unstyled small mb-4">
-        {comments.map((c) => {
-          const isAuthor = me?.member_id != null && c.author_member_id === me.member_id;
-          const edited =
-            c.updated_at &&
-            c.created_at &&
-            new Date(c.updated_at).getTime() - new Date(c.created_at).getTime() > 1500;
-          return (
-            <li key={c.id} className="mb-3 pb-3 border-bottom">
-              <div className="text-secondary mb-1 d-flex flex-wrap align-items-center justify-content-between gap-2">
-                <div>
-                  <strong className="text-dark">{c.author?.display_name ?? `Member #${c.author_member_id}`}</strong>
-                  {c.author?.member_type === "ai" ? <span className="badge bg-secondary ms-1 small">AI</span> : null}
-                  <span className="text-muted"> · {new Date(c.created_at).toLocaleString()}</span>
-                  {edited ? <span className="text-muted fst-italic ms-1">(edited)</span> : null}
-                </div>
-                {isAuthor && editingCommentId !== c.id ? (
-                  <div className="d-flex gap-1 flex-shrink-0">
-                    <button
-                      type="button"
-                      className="btn btn-outline-secondary btn-sm p-1 lh-1"
-                      onClick={() => startEdit(c)}
-                      title="Edit comment"
-                      aria-label="Edit comment"
-                    >
-                      <i className="bi bi-pencil" aria-hidden />
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-outline-danger btn-sm p-1 lh-1"
-                      onClick={() => onDeleteComment(c.id)}
-                      title="Delete comment"
-                      aria-label="Delete comment"
-                    >
-                      <i className="bi bi-trash" aria-hidden />
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-              {editingCommentId === c.id ? (
-                <form className="vstack gap-2 mt-1" onSubmit={saveEdit}>
-                  {editCommentMentionSuggestions.length > 0 ? (
-                    <div className="as-chat-mention-suggest mb-1">
-                      {editCommentMentionSuggestions.map((m) => (
-                        <button key={m.id} type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onPickCommentMention(m.name, "edit")}>
-                          @{mentionKeyFromName(m.name)}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                  <MarkdownEditorField
-                    value={editDraft}
-                    onChange={setEditDraft}
-                    height={160}
-                    textareaProps={{ required: true }}
-                  />
-                  <div className="d-flex gap-2">
-                    <button className="btn btn-primary btn-sm" type="submit" disabled={!editDraft.trim()}>
-                      Save
-                    </button>
-                    <button className="btn btn-outline-secondary btn-sm" type="button" onClick={cancelEdit}>
-                      Cancel
-                    </button>
-                  </div>
-                </form>
-              ) : (
-                <div className="mt-1 as-comment-md">{renderCommentContent(c.body)}</div>
-              )}
-            </li>
-          );
-        })}
-      </ul>
-      <form onSubmit={onPostComment} className="vstack gap-2">
-        {me ? (
-          <p className="small text-secondary mb-0">
-            Posting as <strong>{me.display_name}</strong>.
-            {!onProject ? (
-              <span className="d-block text-warning mt-1">You are not on this project — add yourself in Team before commenting.</span>
-            ) : null}
-          </p>
-        ) : null}
-        {createCommentMentionSuggestions.length > 0 ? (
-          <div className="as-chat-mention-suggest mb-1">
-            {createCommentMentionSuggestions.map((m) => (
-              <button key={m.id} type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onPickCommentMention(m.name, "create")}>
-                @{mentionKeyFromName(m.name)}
-              </button>
-            ))}
-          </div>
-        ) : null}
-        <MarkdownEditorField value={cmBody} onChange={setCmBody} height={170} placeholder="Comment" textareaProps={{ required: true }} />
-        <button
-          className="btn btn-primary btn-sm"
-          type="submit"
-          disabled={!cmBody.trim() || (me != null && !onProject)}
-          title={me != null && !onProject ? "Join this project in Team to comment" : undefined}
-        >
-          Post comment
-        </button>
-      </form>
-        </>
-      )}
     </>
   );
 }
@@ -3228,6 +3243,7 @@ export default function App() {
         </div>
       </header>
 
+      <AgileMarkdownProjectContext.Provider value={projectId}>
       <div className="as-body">
         <aside className="as-sidenav">
           <div className="as-sidenav-label">Workspace</div>
@@ -3453,6 +3469,8 @@ export default function App() {
                             height={260}
                             placeholder="Context, acceptance criteria, links... (optional)"
                             textareaProps={{ id: "as-new-story-desc" }}
+                            insertToolbar
+                            projectId={projectId}
                           />
                           <div className="form-text">Leave blank if details come later — you can edit the story anytime.</div>
                         </div>
@@ -4572,26 +4590,28 @@ export default function App() {
           <div className="as-drawer-backdrop" role="presentation" onClick={closeStoryDrawer} aria-hidden />
           <aside className="as-drawer" aria-label="Story details">
             <div className="as-drawer-hd">
-              <div className="min-w-0 flex-grow-1">
+              <div className="as-drawer-hd-title min-w-0">
                 {storyDetail.story_key ? (
                   <div className="small text-white-50 font-monospace text-truncate mb-0">{storyDetail.story_key}</div>
                 ) : null}
                 <span className="fw-semibold text-truncate d-block">{storyDetail.title}</span>
               </div>
-              {projectId ? (
-                <button
-                  type="button"
-                  className="btn btn-sm btn-outline-primary flex-shrink-0"
-                  title="Open full story page (shareable URL)"
-                  onClick={() => navigate(`/p/${projectId}/story/${storyDetail.id}`)}
-                >
-                  <i className="bi bi-box-arrow-up-right me-1" aria-hidden />
-                  Full page
+              <div className="as-drawer-hd-actions">
+                {projectId ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-primary flex-shrink-0"
+                    title="Open full story page (shareable URL)"
+                    onClick={() => navigate(`/p/${projectId}/story/${storyDetail.id}`)}
+                  >
+                    <i className="bi bi-box-arrow-up-right me-1" aria-hidden />
+                    Full page
+                  </button>
+                ) : null}
+                <button type="button" className="btn btn-sm btn-outline-secondary flex-shrink-0" onClick={closeStoryDrawer} aria-label="Close">
+                  <i className="bi bi-x-lg" />
                 </button>
-              ) : null}
-              <button type="button" className="btn btn-sm btn-outline-secondary flex-shrink-0" onClick={closeStoryDrawer} aria-label="Close">
-                <i className="bi bi-x-lg" />
-              </button>
+              </div>
             </div>
             <div className="as-drawer-bd">
               <StoryDetailBody
@@ -4618,6 +4638,7 @@ export default function App() {
           </aside>
         </>
       )}
+      </AgileMarkdownProjectContext.Provider>
     </div>
   );
 }

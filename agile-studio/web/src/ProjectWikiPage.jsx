@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
 import { apiDelete, apiGet, apiPost, apiPut } from "./api.js";
 
@@ -25,100 +25,171 @@ function collectFolderIds(nodes, s = new Set()) {
   return s;
 }
 
-function WikiFolderTree({
-  nodes,
-  depth,
+/** Root key for expand/collapse of unfiled docs block (must not collide with numeric folder ids). */
+const UNFILED_SECTION_KEY = "unfiled";
+
+function docStoryKeys(d) {
+  if (Array.isArray(d.story_keys)) return d.story_keys;
+  if (d.story_key) return [d.story_key];
+  return [];
+}
+
+function sortDocsByTitle(a, b) {
+  const ta = (a.title || "").toLowerCase();
+  const tb = (b.title || "").toLowerCase();
+  if (ta !== tb) return ta < tb ? -1 : 1;
+  return (a.id || 0) - (b.id || 0);
+}
+
+function WikiTreeDocRow({ doc, selId, onSelectDoc }) {
+  const keys = docStoryKeys(doc);
+  return (
+    <li className="as-wiki-tree-doc-li">
+      <button
+        type="button"
+        className={`as-wiki-tree-doc-btn ${doc.id === selId ? "is-active" : ""}`}
+        onClick={() => onSelectDoc(doc)}
+      >
+        <span className="as-wiki-folder-caret as-wiki-folder-caret--spacer" aria-hidden />
+        <i className="bi bi-file-earmark-text as-wiki-tree-doc-icon" aria-hidden />
+        <span className="as-wiki-tree-doc-title text-truncate">{doc.title || "Untitled"}</span>
+        {doc.is_draft ? (
+          <span className="badge rounded-pill bg-warning text-dark as-wiki-draft-badge flex-shrink-0">Draft</span>
+        ) : null}
+      </button>
+      {keys.length ? (
+        <div className="as-wiki-tree-doc-meta">
+          <span className="font-monospace text-truncate">{doc.slug}</span>
+          <div className="as-wiki-story-chips as-wiki-story-chips--compact">
+            {keys.slice(0, 3).map((k) => (
+              <span key={k} className="as-wiki-chip">
+                {k}
+              </span>
+            ))}
+            {keys.length > 3 ? <span className="as-wiki-chip as-wiki-chip-more">+{keys.length - 3}</span> : null}
+          </div>
+        </div>
+      ) : (
+        <div className="as-wiki-tree-doc-meta">
+          <span className="font-monospace text-truncate">{doc.slug}</span>
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** One folder row + nested folders and documents (single `<li>`). */
+function WikiFolderNode({
+  node,
   expandedFolders,
   toggleFolder,
-  listFilter,
-  onPickFolder,
+  docsByFolderId,
+  createInFolderId,
+  selId,
+  onSelectDoc,
+  onFolderNameClick,
   onAddChild,
   onDeleteFolder,
 }) {
-  if (!nodes?.length) return null;
+  const childFolders = node.children || [];
+  const folderDocs = [...(docsByFolderId.get(node.id) || [])].sort(sortDocsByTitle);
+  const open = expandedFolders.has(node.id);
+  const hasSubtree = childFolders.length > 0 || folderDocs.length > 0;
+  const folderTarget = createInFolderId === node.id;
   return (
-    <ul className={`as-wiki-folder-tree-ul${depth > 0 ? " as-wiki-folder-tree-nested" : ""}`}>
-      {nodes.map((node) => {
-        const hasChildren = node.children?.length > 0;
-        const open = expandedFolders.has(node.id);
-        const selected = listFilter.type === "folder" && listFilter.id === node.id;
-        return (
-          <li key={node.id}>
-            <div className="as-wiki-folder-row">
-              {hasChildren ? (
-                <button
-                  type="button"
-                  className="as-wiki-folder-caret"
-                  onClick={() => toggleFolder(node.id)}
-                  aria-expanded={open}
-                  aria-label={open ? "Collapse" : "Expand"}
-                >
-                  <i className={`bi ${open ? "bi-chevron-down" : "bi-chevron-right"}`} aria-hidden />
-                </button>
-              ) : (
-                <span className="as-wiki-folder-caret as-wiki-folder-caret--spacer" aria-hidden />
-              )}
-              <button
-                type="button"
-                className={`as-wiki-folder-name ${selected ? "is-active" : ""}`}
-                onClick={() => onPickFolder(node.id)}
-              >
-                <i className="bi bi-folder2 me-1" aria-hidden />
-                <span className="text-truncate">{node.name}</span>
-              </button>
-              <button
-                type="button"
-                className="as-wiki-folder-mini"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onAddChild(node.id);
-                }}
-                title="New subfolder"
-              >
-                <i className="bi bi-folder-plus" />
-              </button>
-              <button
-                type="button"
-                className="as-wiki-folder-mini as-wiki-folder-mini--danger"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDeleteFolder(node);
-                }}
-                title="Delete folder"
-              >
-                <i className="bi bi-trash" />
-              </button>
-            </div>
-            {hasChildren && open ? (
-              <WikiFolderTree
-                nodes={node.children}
-                depth={depth + 1}
-                expandedFolders={expandedFolders}
-                toggleFolder={toggleFolder}
-                listFilter={listFilter}
-                onPickFolder={onPickFolder}
-                onAddChild={onAddChild}
-                onDeleteFolder={onDeleteFolder}
-              />
-            ) : null}
-          </li>
-        );
-      })}
-    </ul>
+    <li>
+      <div className="as-wiki-folder-row">
+        {hasSubtree ? (
+          <button
+            type="button"
+            className="as-wiki-folder-caret"
+            onClick={() => toggleFolder(node.id)}
+            aria-expanded={open}
+            aria-label={open ? "Collapse" : "Expand"}
+          >
+            <i className={`bi ${open ? "bi-chevron-down" : "bi-chevron-right"}`} aria-hidden />
+          </button>
+        ) : (
+          <span className="as-wiki-folder-caret as-wiki-folder-caret--spacer" aria-hidden />
+        )}
+        <button
+          type="button"
+          className={`as-wiki-folder-name ${folderTarget ? "is-create-target" : ""}`}
+          onClick={() => onFolderNameClick(node.id)}
+        >
+          <i className="bi bi-folder2 me-1" aria-hidden />
+          <span className="text-truncate">{node.name}</span>
+        </button>
+        <button
+          type="button"
+          className="as-wiki-folder-mini"
+          onClick={(e) => {
+            e.stopPropagation();
+            onAddChild(node.id);
+          }}
+          title="New subfolder"
+        >
+          <i className="bi bi-folder-plus" />
+        </button>
+        <button
+          type="button"
+          className="as-wiki-folder-mini as-wiki-folder-mini--danger"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDeleteFolder(node);
+          }}
+          title="Delete folder"
+        >
+          <i className="bi bi-trash" />
+        </button>
+      </div>
+      {open ? (
+        <>
+          {childFolders.length > 0 ? (
+            <ul className="as-wiki-folder-tree-ul as-wiki-folder-tree-nested">
+              {childFolders.map((ch) => (
+                <WikiFolderNode
+                  key={ch.id}
+                  node={ch}
+                  expandedFolders={expandedFolders}
+                  toggleFolder={toggleFolder}
+                  docsByFolderId={docsByFolderId}
+                  createInFolderId={createInFolderId}
+                  selId={selId}
+                  onSelectDoc={onSelectDoc}
+                  onFolderNameClick={onFolderNameClick}
+                  onAddChild={onAddChild}
+                  onDeleteFolder={onDeleteFolder}
+                />
+              ))}
+            </ul>
+          ) : null}
+          {folderDocs.length > 0 ? (
+            <ul className="as-wiki-folder-tree-ul as-wiki-folder-tree-nested as-wiki-folder-tree-docs">
+              {folderDocs.map((d) => (
+                <WikiTreeDocRow key={d.id} doc={d} selId={selId} onSelectDoc={onSelectDoc} />
+              ))}
+            </ul>
+          ) : null}
+        </>
+      ) : null}
+    </li>
   );
 }
 
 /** Project Documentation / wiki: folder tree, list, search, edit, story links, wiki:slug. */
 export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
   const navigate = useNavigate();
-  const [docs, setDocs] = useState([]);
+  const [libraryDocs, setLibraryDocs] = useState([]);
+  /** When non-null, sidebar shows search hits instead of full library (still grouped by folder). */
+  const [searchHits, setSearchHits] = useState(null);
   const [folderTree, setFolderTree] = useState([]);
   const [expandedFolders, setExpandedFolders] = useState(() => new Set());
-  const [listFilter, setListFilter] = useState(/** @type {{ type: 'all' } | { type: 'unfiled' } | { type: 'folder', id: number }} */ ({ type: "all" }));
+  /** New documents are created in this folder until cleared (click folder name to set). */
+  const [createInFolderId, setCreateInFolderId] = useState(null);
   const [docFolderId, setDocFolderId] = useState(null);
   const [stories, setStories] = useState([]);
   const [kw, setKw] = useState("");
-  const [sem, setSem] = useState("");
   const [selId, setSelId] = useState(null);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -154,31 +225,28 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
       const res = await apiGet(`/projects/${projectId}/wiki-folders/tree`);
       const tree = Array.isArray(res?.tree) ? res.tree : [];
       setFolderTree(tree);
-      setExpandedFolders(collectFolderIds(tree));
+      setExpandedFolders(new Set([UNFILED_SECTION_KEY, ...collectFolderIds(tree)]));
     } catch (e) {
       setErr?.(e?.message || String(e));
     }
   }, [projectId, setErr]);
 
-  const refresh = useCallback(async () => {
+  const loadLibraryDocs = useCallback(async () => {
     if (!projectId) return;
     setLoading(true);
     try {
-      let path = `/projects/${projectId}/docs?limit=500`;
-      if (listFilter.type === "unfiled") path += "&unfiled=true";
-      else if (listFilter.type === "folder") path += `&in_folder=${listFilter.id}`;
-      const rows = await apiGet(path);
-      setDocs(Array.isArray(rows) ? rows : []);
+      const rows = await apiGet(`/projects/${projectId}/docs?limit=500`);
+      setLibraryDocs(Array.isArray(rows) ? rows : []);
     } catch (e) {
       setErr?.(e?.message || String(e));
     } finally {
       setLoading(false);
     }
-  }, [projectId, listFilter, setErr]);
+  }, [projectId, setErr]);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    loadLibraryDocs();
+  }, [loadLibraryDocs]);
 
   useEffect(() => {
     loadStories();
@@ -189,6 +257,34 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
   }, [loadFolderTree]);
 
   const flatFolderOptions = useMemo(() => flattenWikiFolders(folderTree), [folderTree]);
+
+  const docsForTree = searchHits !== null ? searchHits : libraryDocs;
+
+  const docsByFolderId = useMemo(() => {
+    const m = new Map();
+    const arr = Array.isArray(docsForTree) ? docsForTree : [];
+    for (const d of arr) {
+      if (!d || typeof d !== "object") continue;
+      const fid = d.folder_id != null ? Number(d.folder_id) : null;
+      if (fid == null || !Number.isFinite(fid)) continue;
+      if (!m.has(fid)) m.set(fid, []);
+      m.get(fid).push(d);
+    }
+    return m;
+  }, [docsForTree]);
+
+  const unfiledDocs = useMemo(() => {
+    const arr = Array.isArray(docsForTree) ? docsForTree : [];
+    const out = [];
+    for (const raw of arr) {
+      const d = raw;
+      if (!d || typeof d !== "object") continue;
+      const fid = d.folder_id != null ? Number(d.folder_id) : null;
+      if (fid == null || !Number.isFinite(fid)) out.push(d);
+    }
+    out.sort(sortDocsByTitle);
+    return out;
+  }, [docsForTree]);
 
   useEffect(
     () => () => {
@@ -251,29 +347,43 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     };
   }, [projectId, initialSlug, applyDoc, setErr]);
 
-  const wikiPreviewOptions = useMemo(
-    () => ({
-      components: {
-        a: ({ href, children, ...rest }) => {
-          const h = href || "";
-          if (h.startsWith("wiki:")) {
-            const slug = encodeURIComponent(h.slice(5).replace(/^\/*/, ""));
-            return (
-              <Link to={`/p/${projectId}/wiki/${slug}`} {...rest}>
-                {children}
-              </Link>
-            );
-          }
-          return (
-            <a href={h} target="_blank" rel="noopener noreferrer" {...rest}>
-              {children}
-            </a>
-          );
-        },
-      },
-    }),
-    [projectId]
-  );
+  /** Story » Docs "New document": location.state.createDocForStoryId + nonce → tạo doc có story_ids, mở editor. */
+  useEffect(() => {
+    if (!projectId) return;
+    const raw = location.state?.createDocForStoryId;
+    const nonce = location.state?.createDocNonce;
+    if (raw == null || typeof nonce !== "string") return;
+
+    const sid = Number(raw);
+    const pathPlusSearch = `${location.pathname}${location.search || ""}`;
+    if (!Number.isFinite(sid) || sid <= 0) {
+      navigate(pathPlusSearch, { replace: true, state: {} });
+      return;
+    }
+
+    const dedupeKey = `asWikiCreate:${nonce}`;
+    if (sessionStorage.getItem(dedupeKey)) return;
+    sessionStorage.setItem(dedupeKey, "1");
+
+    navigate(pathPlusSearch, { replace: true, state: {} });
+
+    (async () => {
+      try {
+        const d = await apiPost(`/projects/${projectId}/docs`, {
+          title: "New document",
+          content: "",
+          story_ids: [sid],
+          folder_id: null,
+          is_draft: true,
+        });
+        await loadLibraryDocs();
+        applyDoc(d);
+      } catch (e) {
+        sessionStorage.removeItem(dedupeKey);
+        setErr?.(e?.message || String(e));
+      }
+    })();
+  }, [projectId, location.state, location.pathname, location.search, navigate, loadLibraryDocs, applyDoc, setErr]);
 
   useEffect(() => {
     if (!selId || !projectId) return;
@@ -305,7 +415,7 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
           folderKey,
           isDraft,
         };
-        await refresh();
+        await loadLibraryDocs();
       } catch (e) {
         setErr?.(e?.message || String(e));
       } finally {
@@ -323,7 +433,7 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     linkedStoryIds,
     selId,
     projectId,
-    refresh,
+    loadLibraryDocs,
     setErr,
   ]);
 
@@ -331,18 +441,14 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     if (!projectId) return;
     setLoading(true);
     try {
-      const semQ = sem.trim();
       const kwQ = kw.trim();
-      if (semQ) {
-        const q = new URLSearchParams({ semantic_query: semQ, top_k: "25" });
-        const res = await apiGet(`/projects/${projectId}/docs/search?${q}`);
-        setDocs(Array.isArray(res?.results) ? res.results : []);
-      } else if (kwQ) {
+      if (kwQ) {
         const q = new URLSearchParams({ query: kwQ, top_k: "50" });
         const res = await apiGet(`/projects/${projectId}/docs/search?${q}`);
-        setDocs(Array.isArray(res?.results) ? res.results : []);
+        setSearchHits(Array.isArray(res?.results) ? res.results : []);
       } else {
-        await refresh();
+        setSearchHits(null);
+        await loadLibraryDocs();
       }
     } catch (e) {
       setErr?.(e?.message || String(e));
@@ -400,8 +506,14 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     });
   }, []);
 
-  const onPickFolder = useCallback((folderId) => {
-    setListFilter({ type: "folder", id: folderId });
+  const onFolderNameClick = useCallback((folderId) => {
+    setCreateInFolderId(folderId);
+    setExpandedFolders((prev) => new Set(prev).add(folderId));
+  }, []);
+
+  const onLibraryRootClick = useCallback(() => {
+    setCreateInFolderId(null);
+    setExpandedFolders((prev) => new Set(prev).add(UNFILED_SECTION_KEY));
   }, []);
 
   const createFolder = useCallback(
@@ -430,19 +542,19 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
         return;
       try {
         await apiDelete(`/projects/${projectId}/wiki-folders/${node.id}`);
-        setListFilter((f) => (f.type === "folder" && f.id === node.id ? { type: "all" } : f));
+        setCreateInFolderId((prev) => (prev === node.id ? null : prev));
         await loadFolderTree();
-        await refresh();
+        await loadLibraryDocs();
       } catch (e) {
         setErr?.(e?.message || String(e));
       }
     },
-    [projectId, loadFolderTree, refresh, setErr]
+    [projectId, loadFolderTree, loadLibraryDocs, setErr]
   );
 
   const onCreate = async () => {
     try {
-      const folder_id = listFilter.type === "folder" ? listFilter.id : null;
+      const folder_id = createInFolderId;
       const d = await apiPost(`/projects/${projectId}/docs`, {
         title: "New document",
         content: "",
@@ -450,7 +562,7 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
         folder_id,
         is_draft: true,
       });
-      await refresh();
+      await loadLibraryDocs();
       applyDoc(d);
     } catch (e) {
       setErr?.(e?.message || String(e));
@@ -472,22 +584,28 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
         isDraft: true,
       };
       navigate(`/p/${projectId}/wiki`, { replace: true });
-      await refresh();
+      await loadLibraryDocs();
     } catch (e) {
       setErr?.(e?.message || String(e));
     }
   };
 
-  const selectedDoc = selId ? docs.find((x) => x.id === selId) : null;
+  const selectedDoc = useMemo(() => {
+    if (!selId) return null;
+    const fromLib = libraryDocs.find((x) => x.id === selId);
+    if (fromLib) return fromLib;
+    const tree = Array.isArray(docsForTree) ? docsForTree : [];
+    return tree.find((x) => x.id === selId) ?? null;
+  }, [selId, libraryDocs, docsForTree]);
 
   return (
     <div className="as-wiki-page">
-      <header className="as-wiki-header as-page-head d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+      <header className="as-wiki-header as-page-head d-flex flex-wrap justify-content-between align-items-start gap-3 mb-3">
         <div>
           <p className="as-wiki-kicker mb-2">Knowledge base</p>
           <h1 className="as-wiki-page-title">Documentation</h1>
           <p className="as-wiki-lead mb-0">
-            Markdown, semantic search, cross-links{" "}
+            Markdown, search, cross-links{" "}
             <code className="as-wiki-code-hint user-select-all">[label](wiki:slug)</code> — a document can link to multiple stories.
           </p>
         </div>
@@ -499,181 +617,175 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
         ) : null}
       </header>
 
-      <div className="row g-4 as-wiki-grid">
-        <div className="col-lg-4">
-          <aside className="as-wiki-sidebar as-panel h-100">
+      <div className="as-wiki-workbench">
+        <div className="row g-0 as-wiki-grid">
+        <div className="col-12 col-lg-4 col-xl-4 order-1 as-wiki-col as-wiki-col--nav">
+          <aside className="as-wiki-sidebar h-100">
             <div className="as-wiki-sidebar-toolbar">
               <div className="input-group as-wiki-search-group mb-3">
-                <span className="input-group-text">
-                  <i className="bi bi-search" aria-hidden />
-                </span>
                 <input
                   type="search"
                   className="form-control"
-                  placeholder="Search title or body…"
+                  placeholder="Search documents…"
                   value={kw}
                   onChange={(e) => setKw(e.target.value)}
-                  aria-label="Keyword search"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      runSearch();
+                    }
+                  }}
+                  aria-label="Search documents"
                 />
-              </div>
-              <div className="input-group as-wiki-search-group mb-3">
-                <span className="input-group-text" title="Semantic">
-                  <i className="bi bi-stars" aria-hidden />
-                </span>
-                <input
-                  type="search"
-                  className="form-control"
-                  placeholder="Semantic search…"
-                  value={sem}
-                  onChange={(e) => setSem(e.target.value)}
-                  aria-label="Semantic search"
-                />
-              </div>
-              <div className="d-flex flex-wrap gap-2 mb-4">
-                <button type="button" className="btn btn-primary as-wiki-btn" onClick={runSearch}>
-                  Search
-                </button>
                 <button
                   type="button"
-                  className="btn btn-outline-secondary as-wiki-btn"
-                  onClick={() => {
-                    setKw("");
-                    setSem("");
-                    setListFilter({ type: "all" });
-                  }}
+                  className="btn btn-outline-secondary as-wiki-search-submit"
+                  onClick={runSearch}
+                  title="Search"
+                  aria-label="Search"
                 >
-                  Reset
+                  <i className="bi bi-search" aria-hidden />
                 </button>
               </div>
 
-              <div className="as-wiki-folder-panel mb-4">
-                <div className="as-wiki-folder-panel-hd d-flex align-items-center justify-content-between gap-2 mb-2">
-                  <span>Folders</span>
+              {searchHits !== null ? (
+                <div className="alert alert-light border py-2 px-3 small mb-3 as-wiki-search-banner">
+                  <span className="text-secondary">Showing search results.</span>{" "}
                   <button
                     type="button"
-                    className="btn btn-sm btn-outline-primary"
-                    onClick={() => createFolder(null)}
-                    title="New root folder"
+                    className="btn btn-link btn-sm p-0 align-baseline"
+                    onClick={() => {
+                      setSearchHits(null);
+                      loadLibraryDocs();
+                    }}
                   >
-                    <i className="bi bi-folder-plus me-1" aria-hidden />
-                    Folder
+                    Show full library
                   </button>
                 </div>
-                <div className="as-wiki-folder-filter d-flex flex-wrap gap-1 mb-2">
-                  <button
-                    type="button"
-                    className={`btn btn-sm ${listFilter.type === "all" ? "btn-primary" : "btn-outline-secondary"}`}
-                    onClick={() => setListFilter({ type: "all" })}
-                  >
-                    All
-                  </button>
-                  <button
-                    type="button"
-                    className={`btn btn-sm ${listFilter.type === "unfiled" ? "btn-primary" : "btn-outline-secondary"}`}
-                    onClick={() => setListFilter({ type: "unfiled" })}
-                  >
-                    Unfiled
-                  </button>
-                </div>
-                {folderTree.length > 0 ? (
-                  <WikiFolderTree
-                    nodes={folderTree}
-                    depth={0}
-                    expandedFolders={expandedFolders}
-                    toggleFolder={toggleFolder}
-                    listFilter={listFilter}
-                    onPickFolder={onPickFolder}
-                    onAddChild={(pid) => createFolder(pid)}
-                    onDeleteFolder={onDeleteFolderNode}
-                  />
-                ) : (
-                  <p className="small text-secondary mb-0 as-wiki-folder-empty">No folders yet — create one above.</p>
-                )}
-              </div>
+              ) : null}
 
-              <button type="button" className="btn btn-outline-primary w-100 mb-4 as-wiki-new-btn" onClick={onCreate}>
-                <i className="bi bi-plus-lg me-1" aria-hidden />
-                New document
-              </button>
-            </div>
-            <div className="as-wiki-list-hd">Library</div>
-            <div className="as-wiki-list list-group list-group-flush">
-              {loading ? (
-                <div className="as-wiki-list-empty py-4 text-secondary small">Loading…</div>
-              ) : docs.length === 0 ? (
-                <div className="as-wiki-list-empty py-4 text-secondary small">No documents yet.</div>
-              ) : (
-                docs.map((d) => {
-                  const keys = Array.isArray(d.story_keys) ? d.story_keys : d.story_key ? [d.story_key] : [];
-                  return (
+              <div className="as-wiki-folder-panel mb-3">
+                <div className="as-wiki-folder-panel-hd d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                  <span>Documents</span>
+                  <div className="d-flex flex-wrap gap-1 align-items-center">
                     <button
-                      key={d.id}
                       type="button"
-                      className={`as-wiki-list-item list-group-item list-group-item-action ${d.id === selId ? "active" : ""}`}
-                      onClick={() => applyDoc(d)}
+                      className="btn btn-sm btn-outline-primary"
+                      onClick={() => createFolder(null)}
+                      title="New root folder"
                     >
-                      <div className="as-wiki-list-title text-truncate">{d.title || "Untitled"}</div>
-                      <div className="as-wiki-list-meta text-truncate">
-                        <span className="font-monospace">{d.slug}</span>
-                        {d.is_draft ? (
-                          <span className="badge rounded-pill bg-warning text-dark ms-1 as-wiki-draft-badge">Draft</span>
-                        ) : null}
-                      </div>
-                      {keys.length ? (
-                        <div className="as-wiki-story-chips">
-                          {keys.slice(0, 4).map((k) => (
-                            <span key={k} className="as-wiki-chip">
-                              {k}
-                            </span>
-                          ))}
-                          {keys.length > 4 ? <span className="as-wiki-chip as-wiki-chip-more">+{keys.length - 4}</span> : null}
-                        </div>
-                      ) : null}
+                      <i className="bi bi-folder-plus me-1" aria-hidden />
+                      Folder
                     </button>
-                  );
-                })
-              )}
+                    <button type="button" className="btn btn-sm btn-outline-primary" onClick={onCreate} title="New document">
+                      <i className="bi bi-plus-lg me-1" aria-hidden />
+                      New doc
+                    </button>
+                  </div>
+                </div>
+                <div className="as-wiki-folder-scroll">
+                  {loading && libraryDocs.length === 0 ? (
+                    <p className="small text-secondary mb-0 py-2">Loading library…</p>
+                  ) : (
+                    <ul className="as-wiki-folder-tree-ul as-wiki-library-tree-root">
+                      <li>
+                        <div className="as-wiki-folder-row">
+                          <button
+                            type="button"
+                            className="as-wiki-folder-caret"
+                            onClick={() => toggleFolder(UNFILED_SECTION_KEY)}
+                            aria-expanded={expandedFolders.has(UNFILED_SECTION_KEY)}
+                            aria-label={expandedFolders.has(UNFILED_SECTION_KEY) ? "Collapse" : "Expand"}
+                          >
+                            <i
+                              className={`bi ${expandedFolders.has(UNFILED_SECTION_KEY) ? "bi-chevron-down" : "bi-chevron-right"}`}
+                              aria-hidden
+                            />
+                          </button>
+                          <button
+                            type="button"
+                            className="as-wiki-folder-name as-wiki-folder-name--root"
+                            onClick={onLibraryRootClick}
+                          >
+                            <i className="bi bi-inbox me-1" aria-hidden />
+                            <span className="text-truncate">Library root (unfiled)</span>
+                          </button>
+                        </div>
+                        {expandedFolders.has(UNFILED_SECTION_KEY) ? (
+                          <ul className="as-wiki-folder-tree-ul as-wiki-folder-tree-nested as-wiki-folder-tree-docs">
+                            {unfiledDocs.length === 0 ? (
+                              <li className="small text-secondary py-2 ps-1">No documents in library root.</li>
+                            ) : (
+                              unfiledDocs.map((d) => (
+                                <WikiTreeDocRow key={d.id} doc={d} selId={selId} onSelectDoc={applyDoc} />
+                              ))
+                            )}
+                          </ul>
+                        ) : null}
+                      </li>
+                      {folderTree.length > 0
+                        ? folderTree.map((node) => (
+                            <WikiFolderNode
+                              key={node.id}
+                              node={node}
+                              expandedFolders={expandedFolders}
+                              toggleFolder={toggleFolder}
+                              docsByFolderId={docsByFolderId}
+                              createInFolderId={createInFolderId}
+                              selId={selId}
+                              onSelectDoc={applyDoc}
+                              onFolderNameClick={onFolderNameClick}
+                              onAddChild={(pid) => createFolder(pid)}
+                              onDeleteFolder={onDeleteFolderNode}
+                            />
+                          ))
+                        : null}
+                    </ul>
+                  )}
+                  {!loading && folderTree.length === 0 ? (
+                    <p className="small text-secondary mb-0 mt-2 as-wiki-folder-empty">
+                      No folders — use Folder or New doc above, or keep docs in library root.
+                    </p>
+                  ) : null}
+                </div>
+              </div>
             </div>
           </aside>
         </div>
 
-        <div className="col-lg-8">
-          <main className="as-wiki-editor-wrap as-panel">
+        <div className="col-12 col-lg-8 col-xl-8 order-2 as-wiki-col as-wiki-col--main">
+          <main className="as-wiki-editor-wrap as-wiki-editor-wrap--main h-100">
             {selId ? (
               <>
                 <div className="as-wiki-editor-toolbar">
-                  <div className="d-flex flex-wrap align-items-center gap-3 mb-4 as-wiki-title-row">
+                  <div className="as-wiki-title-row mb-0">
                     <input
-                      className="form-control form-control-lg as-wiki-title-input"
+                      className="form-control form-control-lg as-wiki-title-input w-100"
                       value={title}
                       onChange={(e) => setTitle(e.target.value)}
                       placeholder="Document title"
                       aria-label="Document title"
                     />
-                    <div className="form-check form-switch ms-auto as-wiki-draft-switch">
-                      <input
-                        className="form-check-input"
-                        type="checkbox"
-                        id="wiki-draft-toggle"
-                        checked={isDraft}
-                        onChange={(e) => setIsDraft(e.target.checked)}
-                      />
-                      <label className="form-check-label" htmlFor="wiki-draft-toggle">
-                        Draft
-                      </label>
-                    </div>
-                    <button type="button" className="btn btn-outline-danger as-wiki-btn" onClick={onDelete}>
-                      <i className="bi bi-trash me-1" aria-hidden />
-                      Delete
-                    </button>
                   </div>
-                  <div className="d-flex flex-wrap align-items-center gap-2 mb-1 as-wiki-folder-doc-row">
+                </div>
+
+                <div className="as-panel-bd as-wiki-editor-bd">
+                  <MarkdownEditorField
+                    value={body}
+                    onChange={setBody}
+                    height={520}
+                    previewMode="live"
+                    insertToolbar
+                    projectId={projectId}
+                  />
+
+                  <div className="as-wiki-editor-meta-row d-flex flex-wrap align-items-center gap-2 mt-3 pt-3">
                     <label htmlFor="wiki-doc-folder" className="small fw-semibold text-secondary mb-0 flex-shrink-0">
                       Folder
                     </label>
                     <select
                       id="wiki-doc-folder"
-                      className="form-select form-select-sm as-wiki-doc-folder-select"
+                      className="form-select form-select-sm as-wiki-doc-folder-select as-wiki-editor-folder-select-full"
                       value={docFolderId == null ? "" : String(docFolderId)}
                       onChange={(e) => {
                         const v = e.target.value;
@@ -688,16 +800,6 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                       ))}
                     </select>
                   </div>
-                </div>
-
-                <div className="as-panel-bd as-wiki-editor-bd">
-                  <MarkdownEditorField
-                    value={body}
-                    onChange={setBody}
-                    height={520}
-                    previewMode="live"
-                    previewOptions={wikiPreviewOptions}
-                  />
 
                   <section
                     className="as-wiki-link-section as-wiki-link-section--below"
@@ -788,15 +890,35 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                     </div>
                   </section>
 
-                  <footer className="as-wiki-editor-foot mt-3 d-flex flex-wrap gap-3 align-items-center">
-                    <span className="as-wiki-foot-slug font-monospace user-select-all">/{selectedDoc?.slug}</span>
-                    {linkedStoryIds.length > 0 ? (
-                      <span className="as-wiki-foot-meta">
-                        {linkedStoryIds.length} {linkedStoryIds.length === 1 ? "story" : "stories"} linked
-                      </span>
-                    ) : (
-                      <span className="as-wiki-foot-meta">Library only (no story links)</span>
-                    )}
+                  <footer className="as-wiki-editor-foot mt-3 d-flex flex-wrap align-items-center justify-content-between gap-3">
+                    <div className="d-flex flex-wrap gap-3 align-items-center as-wiki-editor-foot-primary">
+                      <span className="as-wiki-foot-slug font-monospace user-select-all">/{selectedDoc?.slug}</span>
+                      {linkedStoryIds.length > 0 ? (
+                        <span className="as-wiki-foot-meta">
+                          {linkedStoryIds.length} {linkedStoryIds.length === 1 ? "story" : "stories"} linked
+                        </span>
+                      ) : (
+                        <span className="as-wiki-foot-meta">Library only (no story links)</span>
+                      )}
+                    </div>
+                    <div className="d-flex flex-wrap align-items-center gap-3 justify-content-end as-wiki-editor-foot-actions">
+                      <div className="form-check form-switch as-wiki-draft-switch mb-0">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          id="wiki-draft-toggle"
+                          checked={isDraft}
+                          onChange={(e) => setIsDraft(e.target.checked)}
+                        />
+                        <label className="form-check-label" htmlFor="wiki-draft-toggle">
+                          Draft
+                        </label>
+                      </div>
+                      <button type="button" className="btn btn-outline-danger as-wiki-btn flex-shrink-0" onClick={onDelete}>
+                        <i className="bi bi-trash me-1" aria-hidden />
+                        Delete
+                      </button>
+                    </div>
                   </footer>
                 </div>
               </>
@@ -808,12 +930,13 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                   </div>
                   <p className="mb-2 fw-medium">Select a document or create a new one</p>
                   <p className="small text-secondary mb-0">
-                    Use the sidebar search or New document to get started.
+                    Choose a document in the tree on the left, or create a new one.
                   </p>
                 </div>
               </div>
             )}
           </main>
+        </div>
         </div>
       </div>
     </div>

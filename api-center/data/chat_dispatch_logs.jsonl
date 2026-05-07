@@ -188,3 +188,20 @@
 {"t": 1777996129.239105, "type": "chat.dispatch", "trace_id": "tr_1777996123223", "project_id": "2", "channel_id": "2_dm_1_3", "channel_type": "direct", "selected_agent_id": "mia-tech", "should_respond": true, "message_preview": "con ơi , tài liệu tech con comment trong các story hãy copy nó vào docs của agile studio này nhé, kiểm trả mcp có hỗ trợ đó"}
 {"t": 1777996200.650686, "type": "chat.reply.working_queue_webhook", "task_id": "773e7432b50e45638dbadc795e4b325f", "mode": "none", "status": "api_http_503", "delivery_kind": "done"}
 {"t": 1777996200.956672, "type": "chat.dispatch", "trace_id": "tr_1777996163407", "project_id": "2", "channel_id": "2_dm_1_3", "channel_type": "direct", "selected_agent_id": "mia-tech", "should_respond": true, "message_preview": "ổn k con"}
+{"t": 1778084867.645597, "type": "webhook.notification.dispatch", "trace_id": "as_1778084867573_23f8fba0", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778084878.968905, "type": "webhook.notification.dispatch", "trace_id": "as_1778084878943_979433d4", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778084882.6670551, "type": "webhook.notification.dispatch", "trace_id": "as_1778084882651_9a78a94a", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085205.2989361, "type": "webhook.notification.dispatch", "trace_id": "as_1778085205265_919814ea", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085209.2930188, "type": "webhook.notification.dispatch", "trace_id": "as_1778085209243_1ce20179", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085288.101961, "type": "webhook.notification.dispatch", "trace_id": "as_1778085288072_c3e55897", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085308.1171682, "type": "webhook.notification.dispatch", "trace_id": "as_1778085308082_19dbd483", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085317.671697, "type": "webhook.notification.dispatch", "trace_id": "as_1778085317646_be81ea7d", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085359.24343, "type": "webhook.notification.dispatch", "trace_id": "as_1778085359209_3ad5c264", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085428.217758, "type": "webhook.notification.dispatch", "trace_id": "as_1778085428199_63aff83f", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085753.5445151, "type": "webhook.notification.dispatch", "trace_id": "as_1778085753516_b1c6afa6", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085763.334353, "type": "webhook.notification.dispatch", "trace_id": "as_1778085760873_58ff4719", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085813.579774, "type": "webhook.notification.dispatch", "trace_id": "as_1778085813556_81bc60bc", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085903.371961, "type": "webhook.notification.dispatch", "trace_id": "as_1778085903354_948f0bc0", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778085968.0874188, "type": "webhook.notification.dispatch", "trace_id": "as_1778085968055_6dd035e1", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778086099.539179, "type": "webhook.notification.dispatch", "trace_id": "as_1778086099509_9b74afe3", "project_id": "2", "routed_count": 2, "item_kind": "notification"}
+{"t": 1778086243.5155, "type": "webhook.notification.dispatch", "trace_id": "as_1778086243496_ccc661a4", "project_id": "2", "routed_count": 2, "item_kind": "notification"}

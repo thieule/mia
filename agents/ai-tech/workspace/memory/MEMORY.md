@@ -28,6 +28,12 @@ Use one block per project (fill from **Agile Studio MCP** or the user; do not ha
 
 Do **not** link or assume paths to Agile Studio sources in git — deployment may omit that tree. Reload from **MCP** + this file when unsure.
 
+## Project: Workflows Automation - Story ID 23
+
+- Design document: "Thiết kế kỹ thuật: Tự động hóa luồng việc (Workflows Automation)"
+
+
+
 ## Important Notes
 
 - Repos and paths are **not** fixed in agent prompts — refresh from MCP + this file + chat when unsure.
