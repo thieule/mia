@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
 import WikiCommentsSidebar from "./WikiCommentsSidebar.jsx";
+import { exportWikiDocumentToPdf } from "./wikiPdfExport.jsx";
 import { apiDelete, apiGet, apiPost, apiPut } from "./api.js";
 
 function sortIds(a, b) {
@@ -204,6 +205,7 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [wikiPdfExporting, setWikiPdfExporting] = useState(false);
   /** In-doc feedback: Markdown selection + anchored range focus. */
   const [wikiMdSelection, setWikiMdSelection] = useState(null);
   const [wikiSelFocus, setWikiSelFocus] = useState(null);
@@ -488,6 +490,18 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
       setLoading(false);
     }
   };
+
+  const onExportWikiPdf = useCallback(async () => {
+    if (!selId || wikiPdfExporting) return;
+    setWikiPdfExporting(true);
+    try {
+      await exportWikiDocumentToPdf({ title, body, projectId });
+    } catch (e) {
+      setErr?.(e?.message || String(e));
+    } finally {
+      setWikiPdfExporting(false);
+    }
+  }, [selId, wikiPdfExporting, title, body, projectId, setErr]);
 
   const linkedStoriesResolved = useMemo(() => {
     const map = new Map(stories.map((s) => [s.id, s]));
@@ -845,6 +859,17 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                         aria-label="Document title"
                       />
                     </div>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-light border-0 shadow-none flex-shrink-0 text-body-secondary"
+                      disabled={wikiPdfExporting}
+                      title={wikiPdfExporting ? "Đang tạo PDF…" : "Tải PDF (nội dung hiện tại trong trình soạn)"}
+                      aria-label="Xuất wiki ra PDF"
+                      onClick={() => void onExportWikiPdf()}
+                    >
+                      <i className={`bi ${wikiPdfExporting ? "bi-hourglass-split" : "bi-file-earmark-pdf"}`} aria-hidden />
+                      <span className="d-none d-sm-inline ms-1">PDF</span>
+                    </button>
                     <button
                       type="button"
                       className="btn btn-sm btn-light border-0 shadow-none as-wiki-comments-toggle flex-shrink-0 position-relative text-body-secondary"
