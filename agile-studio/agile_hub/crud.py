@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from typing import Any
+
 from datetime import datetime, time
 from decimal import Decimal
 import re
 import secrets
+import uuid
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from . import models
+from . import models, wiki_embedding
 from .schemas import (
     CommentCreate,
     CommentUpdate,
@@ -20,8 +23,16 @@ from .schemas import (
     WorkflowTemplateCreate,
     StoryCreate,
     StoryPatch,
+    StoryTaskCreate,
+    StoryTaskPatch,
     ReleaseCreate,
     ReleasePatch,
+    WikiFolderCreate,
+    WikiFolderPatch,
+    WikiDocCreate,
+    WikiDocPatch,
+    WikiCommentCreate,
+    WikiCommentPatch,
 )
 
 _COMMENT_MENTION_RE = re.compile(r"@([A-Za-z0-9._-]+)")
@@ -130,6 +141,29 @@ def project_ai_agent_member_ids_map(db: Session, project_id: int) -> dict[str, i
         seen.add(aid.lower())
         out[aid] = int(mem.id)
     return out
+
+
+def recipient_hints_for_wiki_comment(
+    db: Session,
+    project_id: int,
+    doc: models.WikiDocument,
+    *,
+    comment_body: str,
+    author_member_id: int,
+) -> dict[str, Any]:
+    mentioned = mentioned_agent_ids_from_comment_body(db, project_id, comment_body)
+    excerpt = (comment_body or "").strip()
+    if len(excerpt) > 4000:
+        excerpt = excerpt[:3997] + "..."
+    return {
+        "mentioned_agent_ids": mentioned,
+        "comment_excerpt": excerpt,
+        "author_member_id": author_member_id,
+        "ai_member_ids_by_agent": project_ai_agent_member_ids_map(db, project_id),
+        "wiki_document_id": doc.id,
+        "wiki_doc_slug": doc.slug,
+        "wiki_doc_title": doc.title,
+    }
 
 
 def recipient_hints_for_story_comment(
@@ -705,6 +739,190 @@ def story_status_events_list(db: Session, story_id: int, *, limit: int = 100) ->
     )
 
 
+def story_touch_updated(db: Session, story_id: int) -> None:
+    s = story_get(db, story_id)
+    if s is None:
+        return
+    s.updated_at = datetime.utcnow()
+    db.add(s)
+    db.flush()
+
+
+def story_tasks_list(db: Session, story_id: int) -> list[models.StoryTask]:
+    return list(
+        db.scalars(
+            select(models.StoryTask)
+            .where(models.StoryTask.story_id == story_id)
+            .order_by(models.StoryTask.sort_order, models.StoryTask.id)
+        ).all()
+    )
+
+
+def _validate_task_reporter(reporter_id: int | None, project_member_ids_set: set[int]) -> None:
+    if reporter_id is None:
+        return
+    if reporter_id not in project_member_ids_set:
+        raise ValueError("reporter must be a project member in this project")
+
+
+def story_task_assignee_ids_get(db: Session, task_id: int) -> list[int]:
+    rows = db.scalars(
+        select(models.StoryTaskAssignee.member_id)
+        .where(models.StoryTaskAssignee.task_id == task_id)
+        .order_by(models.StoryTaskAssignee.member_id)
+    ).all()
+    return [int(x) for x in rows]
+
+
+def story_task_assignee_ids_map_for_tasks(db: Session, task_ids: list[int]) -> dict[int, list[int]]:
+    if not task_ids:
+        return {}
+    rows = db.execute(
+        select(models.StoryTaskAssignee.task_id, models.StoryTaskAssignee.member_id)
+        .where(models.StoryTaskAssignee.task_id.in_(task_ids))
+        .order_by(models.StoryTaskAssignee.task_id, models.StoryTaskAssignee.member_id)
+    ).all()
+    out: dict[int, list[int]] = {}
+    for tid, mid in rows:
+        out.setdefault(int(tid), []).append(int(mid))
+    return out
+
+
+def story_task_set_assignees(
+    db: Session, task: models.StoryTask, member_ids: list[int], project_member_ids_set: set[int]
+) -> None:
+    for mid in member_ids:
+        if mid not in project_member_ids_set:
+            raise ValueError("task assignee must be a project member in this project")
+    ordered = _dedupe_preserve(member_ids)
+    db.execute(delete(models.StoryTaskAssignee).where(models.StoryTaskAssignee.task_id == task.id))
+    for mid in ordered:
+        db.add(models.StoryTaskAssignee(task_id=task.id, member_id=mid))
+    db.flush()
+
+
+def story_task_to_out(db: Session, task: models.StoryTask) -> dict:
+    aids = story_task_assignee_ids_get(db, task.id)
+    aid0 = aids[0] if aids else None
+    return {
+        "id": task.id,
+        "story_id": task.story_id,
+        "title": task.title,
+        "body": task.body,
+        "done": task.done,
+        "sort_order": task.sort_order,
+        "assignee_ids": aids,
+        "assignee_id": aid0,
+        "reporter_id": task.reporter_id,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
+def story_tasks_out_list(db: Session, story_id: int) -> list[dict]:
+    rows = story_tasks_list(db, story_id)
+    if not rows:
+        return []
+    amap = story_task_assignee_ids_map_for_tasks(db, [x.id for x in rows])
+    out: list[dict] = []
+    for x in rows:
+        aids = amap.get(x.id, [])
+        aid0 = aids[0] if aids else None
+        out.append(
+            {
+                "id": x.id,
+                "story_id": x.story_id,
+                "title": x.title,
+                "body": x.body,
+                "done": x.done,
+                "sort_order": x.sort_order,
+                "assignee_ids": aids,
+                "assignee_id": aid0,
+                "reporter_id": x.reporter_id,
+                "created_at": x.created_at,
+                "updated_at": x.updated_at,
+            }
+        )
+    return out
+
+
+def _next_story_task_sort_order(db: Session, story_id: int) -> int:
+    m = db.scalar(
+        select(func.coalesce(func.max(models.StoryTask.sort_order), -1)).where(
+            models.StoryTask.story_id == story_id
+        )
+    )
+    return int(m) + 1
+
+
+def story_task_create(db: Session, story_id: int, body: StoryTaskCreate) -> models.StoryTask:
+    s = story_get(db, story_id)
+    if s is None:
+        raise ValueError("Story not found")
+    mids = project_member_ids(db, s.project_id)
+    _validate_task_reporter(body.reporter_id, mids)
+    ord_ = body.sort_order if body.sort_order is not None else _next_story_task_sort_order(db, story_id)
+    raw_body = body.body
+    body_clean = raw_body.strip() if isinstance(raw_body, str) else None
+    want_aids = _dedupe_preserve(list(body.assignee_ids))
+    st = models.StoryTask(
+        story_id=story_id,
+        title=body.title.strip(),
+        body=body_clean or None,
+        done=bool(body.done),
+        sort_order=ord_,
+        reporter_id=body.reporter_id,
+    )
+    db.add(st)
+    db.flush()
+    story_task_set_assignees(db, st, want_aids, mids)
+    story_touch_updated(db, story_id)
+    return st
+
+
+def story_task_get(db: Session, task_id: int) -> models.StoryTask | None:
+    return db.get(models.StoryTask, task_id)
+
+
+def story_task_patch(db: Session, st: models.StoryTask, body: StoryTaskPatch) -> models.StoryTask:
+    s = story_get(db, st.story_id)
+    if s is None:
+        raise ValueError("Story not found")
+    mids = project_member_ids(db, s.project_id)
+    data = body.model_dump(exclude_unset=True)
+    if "assignee_ids" in data:
+        mlist = _dedupe_preserve([int(x) for x in (data.get("assignee_ids") or [])])
+        story_task_set_assignees(db, st, mlist, mids)
+    if "reporter_id" in data:
+        rid = data["reporter_id"]
+        _validate_task_reporter(rid, mids)
+        st.reporter_id = rid
+    if "title" in data and data["title"] is not None:
+        st.title = str(data["title"]).strip()
+    if "body" in data:
+        b = data["body"]
+        if b is None:
+            st.body = None
+        else:
+            t = str(b).strip()
+            st.body = t or None
+    if "done" in data and data["done"] is not None:
+        st.done = bool(data["done"])
+    if "sort_order" in data and data["sort_order"] is not None:
+        st.sort_order = int(data["sort_order"])
+    db.add(st)
+    db.flush()
+    story_touch_updated(db, st.story_id)
+    return st
+
+
+def story_task_delete(db: Session, st: models.StoryTask) -> None:
+    sid = st.story_id
+    db.delete(st)
+    db.flush()
+    story_touch_updated(db, sid)
+
+
 def user_get_by_email(db: Session, email: str) -> models.User | None:
     e = email.strip().lower()
     return db.scalar(select(models.User).where(models.User.email == e))
@@ -723,13 +941,18 @@ def user_create(db: Session, *, email: str, password_hash: str, display_name: st
 
 
 def story_to_out(
-    s: models.Story, project_slug: str, db: Session, assignee_ids: list[int] | None = None
+    s: models.Story,
+    project_slug: str,
+    db: Session,
+    assignee_ids: list[int] | None = None,
+    *,
+    include_tasks: bool = False,
 ) -> dict:
     aids = assignee_ids if assignee_ids is not None else story_assignee_ids_get(db, s.id)
     if not aids and s.assignee_id is not None:
         aids = [s.assignee_id]
     aid0 = aids[0] if aids else None
-    return {
+    out: dict = {
         "id": s.id,
         "project_id": s.project_id,
         "story_key": f"{project_slug}-{s.story_number}",
@@ -746,4 +969,721 @@ def story_to_out(
         "reporter_id": s.reporter_id,
         "created_at": s.created_at,
         "updated_at": s.updated_at,
+        "tasks": [],
     }
+    if include_tasks:
+        out["tasks"] = story_tasks_out_list(db, s.id)
+    return out
+
+
+# --- Wiki documents ---
+
+_SLUG_PART = re.compile(r"[^a-z0-9]+")
+
+
+def wiki_slugify(raw: str) -> str:
+    s = _SLUG_PART.sub("-", (raw or "").lower().strip())
+    s = re.sub(r"-+", "-", s).strip("-")
+    return (s or "doc")[:128]
+
+
+def wiki_unique_slug(db: Session, project_id: int, base: str) -> str:
+    b = wiki_slugify(base)[:120]
+    for i in range(0, 2000):
+        cand = b if i == 0 else f"{b}-{i}"
+        hit = db.scalar(
+            select(models.WikiDocument.id).where(
+                models.WikiDocument.project_id == project_id,
+                models.WikiDocument.slug == cand,
+            )
+        )
+        if hit is None:
+            return cand
+    return f"{b}-{uuid.uuid4().hex[:10]}"
+
+
+def _wiki_story_must_be_in_project(db: Session, project_id: int, story_id: int | None) -> None:
+    if story_id is None:
+        return
+    s = story_get(db, story_id)
+    if s is None or s.project_id != project_id:
+        raise ValueError("story does not exist or is not in this project")
+
+
+def _wiki_story_ids_from_create(body: WikiDocCreate) -> list[int]:
+    raw: list[int] = []
+    for x in body.story_ids or []:
+        if x is not None and int(x) > 0:
+            raw.append(int(x))
+    if body.story_id is not None and int(body.story_id) > 0:
+        raw.append(int(body.story_id))
+    out: list[int] = []
+    seen: set[int] = set()
+    for x in raw:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    out.sort()
+    return out
+
+
+def wiki_folder_get(db: Session, folder_id: int) -> models.WikiFolder | None:
+    return db.get(models.WikiFolder, folder_id)
+
+
+def wiki_folder_for_project(db: Session, project_id: int, folder_id: int) -> models.WikiFolder | None:
+    f = wiki_folder_get(db, folder_id)
+    if f is None or f.project_id != project_id:
+        return None
+    return f
+
+
+def _wiki_folder_name_unique(
+    db: Session,
+    project_id: int,
+    parent_id: int | None,
+    name: str,
+    *,
+    exclude_id: int | None = None,
+) -> None:
+    stmt = select(models.WikiFolder.id).where(
+        models.WikiFolder.project_id == project_id,
+        models.WikiFolder.name == name,
+    )
+    if parent_id is None:
+        stmt = stmt.where(models.WikiFolder.parent_id.is_(None))
+    else:
+        stmt = stmt.where(models.WikiFolder.parent_id == parent_id)
+    if exclude_id is not None:
+        stmt = stmt.where(models.WikiFolder.id != exclude_id)
+    hit = db.scalar(stmt)
+    if hit is not None:
+        raise ValueError("folder name already exists in this location")
+
+
+def wiki_folders_list_all(db: Session, project_id: int) -> list[models.WikiFolder]:
+    return list(
+        db.scalars(
+            select(models.WikiFolder)
+            .where(models.WikiFolder.project_id == project_id)
+            .order_by(models.WikiFolder.sort_order, models.WikiFolder.name)
+        ).all()
+    )
+
+
+def wiki_folders_build_tree(rows: list[models.WikiFolder]) -> list[dict]:
+    by_parent: dict[int | None, list[models.WikiFolder]] = {}
+    for f in rows:
+        by_parent.setdefault(f.parent_id, []).append(f)
+    for lst in by_parent.values():
+        lst.sort(key=lambda x: (x.sort_order, x.name.lower()))
+
+    def walk(pid: int | None) -> list[dict]:
+        out: list[dict] = []
+        for f in by_parent.get(pid, []):
+            out.append(
+                {
+                    "id": f.id,
+                    "parent_id": f.parent_id,
+                    "name": f.name,
+                    "sort_order": f.sort_order,
+                    "children": walk(f.id),
+                }
+            )
+        return out
+
+    return walk(None)
+
+
+def wiki_folder_create(db: Session, project_id: int, body: WikiFolderCreate) -> models.WikiFolder:
+    name = (body.name or "").strip()
+    if not name:
+        raise ValueError("folder name required")
+    par = body.parent_id
+    if par is not None:
+        if wiki_folder_for_project(db, project_id, int(par)) is None:
+            raise ValueError("parent folder not found")
+    _wiki_folder_name_unique(db, project_id, par, name)
+    if par is None:
+        q = select(func.coalesce(func.max(models.WikiFolder.sort_order), -1)).where(
+            models.WikiFolder.project_id == project_id,
+            models.WikiFolder.parent_id.is_(None),
+        )
+    else:
+        q = select(func.coalesce(func.max(models.WikiFolder.sort_order), -1)).where(
+            models.WikiFolder.project_id == project_id,
+            models.WikiFolder.parent_id == par,
+        )
+    so = int(db.scalar(q) or -1) + 1
+    fold = models.WikiFolder(project_id=project_id, parent_id=par, name=name, sort_order=so)
+    db.add(fold)
+    db.flush()
+    return fold
+
+
+def wiki_folder_patch(db: Session, fold: models.WikiFolder, body: WikiFolderPatch) -> models.WikiFolder:
+    data = body.model_dump(exclude_unset=True)
+    if "name" in data and data["name"] is not None:
+        nn = data["name"].strip()
+        if not nn:
+            raise ValueError("folder name required")
+        _wiki_folder_name_unique(db, fold.project_id, fold.parent_id, nn, exclude_id=fold.id)
+        fold.name = nn
+    db.add(fold)
+    db.flush()
+    return fold
+
+
+def wiki_folder_delete(db: Session, fold: models.WikiFolder) -> None:
+    db.delete(fold)
+    db.flush()
+
+
+def wiki_doc_set_linked_stories(db: Session, doc: models.WikiDocument, story_ids: list[int]) -> None:
+    """Thay toàn bộ liên kết story cho doc; mỗi story phải thuộc cùng project."""
+    for sid in story_ids:
+        _wiki_story_must_be_in_project(db, doc.project_id, sid)
+    db.execute(delete(models.WikiDocumentStory).where(models.WikiDocumentStory.wiki_document_id == doc.id))
+    db.flush()
+    # Core delete() xóa DB nhưng instance WikiDocumentStory vẫn nằm trong doc.story_links (trạng thái deleted).
+    # expire để không còn tham chiếu tới object đã xóa trước khi db.add(doc) ở wiki_doc_patch.
+    db.expire(doc, ["story_links"])
+    for sid in story_ids:
+        db.add(models.WikiDocumentStory(wiki_document_id=doc.id, story_id=sid))
+    db.flush()
+
+
+def wiki_doc_recompute_embedding(doc: models.WikiDocument) -> list[float]:
+    blob = f"{doc.title}\n\n{doc.content}"
+    return wiki_embedding.embed_text(blob)
+
+
+def wiki_doc_create(db: Session, project_id: int, body: WikiDocCreate, author_member_id: int) -> models.WikiDocument:
+    link_ids = _wiki_story_ids_from_create(body)
+    doc_folder_id: int | None = None
+    if body.folder_id is not None:
+        if wiki_folder_for_project(db, project_id, int(body.folder_id)) is None:
+            raise ValueError("folder not found")
+        doc_folder_id = int(body.folder_id)
+    slug_in = (body.slug or "").strip()
+    if slug_in:
+        slug = wiki_slugify(slug_in)
+        hit = db.scalar(
+            select(models.WikiDocument.id).where(
+                models.WikiDocument.project_id == project_id,
+                models.WikiDocument.slug == slug,
+            )
+        )
+        if hit is not None:
+            raise ValueError("slug already exists in this project")
+    else:
+        slug = wiki_unique_slug(db, project_id, body.title)
+    tags = [str(x).strip() for x in (body.tags or []) if str(x).strip()]
+    doc = models.WikiDocument(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        folder_id=doc_folder_id,
+        slug=slug,
+        title=body.title.strip(),
+        content=body.content or "",
+        tags_json=tags if tags else None,
+        author_member_id=author_member_id,
+        is_draft=bool(body.is_draft),
+        embedding_json=None,
+    )
+    doc.embedding_json = wiki_doc_recompute_embedding(doc)
+    db.add(doc)
+    db.flush()
+    if link_ids:
+        wiki_doc_set_linked_stories(db, doc, link_ids)
+    db.refresh(doc)
+    return doc
+
+
+def wiki_doc_get(db: Session, doc_id: str) -> models.WikiDocument | None:
+    return db.scalar(
+        select(models.WikiDocument)
+        .options(selectinload(models.WikiDocument.story_links))
+        .where(models.WikiDocument.id == doc_id)
+    )
+
+
+def wiki_doc_get_by_slug(db: Session, project_id: int, slug: str) -> models.WikiDocument | None:
+    s = wiki_slugify(slug)
+    return db.scalar(
+        select(models.WikiDocument)
+        .options(selectinload(models.WikiDocument.story_links))
+        .where(
+            models.WikiDocument.project_id == project_id,
+            models.WikiDocument.slug == s,
+        )
+    )
+
+
+def wiki_doc_patch(db: Session, doc: models.WikiDocument, body: WikiDocPatch) -> models.WikiDocument:
+    data = body.model_dump(exclude_unset=True)
+    if "title" in data and data["title"] is not None:
+        doc.title = data["title"].strip()
+    if "content" in data and data["content"] is not None:
+        doc.content = data["content"]
+    if "story_ids" in data:
+        raw = data["story_ids"]
+        ids = [int(x) for x in (raw or []) if x is not None and int(x) > 0]
+        ids = sorted(set(ids))
+        wiki_doc_set_linked_stories(db, doc, ids)
+    elif "story_id" in data:
+        sid = data["story_id"]
+        wiki_doc_set_linked_stories(db, doc, [] if sid is None else [int(sid)])
+    if "folder_id" in data:
+        fd = data["folder_id"]
+        if fd is not None:
+            if wiki_folder_for_project(db, doc.project_id, int(fd)) is None:
+                raise ValueError("folder not found")
+            doc.folder_id = int(fd)
+        else:
+            doc.folder_id = None
+    if "is_draft" in data and data["is_draft"] is not None:
+        doc.is_draft = bool(data["is_draft"])
+    if "tags" in data and data["tags"] is not None:
+        tags = [str(x).strip() for x in data["tags"] if str(x).strip()]
+        doc.tags_json = tags if tags else None
+    if "slug" in data and data["slug"] is not None:
+        ns = wiki_slugify(data["slug"])
+        if not ns:
+            raise ValueError("invalid slug")
+        hit = db.scalar(
+            select(models.WikiDocument.id).where(
+                models.WikiDocument.project_id == doc.project_id,
+                models.WikiDocument.slug == ns,
+                models.WikiDocument.id != doc.id,
+            )
+        )
+        if hit is not None:
+            raise ValueError("slug already exists in this project")
+        doc.slug = ns
+    emb_refresh = "title" in data or "content" in data
+    if emb_refresh:
+        doc.embedding_json = wiki_doc_recompute_embedding(doc)
+    db.add(doc)
+    db.flush()
+    db.refresh(doc)
+    return doc
+
+
+def wiki_doc_delete(db: Session, doc: models.WikiDocument) -> None:
+    db.delete(doc)
+    db.flush()
+
+
+def wiki_documents_list(
+    db: Session,
+    project_id: int,
+    *,
+    story_id: int | None = None,
+    folder_id: int | None = None,
+    unfiled_only: bool = False,
+    q: str | None = None,
+    tag: str | None = None,
+    limit: int = 100,
+) -> list[models.WikiDocument]:
+    limit = min(max(limit, 1), 500)
+    stmt = (
+        select(models.WikiDocument)
+        .options(selectinload(models.WikiDocument.story_links))
+        .where(models.WikiDocument.project_id == project_id)
+    )
+    if unfiled_only:
+        stmt = stmt.where(models.WikiDocument.folder_id.is_(None))
+    elif folder_id is not None:
+        stmt = stmt.where(models.WikiDocument.folder_id == folder_id)
+    if story_id is not None:
+        wds = models.WikiDocumentStory
+        stmt = (
+            stmt.join(wds, wds.wiki_document_id == models.WikiDocument.id)
+            .where(wds.story_id == story_id)
+            .distinct()
+        )
+    if (q or "").strip():
+        qq = f"%{(q or '').strip()}%"
+        stmt = stmt.where(or_(models.WikiDocument.title.like(qq), models.WikiDocument.content.like(qq)))
+    stmt = stmt.order_by(models.WikiDocument.updated_at.desc()).limit(limit)
+    rows = list(db.scalars(stmt).all())
+    if (tag or "").strip() and rows:
+        tl = (tag or "").strip().lower()
+        rows = [
+            r
+            for r in rows
+            if r.tags_json
+            and isinstance(r.tags_json, list)
+            and any(str(x).strip().lower() == tl for x in r.tags_json)
+        ]
+    return rows
+
+
+def wiki_docs_semantic_search(
+    db: Session,
+    project_id: int,
+    query: str,
+    *,
+    story_id: int | None = None,
+    top_k: int = 10,
+) -> list[tuple[float, models.WikiDocument]]:
+    top_k = min(max(top_k, 1), 50)
+    qv = wiki_embedding.embed_text(query)
+    stmt = select(models.WikiDocument).where(models.WikiDocument.project_id == project_id)
+    if story_id is not None:
+        wds = models.WikiDocumentStory
+        stmt = (
+            stmt.join(wds, wds.wiki_document_id == models.WikiDocument.id)
+            .where(wds.story_id == story_id)
+            .distinct()
+        )
+    stmt = stmt.options(selectinload(models.WikiDocument.story_links))
+    rows = list(db.scalars(stmt).all())
+    scored: list[tuple[float, models.WikiDocument]] = []
+    for r in rows:
+        ej = r.embedding_json
+        if not ej or not isinstance(ej, list):
+            continue
+        try:
+            vec = [float(x) for x in ej]
+        except (TypeError, ValueError):
+            continue
+        if len(vec) != len(qv):
+            continue
+        sc = wiki_embedding.cosine_similarity(qv, vec)
+        scored.append((sc, r))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:top_k]
+
+
+def wiki_context_for_story(db: Session, project_id: int, story_id: int, *, limit: int = 16) -> list[dict]:
+    """Ngữ cảnh tài liệu cho story: doc gắn story trước, bổ sung semantic trong cùng project."""
+    st = story_get(db, story_id)
+    if st is None or st.project_id != project_id:
+        raise ValueError("invalid story")
+    p = project_get(db, project_id)
+    pslug = p.slug if p else ""
+    limit = min(max(limit, 1), 80)
+    attached = wiki_documents_list(db, project_id, story_id=story_id, limit=80)
+    blob = f"{st.title}\n\n{(st.description or '')[:6000]}"
+    sem = wiki_docs_semantic_search(db, project_id, blob, story_id=None, top_k=limit + len(attached))
+    seen: set[str] = set()
+    out: list[dict] = []
+    for d in attached:
+        seen.add(d.id)
+        out.append(
+            {
+                **wiki_doc_to_out(db, d, project_slug=pslug, semantic_score=None),
+                "context_role": "attached_to_story",
+            }
+        )
+    for sc, d in sem:
+        if d.id in seen:
+            continue
+        seen.add(d.id)
+        out.append(
+            {
+                **wiki_doc_to_out(db, d, project_slug=pslug, semantic_score=sc),
+                "context_role": "semantic",
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def wiki_doc_to_out(
+    db: Session,
+    doc: models.WikiDocument,
+    *,
+    project_slug: str,
+    semantic_score: float | None = None,
+) -> dict:
+    tags: list[str] = []
+    if doc.tags_json and isinstance(doc.tags_json, list):
+        tags = [str(x) for x in doc.tags_json if x is not None]
+    link_ids = [ls.story_id for ls in (doc.story_links or [])]
+    link_ids.sort()
+    story_keys: list[str] = []
+    for sid in link_ids:
+        st = story_get(db, sid)
+        if st:
+            story_keys.append(f"{project_slug}-{st.story_number}")
+    sk0 = story_keys[0] if story_keys else None
+    emb_len = len(doc.embedding_json) if isinstance(doc.embedding_json, list) else None
+    return {
+        "id": doc.id,
+        "project_id": doc.project_id,
+        "folder_id": doc.folder_id,
+        "story_id": link_ids[0] if link_ids else None,
+        "story_ids": link_ids,
+        "story_keys": story_keys,
+        "slug": doc.slug,
+        "title": doc.title,
+        "content": doc.content,
+        "tags": tags,
+        "author_member_id": doc.author_member_id,
+        "is_draft": bool(doc.is_draft),
+        "created_at": doc.created_at,
+        "updated_at": doc.updated_at,
+        "story_key": sk0,
+        "semantic_score": semantic_score,
+        "embedding_dims": emb_len,
+    }
+
+
+def _wiki_comment_strip_opt(s: str | None) -> str | None:
+    if s is None:
+        return None
+    t = s.strip()
+    return t if t else None
+
+
+def _wiki_comment_thread_root_id(db: Session, start_id: str) -> str | None:
+    cid = (start_id or "").strip()
+    if not cid:
+        return None
+    seen: set[str] = set()
+    while cid:
+        if cid in seen:
+            return None
+        seen.add(cid)
+        r = db.get(models.WikiComment, cid)
+        if r is None:
+            return None
+        if r.parent_id is None:
+            return r.id
+        cid = r.parent_id
+
+
+def _wiki_comment_quote_excerpt_snap(text: str, max_len: int = 480) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if len(t) > max_len:
+        return t[: max_len - 1] + "…"
+    return t
+
+
+def _quoted_selection_in_comment(fragment: str, full: str) -> bool:
+    """True if fragment appears as a contiguous span in full (whitespace-normalized)."""
+
+    def norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    f, g = norm(fragment), norm(full)
+    return bool(f) and f in g
+
+
+def wiki_comment_to_dict(db: Session, row: models.WikiComment) -> dict:
+    m = member_get(db, row.author_member_id)
+    name = (m.display_name or "").strip() if m else ""
+    return {
+        "id": row.id,
+        "doc_id": row.doc_id,
+        "parent_id": row.parent_id,
+        "quoted_comment_id": row.quoted_comment_id,
+        "quoted_excerpt": row.quoted_excerpt,
+        "quoted_author_display_name": row.quoted_author_display_name,
+        "author_member_id": row.author_member_id,
+        "author_display_name": name,
+        "content": row.content,
+        "quote": row.quote,
+        "prefix": row.prefix,
+        "suffix": row.suffix,
+        "text_offset_start": row.text_offset_start,
+        "text_offset_end": row.text_offset_end,
+        "status": row.status,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def wiki_comments_list_for_doc(db: Session, doc_id: str, *, include_resolved: bool = False) -> list[models.WikiComment]:
+    """Danh sách comment; ẩn cả subtree khi **root thread** có status resolved (unless include_resolved)."""
+    stmt = (
+        select(models.WikiComment)
+        .where(models.WikiComment.doc_id == doc_id)
+        .order_by(models.WikiComment.created_at.asc())
+    )
+    all_rows: list[models.WikiComment] = list(db.scalars(stmt).all())
+    if include_resolved:
+        return all_rows
+    by_id = {r.id: r for r in all_rows}
+    root_resolved: set[str] = set()
+    for r in all_rows:
+        if r.parent_id is None and str(r.status) == "resolved":
+            root_resolved.add(r.id)
+
+    def thread_root(r: models.WikiComment) -> models.WikiComment | None:
+        cur: models.WikiComment | None = r
+        seen: set[str] = set()
+        while cur is not None and cur.parent_id:
+            if cur.id in seen:
+                return None
+            seen.add(cur.id)
+            cur = by_id.get(cur.parent_id)
+        return cur
+
+    out: list[models.WikiComment] = []
+    for r in all_rows:
+        root = thread_root(r)
+        if root is None:
+            continue
+        if root.id in root_resolved:
+            continue
+        out.append(r)
+    return out
+
+
+def wiki_comments_visible_count(db: Session, doc_id: str) -> int:
+    """Count messages visible with default sidebar filter (resolved root threads hidden)."""
+    return len(wiki_comments_list_for_doc(db, doc_id, include_resolved=False))
+
+
+def wiki_comment_root_thread_counts(db: Session, doc_id: str) -> tuple[int, int]:
+    """Count feedback threads (root comments only): open vs resolved."""
+    wc = models.WikiComment
+    stmt = select(wc.status).where(wc.doc_id == doc_id, wc.parent_id.is_(None))
+    statuses = list(db.scalars(stmt).all())
+    resolved_n = sum(1 for s in statuses if str(s) == "resolved")
+    open_n = len(statuses) - resolved_n
+    return open_n, resolved_n
+
+
+def wiki_comment_create(
+    db: Session, doc: models.WikiDocument, body: WikiCommentCreate, author_member_id: int
+) -> models.WikiComment:
+    parent_key: str | None = None
+    if body.parent_id:
+        par = db.get(models.WikiComment, (body.parent_id or "").strip())
+        if par is None or par.doc_id != doc.id:
+            raise ValueError("invalid parent comment")
+        parent_key = par.id
+    content = (body.content or "").strip()
+    if not content:
+        raise ValueError("content required")
+    _validate_comment_mentions_in_project(db, doc.project_id, content)
+    qc: str | None
+    px: str | None
+    sx: str | None
+    ost: int | None
+    oen: int | None
+    if parent_key:
+        qc, px, sx, ost, oen = None, None, None, None, None
+    else:
+        qc = _wiki_comment_strip_opt(body.quote)
+        px = _wiki_comment_strip_opt(body.prefix)
+        sx = _wiki_comment_strip_opt(body.suffix)
+        ost, oen = body.text_offset_start, body.text_offset_end
+
+    q_snap_id: str | None = None
+    q_excerpt: str | None = None
+    q_author_snap: str | None = None
+    raw_qcid = _wiki_comment_strip_opt(body.quoted_comment_id)
+    if raw_qcid:
+        if not parent_key:
+            raise ValueError("quoted_comment_id is only allowed on thread replies")
+        qrow = db.get(models.WikiComment, raw_qcid)
+        if qrow is None or qrow.doc_id != doc.id:
+            raise ValueError("invalid quoted comment")
+        thr = _wiki_comment_thread_root_id(db, parent_key)
+        qthr = _wiki_comment_thread_root_id(db, raw_qcid)
+        if thr is None or qthr is None or thr != qthr:
+            raise ValueError("quoted comment must be in the same feedback thread")
+        qm = member_get(db, qrow.author_member_id)
+        q_author_snap = ((qm.display_name or "").strip() if qm else "") or f"Member {qrow.author_member_id}"
+        raw_sel = _wiki_comment_strip_opt(body.quoted_text)
+        if raw_sel:
+            if not _quoted_selection_in_comment(raw_sel, qrow.content or ""):
+                raise ValueError("quoted text must be selected from that comment")
+            q_excerpt = _wiki_comment_quote_excerpt_snap(raw_sel)
+        else:
+            q_excerpt = _wiki_comment_quote_excerpt_snap(qrow.content or "")
+        q_snap_id = raw_qcid
+
+    row = models.WikiComment(
+        id=str(uuid.uuid4()),
+        doc_id=doc.id,
+        parent_id=parent_key,
+        quoted_comment_id=q_snap_id,
+        quoted_excerpt=q_excerpt,
+        quoted_author_display_name=q_author_snap,
+        author_member_id=author_member_id,
+        content=content,
+        quote=qc,
+        prefix=px,
+        suffix=sx,
+        text_offset_start=ost,
+        text_offset_end=oen,
+        status="open",
+    )
+    db.add(row)
+    db.flush()
+    db.refresh(row)
+    return row
+
+
+def wiki_comment_patch(
+    db: Session, row: models.WikiComment, body: WikiCommentPatch
+) -> models.WikiComment:
+    data = body.model_dump(exclude_unset=True)
+    if "content" in data and data["content"] is not None:
+        c = str(data["content"]).strip()
+        if not c:
+            raise ValueError("content required")
+        did = getattr(row, "doc_id", None)
+        doc = wiki_doc_get(db, did) if did else None
+        if doc is None:
+            raise ValueError("document not found for comment")
+        _validate_comment_mentions_in_project(db, doc.project_id, c)
+        row.content = c
+    if "status" in data and data["status"] is not None:
+        row.status = str(data["status"])
+    db.add(row)
+    db.flush()
+    db.refresh(row)
+    return row
+
+
+def wiki_comment_delete(db: Session, row: models.WikiComment, *, editor_member_id: int) -> None:
+    if row.author_member_id != editor_member_id:
+        raise PermissionError("Only the author can delete this comment")
+    db.delete(row)
+    db.flush()
+
+
+def wiki_comments_open_summaries_for_docs(
+    db: Session,
+    doc_ids: list[str],
+    *,
+    limit_per_doc: int = 12,
+) -> dict[str, list[dict]]:
+    """Gợn mở rộng MCP: vài comment đang open theo tài liệu (theo doc_id)."""
+    if not doc_ids:
+        return {}
+    limit_per_doc = min(max(limit_per_doc, 1), 50)
+    uniq = list(dict.fromkeys([x for x in doc_ids if (x or "").strip()]))
+    if not uniq:
+        return {}
+    out: dict[str, list[dict]] = {did: [] for did in uniq}
+    wc = models.WikiComment
+    rows = list(
+        db.scalars(
+            select(wc)
+            .where(wc.doc_id.in_(uniq), wc.status == "open", wc.parent_id.is_(None))
+            .order_by(wc.doc_id.asc(), wc.created_at.desc())
+        ).all()
+    )
+    for r in rows:
+        if len(out[r.doc_id]) >= limit_per_doc:
+            continue
+        q = (r.quote or "").strip()
+        out[r.doc_id].append(
+            {
+                "id": r.id,
+                "content_excerpt": (r.content or "").strip()[:400],
+                "quote_excerpt": (q[:280] + "…") if len(q) > 280 else q,
+            }
+        )
+    return out

@@ -3,7 +3,7 @@
 > **Tích hợp client (code luồng kết nối + webhook):** [CLIENT_INTEGRATION.md](./CLIENT_INTEGRATION.md)  
 > **Agile Studio / API:** [STUDIO_API.md](./STUDIO_API.md) (`GET /v1/discovery`, `POST /v1/sessions`).
 
-Dịch vụ nhỏ chạy riêng: **`workflow-runtime/working_queue_webhook.py`**. Nó ghi file JSON đúng format **`WorkingQueueTaskPayload`** (xem `core/mia/working_queue/models.py`) vào
+Dịch vụ nhỏ chạy riêng: **`workflow-runtime/working_queue_webhook.py`**. Nó ghi file JSON đúng format **`WorkingQueueTaskPayload`** (xem `agents/core/mia/working_queue/models.py`) vào
 
 `<agent-workspace>/working_queue/pending/<task_id>.json`
 
@@ -116,5 +116,5 @@ Sau mỗi bước, mia cập nhật **`working_queue/state/`** trên cùng agent
 
 ## Liên quan
 
-- `core/mia/working_queue/submit_task` — ghi pending.
+- `agents/core/mia/working_queue/submit_task` — ghi pending.
 - `workflow-runtime/docs/ARCHITECTURE.md` — chế độ queue từ workflow YAML.

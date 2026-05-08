@@ -1,0 +1,28 @@
+-- In-doc wiki comments (anchored discussion threads). Run after wiki_documents exists.
+CREATE TABLE IF NOT EXISTS wiki_comments (
+  id                 CHAR(36)      NOT NULL COMMENT 'UUID',
+  doc_id             CHAR(36)      NOT NULL,
+  parent_id          CHAR(36)      NULL COMMENT 'thread reply; NULL = root',
+  quoted_comment_id  CHAR(36)      NULL COMMENT 'quoted peer comment in same thread',
+  quoted_excerpt     MEDIUMTEXT    NULL COMMENT 'snapshot of quoted body for display',
+  quoted_author_display_name VARCHAR(255) NULL COMMENT 'author snapshot when quoted',
+  author_member_id   INT UNSIGNED  NOT NULL,
+  content            MEDIUMTEXT    NOT NULL,
+  quote              MEDIUMTEXT    NULL COMMENT 'selected text (Markdown source)',
+  prefix             MEDIUMTEXT    NULL COMMENT 'context before quote',
+  suffix             MEDIUMTEXT    NULL COMMENT 'context after quote',
+  text_offset_start  INT           NULL,
+  text_offset_end    INT           NULL,
+  status             VARCHAR(16)   NOT NULL DEFAULT 'open' COMMENT 'open | resolved',
+  created_at         DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at         DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY idx_wc_doc (doc_id),
+  KEY idx_wc_parent (parent_id),
+  KEY idx_wc_status (doc_id, status),
+  KEY idx_wc_quoted (quoted_comment_id),
+  CONSTRAINT fk_wc_doc FOREIGN KEY (doc_id) REFERENCES wiki_documents (id) ON DELETE CASCADE,
+  CONSTRAINT fk_wc_parent FOREIGN KEY (parent_id) REFERENCES wiki_comments (id) ON DELETE CASCADE,
+  CONSTRAINT fk_wc_quoted FOREIGN KEY (quoted_comment_id) REFERENCES wiki_comments (id) ON DELETE SET NULL,
+  CONSTRAINT fk_wc_author FOREIGN KEY (author_member_id) REFERENCES members (id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

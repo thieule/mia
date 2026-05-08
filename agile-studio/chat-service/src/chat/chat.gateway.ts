@@ -94,9 +94,19 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     return `${projectId}_story_${storyId}`;
   }
 
+  /** Wiki doc feedback — `{projectId}_wiki_doc_{docId}` (docId UUID). */
+  static wikiDocCommentsRoomId(projectId: number, docId: string): string {
+    return `${projectId}_wiki_doc_${docId}`;
+  }
+
   /** Push structured activity (comments, …) — envelope uses `type: "event"` vs chat messages. */
   broadcastStoryEvent(projectId: number, storyId: number, envelope: Record<string, unknown>) {
     const room = ChatGateway.storyCommentsRoomId(projectId, storyId);
+    this.server.to(room).emit("chat:event", envelope);
+  }
+
+  broadcastWikiDocEvent(projectId: number, docId: string, envelope: Record<string, unknown>) {
+    const room = ChatGateway.wikiDocCommentsRoomId(projectId, docId);
     this.server.to(room).emit("chat:event", envelope);
   }
 

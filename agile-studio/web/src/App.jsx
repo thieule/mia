@@ -1,11 +1,13 @@
-import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { io } from "socket.io-client";
 import { apiDelete, apiGet, apiPatch, apiPost, clearAuth, getStoredUser } from "./api.js";
 import KanbanBoard from "./KanbanBoard.jsx";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
+import { renderMarkdownWithMentions } from "./markdownWithMentions.jsx";
+import ProjectWikiPage from "./ProjectWikiPage.jsx";
+import StoryDocsTab from "./StoryDocsTab.jsx";
+import { AgileMarkdownProjectContext } from "./agileMarkdownLink.jsx";
 import {
   loadNotifications,
   makeNotification,
@@ -14,13 +16,7 @@ import {
   saveNotifications,
   textMentionsDisplayName,
 } from "./notifications.js";
-
-/** LLM đôi khi dùng ¶ thay cho xuống dòng — đưa về newline để remark không lỗi cấu trúc. */
-function normalizeChatMarkdownSource(raw) {
-  return String(raw || "")
-    .replace(/\u00b6/g, "\n")
-    .replace(/\r\n/g, "\n");
-}
+import { replaceTrailingMention } from "./mentionText.jsx";
 
 function formatChatMessageTime(iso) {
   if (!iso) return "";
@@ -31,74 +27,6 @@ function formatChatMessageTime(iso) {
   } catch {
     return "";
   }
-}
-
-/**
- * react-markdown có thể throw với một số chuỗi (bảng/list lỗi, ký tự lạ) — fallback plain text.
- */
-class ChatMarkdownErrorBoundary extends Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false };
-  }
-
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-
-  componentDidUpdate(prevProps) {
-    if (prevProps.source !== this.props.source) {
-      this.setState({ hasError: false });
-    }
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <pre className="mb-0 small as-chat-md-fallback" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-          {this.props.source}
-        </pre>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-/** Markdown trong bubble chat — link mở tab mới; giữ @mention tách khỏi MD để highlight. */
-const CHAT_MARKDOWN_COMPONENTS = {
-  a: ({ node: _n, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
-};
-
-/**
- * Markdown (GFM) + highlight @mention giống bubble chat — tách tại token @ để không làm hỏng parser.
- * mentionIndex: Map từ mentionKey (lowercase) → display name (như commentMentionIndex / chat mentionIndex).
- */
-function renderMarkdownWithMentions(content, mentionIndex) {
-  const idxMap = mentionIndex instanceof Map ? mentionIndex : new Map();
-  const normalized = normalizeChatMarkdownSource(content);
-  const parts = normalized.split(/(@[^\s@]+)/g);
-  return parts.map((p, idx) => {
-    if (!p.startsWith("@")) {
-      if (!p) return null;
-      const md = normalizeChatMarkdownSource(p);
-      return (
-        <div key={idx} className="as-chat-md">
-          <ChatMarkdownErrorBoundary source={md}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={CHAT_MARKDOWN_COMPONENTS}>
-              {md}
-            </ReactMarkdown>
-          </ChatMarkdownErrorBoundary>
-        </div>
-      );
-    }
-    const key = p.slice(1).toLowerCase();
-    const matched = idxMap.has(key);
-    return (
-      <span key={idx} className={matched ? "as-chat-mention" : ""}>
-        {p}
-      </span>
-    );
-  });
 }
 
 const STORY_STATUSES = [
@@ -249,14 +177,21 @@ function findAgentForMentionToken(token, apiCenterAgents, projectMembers) {
   return null;
 }
 
-/** Ưu tiên mention theo thứ tự xuất hiện trong message. */
-function firstResolvedMentionedAgent(mentionMatches, apiCenterAgents, projectMembers) {
+/** Mọi agent được @ (không trùng id) — để group chat gọi được BA + Tech trong một tin. */
+function allResolvedMentionedAgents(mentionMatches, apiCenterAgents, projectMembers) {
+  const seen = new Set();
+  const out = [];
   for (const m of mentionMatches) {
     const a = findAgentForMentionToken(m, apiCenterAgents, projectMembers);
-    if (a) return a;
+    if (!a?.id || seen.has(a.id)) continue;
+    seen.add(a.id);
+    out.push(a);
   }
-  return null;
+  return out;
 }
+
+/** Gửi kèm queue chat; worker (prompt.py) sẽ cắt theo ngân sách ký tự. */
+const CHAT_DISPATCH_HISTORY_LIMIT = 48;
 
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -435,15 +370,18 @@ const TABS = {
   masterData: { id: "master-data", label: "Master data", icon: "bi-diagram-3" },
   chat: { id: "chat", label: "Chat", icon: "bi-chat-dots" },
   releases: { id: "releases", label: "Releases", icon: "bi-rocket-takeoff" },
+  wiki: { id: "wiki", label: "Docs", icon: "bi-journal-text" },
   settings: { id: "settings", label: "Settings", icon: "bi-gear" },
 };
 
-/** URL sync: `/`, `/team`, `/master-data`, `/p/:id/board|team|chat|releases|settings`, `/p/:id/story/:storyId`. */
+/** URL sync: `/`, `/team`, `/master-data`, `/p/:id/board|…|wiki|settings`, `/p/:id/story/:storyId`, `/p/:id/wiki/:slug?`. */
 function parseWorkspacePath(pathname) {
   const p = (pathname || "/").replace(/\/+$/, "") || "/";
   const sm = p.match(/^\/p\/(\d+)\/story\/(\d+)$/);
   if (sm) return { projectId: Number(sm[1]), tab: "story", storyId: Number(sm[2]) };
-  const m = p.match(/^\/p\/(\d+)\/(board|team|chat|releases|settings)$/);
+  const wm = p.match(/^\/p\/(\d+)\/wiki(?:\/([^/]+))?$/);
+  if (wm) return { projectId: Number(wm[1]), tab: "wiki", wikiSlug: wm[2] != null && wm[2] !== "" ? wm[2] : null };
+  const m = p.match(/^\/p\/(\d+)\/(board|team|chat|releases|settings|wiki)$/);
   if (m) return { projectId: Number(m[1]), tab: m[2] };
   if (p === "/team") return { projectId: null, tab: "team" };
   if (p === "/master-data") return { projectId: null, tab: "master-data" };
@@ -463,17 +401,30 @@ function StoryDetailBody({
   onPatchStoryDetails,
   onPatchStoryRelease,
   onPatchStoryAssignees,
+  onCreateTask,
+  onPatchTask,
+  onDeleteTask,
   onPostComment,
   onPatchComment,
   onDeleteComment,
+  setErr,
 }) {
   const me = getStoredUser();
   const onProject = me?.member_id != null && projectMembers.some((row) => row.member_id === me.member_id);
   const [editingCommentId, setEditingCommentId] = useState(null);
   const [editDraft, setEditDraft] = useState("");
+  const [commentMentionCaretCreate, setCommentMentionCaretCreate] = useState(null);
+  const [commentMentionCaretEdit, setCommentMentionCaretEdit] = useState(null);
   const [editingStoryMeta, setEditingStoryMeta] = useState(false);
   const [storyTitleDraft, setStoryTitleDraft] = useState("");
   const [storyDescDraft, setStoryDescDraft] = useState("");
+  const [taskModalOpen, setTaskModalOpen] = useState(false);
+  const [taskModalEditingId, setTaskModalEditingId] = useState(null);
+  const [taskModalTitle, setTaskModalTitle] = useState("");
+  const [taskModalBody, setTaskModalBody] = useState("");
+  const [taskModalAssigneeIds, setTaskModalAssigneeIds] = useState([]);
+  const [taskModalReporterId, setTaskModalReporterId] = useState("");
+  const [storySectionTab, setStorySectionTab] = useState("overview");
   const commentMentionMembers = useMemo(
     () =>
       (Array.isArray(projectMembers) ? projectMembers : [])
@@ -508,13 +459,20 @@ function StoryDetailBody({
     [commentMentionIndex]
   );
   const onPickCommentMention = useCallback((displayName, mode) => {
-    const mentionToken = `@${mentionKeyFromName(displayName)}`;
     if (mode === "edit") {
-      setEditDraft((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${mentionToken} `)));
+      const { next, caret } = replaceTrailingMention(editDraft, displayName);
+      if (next !== editDraft) {
+        setEditDraft(next);
+        setCommentMentionCaretEdit({ start: caret, end: caret });
+      }
       return;
     }
-    setCmBody((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${mentionToken} `)));
-  }, [setCmBody]);
+    const { next, caret } = replaceTrailingMention(cmBody, displayName);
+    if (next !== cmBody) {
+      setCmBody(next);
+      setCommentMentionCaretCreate({ start: caret, end: caret });
+    }
+  }, [cmBody, editDraft, setCmBody]);
 
   const startStoryMetaEdit = () => {
     setStoryTitleDraft(storyDetail.title);
@@ -544,7 +502,90 @@ function StoryDetailBody({
     setEditingStoryMeta(false);
     setStoryTitleDraft("");
     setStoryDescDraft("");
+    setTaskModalOpen(false);
+    setTaskModalEditingId(null);
+    setTaskModalTitle("");
+    setTaskModalBody("");
+    setTaskModalAssigneeIds([]);
+    setTaskModalReporterId("");
+    setStorySectionTab("overview");
   }, [storyDetail.id]);
+
+  const openCreateTaskModal = () => {
+    setTaskModalEditingId(null);
+    setTaskModalTitle("");
+    setTaskModalBody("");
+    setTaskModalAssigneeIds([]);
+    setTaskModalReporterId("");
+    setTaskModalOpen(true);
+  };
+
+  const openEditTaskModal = (t) => {
+    const aids = Array.isArray(t.assignee_ids)
+      ? t.assignee_ids
+      : t.assignee_id != null
+        ? [t.assignee_id]
+        : [];
+    setTaskModalEditingId(t.id);
+    setTaskModalTitle(t.title ?? "");
+    setTaskModalBody(t.body ?? "");
+    setTaskModalAssigneeIds(aids);
+    setTaskModalReporterId(t.reporter_id != null ? String(t.reporter_id) : "");
+    setTaskModalOpen(true);
+  };
+
+  const closeTaskModal = () => {
+    setTaskModalOpen(false);
+    setTaskModalEditingId(null);
+    setTaskModalTitle("");
+    setTaskModalBody("");
+    setTaskModalAssigneeIds([]);
+    setTaskModalReporterId("");
+  };
+
+  const submitTaskModal = async (e) => {
+    e.preventDefault();
+    const title = taskModalTitle.trim();
+    if (!title) return;
+    const rawBody = taskModalBody.trim();
+    const body = rawBody.length ? rawBody : null;
+    const assignee_ids = Array.isArray(taskModalAssigneeIds) ? taskModalAssigneeIds.map(Number) : [];
+    const reporter_id = taskModalReporterId === "" ? null : Number(taskModalReporterId);
+    try {
+      if (taskModalEditingId == null) {
+        await onCreateTask(storyDetail.id, { title, body, assignee_ids, reporter_id });
+      } else {
+        await onPatchTask(storyDetail.id, taskModalEditingId, {
+          title,
+          body,
+          assignee_ids,
+          reporter_id,
+        });
+      }
+      closeTaskModal();
+    } catch {
+      /* error surfaced via setErr */
+    }
+  };
+
+  const formatTaskMemberNames = (ids) => {
+    const list = Array.isArray(ids) ? ids : [];
+    if (!list.length) return "—";
+    return list
+      .map(
+        (id) =>
+          projectMembers.find((r) => r.member_id === id)?.member?.display_name ??
+          `Member #${id}`
+      )
+      .join(", ");
+  };
+
+  const formatTaskReporterName = (rid) => {
+    if (rid == null) return "—";
+    return (
+      projectMembers.find((r) => r.member_id === rid)?.member?.display_name ?? `Member #${rid}`
+    );
+  };
 
   const startEdit = (c) => {
     setEditingCommentId(c.id);
@@ -565,6 +606,118 @@ function StoryDetailBody({
 
   return (
     <>
+      <ul className="nav nav-tabs mb-3">
+        <li className="nav-item">
+          <button
+            type="button"
+            className={`nav-link ${storySectionTab === "overview" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("overview")}
+          >
+            Overview
+          </button>
+        </li>
+        <li className="nav-item">
+          <button
+            type="button"
+            className={`nav-link ${storySectionTab === "tasks" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("tasks")}
+          >
+            Tasks
+          </button>
+        </li>
+        <li className="nav-item">
+          <button
+            type="button"
+            className={`nav-link ${storySectionTab === "docs" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("docs")}
+          >
+            Docs
+          </button>
+        </li>
+      </ul>
+      {storySectionTab === "docs" ? (
+        <StoryDocsTab
+          projectId={storyDetail.project_id}
+          storyId={storyDetail.id}
+          onProject={onProject}
+          setErr={setErr}
+        />
+      ) : storySectionTab === "tasks" ? (
+        <>
+          <div className="mb-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <h2 className="h6 text-secondary mb-0">Tasks</h2>
+            {onProject ? (
+              <button type="button" className="btn btn-link btn-sm p-0" onClick={openCreateTaskModal}>
+                Add task
+              </button>
+            ) : null}
+          </div>
+          {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : []).length === 0 ? (
+            <p className="small text-secondary fst-italic mb-3">No tasks yet.</p>
+          ) : null}
+          <ul className="list-unstyled small mb-0">
+            {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : [])
+              .slice()
+              .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id))
+              .map((t) => (
+                <li key={t.id} className="mb-3 pb-3 border-bottom">
+                  <div className="d-flex align-items-start gap-2">
+                    <input
+                      type="checkbox"
+                      className="form-check-input mt-1 flex-shrink-0"
+                      checked={!!t.done}
+                      disabled={!onProject}
+                      onChange={(e) => onPatchTask(storyDetail.id, t.id, { done: e.target.checked })}
+                      aria-label={t.done ? "Mark task as not done" : "Mark task as done"}
+                    />
+                    <div className="flex-grow-1 min-w-0">
+                      <div className={`fw-semibold ${t.done ? "text-decoration-line-through text-secondary" : ""}`}>{t.title}</div>
+                      {t.body ? (
+                        <div className={`as-story-body as-story-desc-md mt-1 small ${t.done ? "text-secondary" : ""}`}>
+                          {renderMarkdownWithMentions(t.body, commentMentionIndex)}
+                        </div>
+                      ) : null}
+                      <div className="small text-secondary mt-1">
+                        <span className="text-nowrap">Assignees: </span>
+                        <span>{formatTaskMemberNames(t.assignee_ids?.length ? t.assignee_ids : t.assignee_id != null ? [t.assignee_id] : [])}</span>
+                        <span className="text-nowrap"> · Reporter: </span>
+                        <span>{formatTaskReporterName(t.reporter_id)}</span>
+                      </div>
+                    </div>
+                    {onProject ? (
+                      <div className="d-flex gap-1 flex-shrink-0">
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm p-1 lh-1"
+                          onClick={() => openEditTaskModal(t)}
+                          title="Edit task"
+                          aria-label="Edit task"
+                        >
+                          <i className="bi bi-pencil" aria-hidden />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm p-1 lh-1"
+                          onClick={() => onDeleteTask(storyDetail.id, t.id)}
+                          title="Delete task"
+                          aria-label="Delete task"
+                        >
+                          <i className="bi bi-trash" aria-hidden />
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+          </ul>
+          {!onProject && getStoredUser() ? (
+            <p className="small text-secondary mt-3 mb-0">
+              Add yourself to the project <strong>Team</strong> to create or update tasks.
+            </p>
+          ) : null}
+        </>
+      ) : (
+        <>
       <div className="d-flex align-items-start justify-content-between gap-2 mb-3">
         {editingStoryMeta ? (
           <form className="flex-grow-1 min-w-0" onSubmit={saveStoryMeta}>
@@ -589,6 +742,8 @@ function StoryDetailBody({
               height={220}
               placeholder="Optional"
               textareaProps={{ id: "as-story-edit-desc" }}
+              insertToolbar
+              projectId={storyDetail.project_id}
             />
             <div className="d-flex gap-2">
               <button className="btn btn-primary btn-sm" type="submit" disabled={!storyTitleDraft.trim()}>
@@ -800,6 +955,8 @@ function StoryDetailBody({
                     onChange={setEditDraft}
                     height={160}
                     textareaProps={{ required: true }}
+                    selectionFocus={commentMentionCaretEdit}
+                    onSelectionFocusDone={() => setCommentMentionCaretEdit(null)}
                   />
                   <div className="d-flex gap-2">
                     <button className="btn btn-primary btn-sm" type="submit" disabled={!editDraft.trim()}>
@@ -835,7 +992,17 @@ function StoryDetailBody({
             ))}
           </div>
         ) : null}
-        <MarkdownEditorField value={cmBody} onChange={setCmBody} height={170} placeholder="Comment" textareaProps={{ required: true }} />
+        <MarkdownEditorField
+          value={cmBody}
+          onChange={setCmBody}
+          height={170}
+          placeholder="Comment"
+          textareaProps={{ required: true }}
+          insertToolbar
+          projectId={storyDetail.project_id}
+          selectionFocus={commentMentionCaretCreate}
+          onSelectionFocusDone={() => setCommentMentionCaretCreate(null)}
+        />
         <button
           className="btn btn-primary btn-sm"
           type="submit"
@@ -845,6 +1012,102 @@ function StoryDetailBody({
           Post comment
         </button>
       </form>
+        </>
+      )}
+      {taskModalOpen ? (
+        <>
+          <div
+            className="modal fade show d-block"
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="as-task-modal-title"
+          >
+            <div className="modal-dialog modal-lg modal-dialog-scrollable">
+              <div className="modal-content">
+                <form onSubmit={submitTaskModal}>
+                  <div className="modal-header">
+                    <h5 className="modal-title" id="as-task-modal-title">
+                      {taskModalEditingId == null ? "Create task" : "Edit task"}
+                    </h5>
+                    <button type="button" className="btn-close" onClick={closeTaskModal} aria-label="Close" />
+                  </div>
+                  <div className="modal-body">
+                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-title-input">
+                      Title
+                    </label>
+                    <input
+                      id="as-task-modal-title-input"
+                      className="form-control mb-3"
+                      value={taskModalTitle}
+                      onChange={(e) => setTaskModalTitle(e.target.value)}
+                      maxLength={500}
+                      required
+                      autoFocus
+                    />
+                    <label className="form-label small text-secondary mb-1">Assignees</label>
+                    <select
+                      className="form-select mb-3"
+                      multiple
+                      size={Math.max(2, Math.min(6, projectMembers.length || 2))}
+                      value={taskModalAssigneeIds.map(String)}
+                      onChange={(e) =>
+                        setTaskModalAssigneeIds(Array.from(e.target.selectedOptions, (o) => Number(o.value)))
+                      }
+                      aria-label="Task assignees"
+                    >
+                      {projectMembers.map((row) => (
+                        <option key={row.member_id} value={row.member_id}>
+                          {row.member?.display_name ?? `Member #${row.member_id}`}
+                          {row.member?.member_type === "ai" ? " (AI)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="form-text mb-3">Hold Cmd/Ctrl to select multiple people or AI agents.</div>
+                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-reporter">
+                      Reporter
+                    </label>
+                    <select
+                      id="as-task-modal-reporter"
+                      className="form-select mb-3"
+                      value={taskModalReporterId}
+                      onChange={(e) => setTaskModalReporterId(e.target.value)}
+                      aria-label="Reporter task"
+                    >
+                      <option value="">— None —</option>
+                      {projectMembers.map((row) => (
+                        <option key={row.member_id} value={row.member_id}>
+                          {row.member?.display_name ?? `Member #${row.member_id}`}
+                          {row.member?.member_type === "ai" ? " (AI)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-body">
+                      Description
+                    </label>
+                    <MarkdownEditorField
+                      value={taskModalBody}
+                      onChange={setTaskModalBody}
+                      height={220}
+                      placeholder="Markdown (optional)"
+                      textareaProps={{ id: "as-task-modal-body" }}
+                    />
+                  </div>
+                  <div className="modal-footer">
+                    <button type="button" className="btn btn-outline-secondary" onClick={closeTaskModal}>
+                      Cancel
+                    </button>
+                    <button type="submit" className="btn btn-primary" disabled={!taskModalTitle.trim()}>
+                      Save
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+          <div className="modal-backdrop fade show" />
+        </>
+      ) : null}
     </>
   );
 }
@@ -902,6 +1165,8 @@ export default function App() {
   const [activeChatId, setActiveChatId] = useState("general");
   const [chatInput, setChatInput] = useState("");
   const [chatMessagesByChannel, setChatMessagesByChannel] = useState({});
+  const [wikiRealtimeDocId, setWikiRealtimeDocId] = useState(null);
+  const [wikiRealtimeCommentsBump, setWikiRealtimeCommentsBump] = useState(0);
   const [chatConnected, setChatConnected] = useState(false);
   const [typingByChannel, setTypingByChannel] = useState({});
 
@@ -917,6 +1182,15 @@ export default function App() {
   const apiCenterAgentWsRef = useRef(null);
   const chatTypingStopTimerRef = useRef(null);
   const chatTypingPurgeTimerRef = useRef(null);
+  const chatTextareaRef = useRef(null);
+  const chatCaretAfterMentionRef = useRef(null);
+  const wikiRealtimeDocIdRef = useRef(null);
+  /** Ref chứa phiên bản mới nhất của fetch comment story — tránh tái đăng ký socket.io. */
+  const refreshStoryCommentsForSocketRef = useRef(async (_sid) => {});
+
+  useEffect(() => {
+    wikiRealtimeDocIdRef.current = wikiRealtimeDocId;
+  }, [wikiRealtimeDocId]);
   /** Agent đang trả lời: POST /chat/typing + renew (TTL UI ~3.5s). */
   const agentTypingIntervalRef = useRef(null);
   const agentTypingSafetyTimerRef = useRef(null);
@@ -973,7 +1247,9 @@ export default function App() {
   const workspace = parseWorkspacePath(location.pathname);
   const isStoryPage = workspace?.tab === "story";
   const mainTab =
-    workspace && ["board", "team", "master-data", "chat", "releases", "settings"].includes(workspace.tab) ? workspace.tab : "board";
+    workspace && ["board", "team", "master-data", "chat", "releases", "wiki", "settings"].includes(workspace.tab)
+      ? workspace.tab
+      : "board";
 
   const refreshProjects = useCallback(async () => {
     setErr(null);
@@ -1110,6 +1386,25 @@ export default function App() {
     setStoryDetail(null);
     setComments([]);
   }, []);
+
+  const refreshStoryCommentsForSocket = useCallback(async (targetStoryId) => {
+    const sid = Number(targetStoryId);
+    if (!Number.isFinite(sid) || storyId !== sid) return;
+    try {
+      const rows = await apiGet(`/stories/${sid}/comments`);
+      setComments(Array.isArray(rows) ? rows : []);
+    } catch {
+      /* realtime path — không chặn UX */
+    }
+  }, [storyId]);
+
+  useEffect(() => {
+    refreshStoryCommentsForSocketRef.current = refreshStoryCommentsForSocket;
+  }, [refreshStoryCommentsForSocket]);
+
+  useEffect(() => {
+    if (mainTab !== "wiki") setWikiRealtimeDocId(null);
+  }, [mainTab]);
 
   const closeProjectsHub = useCallback(() => setShowProjectsHub(false), []);
   const closeMasterDataHub = useCallback(() => {
@@ -1296,7 +1591,7 @@ export default function App() {
     requestAnimationFrame(() => {
       requestAnimationFrame(scrollToBottom);
     });
-  }, [mainTab, activeChatRoom?.channelId, chatMessagesByChannel]);
+  }, [mainTab, activeChatRoom?.channelId, chatMessagesByChannel, activeChatMessages.length, activeChatMessages.at(-1)?.id]);
 
   const mentionIndex = useMemo(() => {
     const map = new Map();
@@ -1334,9 +1629,29 @@ export default function App() {
   );
 
   const onPickMention = useCallback((displayName) => {
-    const mentionToken = `@${mentionKeyFromName(displayName)}`;
-    setChatInput((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${mentionToken} `)));
+    setChatInput((prev) => {
+      const { next, caret } = replaceTrailingMention(prev, displayName);
+      if (next === prev) return prev;
+      chatCaretAfterMentionRef.current = caret;
+      return next;
+    });
   }, []);
+
+  useLayoutEffect(() => {
+    const caret = chatCaretAfterMentionRef.current;
+    if (caret == null) return;
+    chatCaretAfterMentionRef.current = null;
+    const el = chatTextareaRef.current;
+    if (!el || typeof el.setSelectionRange !== "function") return;
+    try {
+      el.focus({ preventScroll: false });
+      const len = el.value?.length ?? 0;
+      const p = Math.max(0, Math.min(caret, len));
+      el.setSelectionRange(p, p);
+    } catch {
+      /* ignore */
+    }
+  }, [chatInput]);
 
   useEffect(() => {
     if (!chatChannelItems.length) return;
@@ -1548,7 +1863,7 @@ export default function App() {
         .replace(/[.,;:!?)\]]+$/g, "")
         .toLowerCase()
     );
-    const targetAgentFromMention = firstResolvedMentionedAgent(mentionMatches, apiCenterAgents, projectMembers);
+    const mentionedAgents = allResolvedMentionedAgents(mentionMatches, apiCenterAgents, projectMembers);
     const directAgentTarget =
       roomSnapshot.targetKind === "private_user"
         ? (() => {
@@ -1557,20 +1872,26 @@ export default function App() {
             return matchAgentIdToCatalog(String(row.member.agent_id || "").toLowerCase(), apiCenterAgents);
           })()
         : null;
-    const targetAgent = targetAgentFromMention || directAgentTarget;
-    const agentMemberForTyping = targetAgent
-      ? resolveAiMemberForAgentReply(projectMembers, targetAgent.id, apiCenterAgents)
+    const agentsToNotify =
+      roomSnapshot.targetKind === "private_user"
+        ? directAgentTarget
+          ? [directAgentTarget]
+          : mentionedAgents
+        : mentionedAgents;
+    const primaryAgent = agentsToNotify[0] || null;
+    const agentMemberForTyping = primaryAgent
+      ? resolveAiMemberForAgentReply(projectMembers, primaryAgent.id, apiCenterAgents)
       : null;
     chatDebug("onSendChatMessage", {
       mentionMatches,
-      targetAgentId: targetAgent?.id,
+      agentIds: agentsToNotify.map((a) => a.id),
       apiCenterConnected,
       channelId: roomSnapshot.channelId,
     });
     setChatInput("");
     emitTyping(false);
-    if (apiCenterConnected && targetAgent) {
-      const history = (chatMessagesByChannel[roomSnapshot.channelId] || []).slice(-8).map((m) => ({
+    if (apiCenterConnected && agentsToNotify.length > 0) {
+      const history = (chatMessagesByChannel[roomSnapshot.channelId] || []).slice(-CHAT_DISPATCH_HISTORY_LIMIT).map((m) => ({
         sender_id: String(m.senderUserId),
         sender_type: Number(m.senderUserId) === Number(myChatUserId) ? "human" : "agent",
         content: String(m.content || ""),
@@ -1579,8 +1900,7 @@ export default function App() {
       const fromStories = findStoryKeysFromLoadedStories(content, stories);
       const fromSlugPattern = findStoryKeysByProjectSlugPattern(content, selectedProject?.slug);
       const mentionedStoryKeys = [...new Set([...fromStories, ...fromSlugPattern])];
-      const dispatchPayload = {
-        trace_id: `tr_${Date.now()}`,
+      const baseDispatch = {
         project_id: String(projectId),
         project_context: {
           name: selectedProject?.name || `Project ${projectId}`,
@@ -1593,7 +1913,6 @@ export default function App() {
         sender: { id: String(myChatUserId || 0), name: myName },
         message: content,
         mentions: mentionMatches,
-        target_agent_id: String(targetAgent.id),
         conversation_history: history,
         ...(mentionedStoryKeys.length
           ? {
@@ -1605,6 +1924,7 @@ export default function App() {
             }
           : {}),
       };
+
       if (agentMemberForTyping?.member_id && userMessageId) {
         resetAgentProcessingUiImmediate();
         const aid = Number(agentMemberForTyping.member_id);
@@ -1613,9 +1933,10 @@ export default function App() {
           room: roomSnapshot,
           senderUserId: aid,
           senderName:
-            agentMemberForTyping.member?.display_name || targetAgent.name || String(targetAgent.id),
+            agentMemberForTyping.member?.display_name || primaryAgent.name || String(primaryAgent.id),
           viewerMemberId: myChatUserId,
         };
+        const firstTrace = `tr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
         agentUiLeadTimerRef.current = setTimeout(() => {
           agentUiLeadTimerRef.current = null;
           agentProcessingShownAtRef.current = Date.now();
@@ -1644,7 +1965,7 @@ export default function App() {
             reaction: "doing",
             action: "add",
           }).catch(() => {});
-          beginAgentTypingPulse(typingPayload, dispatchPayload.trace_id, stopAgentTypingIndicator);
+          beginAgentTypingPulse(typingPayload, firstTrace, stopAgentTypingIndicator);
         }, AGENT_CHAT_UI_LEAD_MS);
       } else if (agentMemberForTyping?.member_id) {
         startAgentTypingIndicator(
@@ -1653,43 +1974,59 @@ export default function App() {
             room: roomSnapshot,
             senderUserId: Number(agentMemberForTyping.member_id),
             senderName:
-              agentMemberForTyping.member?.display_name || targetAgent.name || String(targetAgent.id),
+              agentMemberForTyping.member?.display_name || primaryAgent.name || String(primaryAgent.id),
             viewerMemberId: myChatUserId,
           },
-          dispatchPayload.trace_id
+          `tr_${Date.now()}`
         );
       }
-      sendAgentDispatch(dispatchPayload)
-        .then(async ({ via, ack }) => {
-          chatDebug("dispatch settled", { via, should_respond: ack?.should_respond, reply_len: ack?.reply_text?.length });
-          if (via === "ws") return;
-          try {
-            if (!ack?.should_respond || !ack?.reply_text) return;
-            const agentMember = resolveAiMemberForAgentReply(projectMembers, targetAgent.id, apiCenterAgents);
-            if (!agentMember?.member_id) return;
-            const dmPeerUserId = dmPeerUserIdForAgentSend(roomSnapshot, agentMember.member_id, myChatUserId);
-            await fetch(`${CHAT_API_BASE}/chat/messages`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                projectId,
-                targetKind: roomSnapshot.targetKind,
-                channelName: roomSnapshot.channelName || undefined,
-                userId: dmPeerUserId,
-                senderUserId: Number(agentMember.member_id),
-                senderName: agentMember.member?.display_name || targetAgent.name || String(targetAgent.id),
-                content: String(ack.reply_text),
-              }),
+
+      let dispatchIndex = 0;
+      const dispatchOne = (targetAgent) => {
+        const trace_id = `tr_${Date.now()}_${dispatchIndex++}_${Math.random().toString(36).slice(2, 9)}`;
+        const dispatchPayload = {
+          ...baseDispatch,
+          trace_id,
+          target_agent_id: String(targetAgent.id),
+        };
+        return sendAgentDispatch(dispatchPayload)
+          .then(async ({ via, ack }) => {
+            chatDebug("dispatch settled", targetAgent.id, {
+              via,
+              should_respond: ack?.should_respond,
+              reply_len: ack?.reply_text?.length,
             });
-          } finally {
+            if (via === "ws") return;
+            try {
+              if (!ack?.should_respond || !ack?.reply_text) return;
+              const agentMember = resolveAiMemberForAgentReply(projectMembers, targetAgent.id, apiCenterAgents);
+              if (!agentMember?.member_id) return;
+              const dmPeerUserId = dmPeerUserIdForAgentSend(roomSnapshot, agentMember.member_id, myChatUserId);
+              await fetch(`${CHAT_API_BASE}/chat/messages`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  projectId,
+                  targetKind: roomSnapshot.targetKind,
+                  channelName: roomSnapshot.channelName || undefined,
+                  userId: dmPeerUserId,
+                  senderUserId: Number(agentMember.member_id),
+                  senderName: agentMember.member?.display_name || targetAgent.name || String(targetAgent.id),
+                  content: String(ack.reply_text),
+                }),
+              });
+            } finally {
+              stopAgentTypingIndicator();
+            }
+          })
+          .catch((err) => {
+            chatDebug("dispatch failed", targetAgent.id, err);
             stopAgentTypingIndicator();
-          }
-        })
-        .catch((err) => {
-          chatDebug("dispatch failed", err);
-          stopAgentTypingIndicator();
-        });
-    } else if (content.includes("@") && apiCenterConnected && !targetAgent) {
+          });
+      };
+
+      for (const a of agentsToNotify) void dispatchOne(a);
+    } else if (content.includes("@") && apiCenterConnected && agentsToNotify.length === 0) {
       chatDebug("mention nhưng không resolve được agent — kiểm tra catalog / member AI / @token");
     }
   }, [
@@ -1773,9 +2110,10 @@ export default function App() {
     [activeChatRoom, projectId, myChatUserId]
   );
 
-  const storyDrawerOpen = storyId != null;
+  /** Socket.IO chat-service: Chat tab, wiki (feedback), hoặc trang chi tiết story. */
+  const chatSocketShouldConnect = Boolean(projectId) && (mainTab === "chat" || mainTab === "wiki" || isStoryPage);
   useEffect(() => {
-    if (!projectId || (mainTab !== "chat" && !storyDrawerOpen)) return;
+    if (!chatSocketShouldConnect) return;
     const socket = io(CHAT_WS_NAMESPACE, { transports: ["websocket", "polling"] });
     chatSocketRef.current = socket;
     socket.on("connect", () => setChatConnected(true));
@@ -1795,27 +2133,18 @@ export default function App() {
     socket.on("chat:event", (evt) => {
       if (!evt || evt.type !== "event") return;
       const pid = Number(evt.projectId);
-      const sid = Number(evt.storyId);
-      if (pid !== projectIdRef.current || sid !== storyIdRef.current) return;
-      const et = evt.eventType;
-      const pl = evt.payload && typeof evt.payload === "object" ? evt.payload : {};
-      if (et === "story.comment.created") {
-        const c = pl.comment;
-        if (!c?.id) return;
-        setComments((prev) => {
-          if (prev.some((x) => x.id === c.id)) return prev;
-          const next = [...prev, c];
-          next.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-          return next;
-        });
-      } else if (et === "story.comment.updated") {
-        const c = pl.comment;
-        if (!c?.id) return;
-        setComments((prev) => prev.map((x) => (x.id === c.id ? c : x)));
-      } else if (et === "story.comment.deleted") {
-        const cid = Number(pl.comment_id);
-        if (!Number.isFinite(cid)) return;
-        setComments((prev) => prev.filter((x) => x.id !== cid));
+      if (pid !== projectIdRef.current) return;
+      const et = String(evt.eventType || "");
+      if (et.startsWith("story.comment.")) {
+        const sid = Number(evt.storyId);
+        if (!Number.isFinite(sid) || sid !== storyIdRef.current) return;
+        refreshStoryCommentsForSocketRef.current?.(sid);
+        return;
+      }
+      if (et.startsWith("wiki.comment.")) {
+        const docId = String(evt.docId || "").trim();
+        if (!docId || docId !== wikiRealtimeDocIdRef.current) return;
+        setWikiRealtimeCommentsBump((n) => n + 1);
       }
     });
     socket.on("chat:messageDeleted", (payload) => {
@@ -1859,17 +2188,27 @@ export default function App() {
       socket.disconnect();
       chatSocketRef.current = null;
     };
-  }, [mainTab, projectId, storyDrawerOpen]);
+  }, [chatSocketShouldConnect, projectId]);
 
   useEffect(() => {
     const sock = chatSocketRef.current;
-    if (!sock || !chatConnected || projectId == null || storyId == null) return;
+    if (!sock || !chatConnected || projectId == null || storyId == null || !isStoryPage) return;
     const channelId = storyCommentsChannelId(projectId, storyId);
     sock.emit("chat:join", { channelId });
     return () => {
       sock.emit("chat:leave", { channelId });
     };
-  }, [projectId, storyId, chatConnected]);
+  }, [projectId, storyId, chatConnected, isStoryPage]);
+
+  useEffect(() => {
+    const sock = chatSocketRef.current;
+    if (!sock || !chatConnected || projectId == null || mainTab !== "wiki" || !wikiRealtimeDocId) return;
+    const channelId = `${projectId}_wiki_doc_${wikiRealtimeDocId}`;
+    sock.emit("chat:join", { channelId });
+    return () => {
+      sock.emit("chat:leave", { channelId });
+    };
+  }, [projectId, mainTab, wikiRealtimeDocId, chatConnected]);
 
   useEffect(() => {
     if (mainTab !== "chat") {
@@ -1950,8 +2289,9 @@ export default function App() {
 
         const channelId = String(data?.channel_id || data?.channelId || "");
         const replyTrace = String(data?.trace_id || "").trim();
+        /** Multi-agent: mọi reply trên đúng channel đều tắt typing (trace chỉ gắn agent đầu). */
         const stopTypingIfOurReply = () => {
-          if (!replyTrace || replyTrace === agentTypingTraceRef.current) stopAgentTypingRef.current();
+          stopAgentTypingRef.current();
         };
 
         const content = String(data?.reply_text || data?.message || data?.content || "").trim();
@@ -1961,6 +2301,20 @@ export default function App() {
         if (!channelId || !content) {
           stopTypingIfOurReply();
           return;
+        }
+
+        /** API Center đã POST reply vào chat-service qua HTTP callback — tránh gửi trùng. */
+        if (isAgentReply) {
+          const dmode = String(data?.delivery_mode || "");
+          const dst = String(data?.delivery_status || "");
+          if (dmode === "api" && /^api:2/.test(dst)) {
+            stopTypingIfOurReply();
+            if (replyTrace) {
+              postedAgentReplyTraceIdsRef.current.add(replyTrace);
+              if (postedAgentReplyTraceIdsRef.current.size > 200) postedAgentReplyTraceIdsRef.current.clear();
+            }
+            return;
+          }
         }
 
         const traceId = replyTrace;
@@ -2588,6 +2942,50 @@ export default function App() {
     }
   };
 
+  const onCreateTask = async (sid, { title, body, assignee_ids, reporter_id }) => {
+    const t = (title || "").trim();
+    if (!projectId || !sid || !t) return;
+    setErr(null);
+    try {
+      await apiPost(`/stories/${sid}/tasks`, {
+        title: t,
+        body: body ?? null,
+        assignee_ids: Array.isArray(assignee_ids) ? assignee_ids : [],
+        reporter_id: reporter_id ?? null,
+      });
+      await loadProject(projectId, { preserveStory: true });
+      if (storyId === sid) await loadStory(sid);
+    } catch (e2) {
+      setErr(e2.message);
+      throw e2;
+    }
+  };
+
+  const onPatchTask = async (sid, taskId, patch) => {
+    if (!projectId || !sid) return;
+    setErr(null);
+    try {
+      await apiPatch(`/stories/${sid}/tasks/${taskId}`, patch);
+      await loadProject(projectId, { preserveStory: true });
+      if (storyId === sid) await loadStory(sid);
+    } catch (e2) {
+      setErr(e2.message);
+      throw e2;
+    }
+  };
+
+  const onDeleteTask = async (sid, taskId) => {
+    if (!projectId || !sid || !window.confirm("Delete this task?")) return;
+    setErr(null);
+    try {
+      await apiDelete(`/stories/${sid}/tasks/${taskId}`);
+      await loadProject(projectId, { preserveStory: true });
+      if (storyId === sid) await loadStory(sid);
+    } catch (e2) {
+      setErr(e2.message);
+    }
+  };
+
   const onSaveProjectSettings = async (e) => {
     e.preventDefault();
     if (!projectId) return;
@@ -2848,6 +3246,7 @@ export default function App() {
         </div>
       </header>
 
+      <AgileMarkdownProjectContext.Provider value={projectId}>
       <div className="as-body">
         <aside className="as-sidenav">
           <div className="as-sidenav-label">Workspace</div>
@@ -2895,6 +3294,16 @@ export default function App() {
           >
             <i className={TABS.settings.icon} aria-hidden />
             {TABS.settings.label}
+          </button>
+          <button
+            type="button"
+            className={`as-nav-btn mb-1 ${mainTab === TABS.wiki.id ? "active" : ""}`}
+            disabled={!projectId}
+            onClick={() => projectId && navigate(`/p/${projectId}/wiki`)}
+            title="Docs and wiki for this project"
+          >
+            <i className={TABS.wiki.icon} aria-hidden />
+            {TABS.wiki.label}
           </button>
           <div className="as-sidenav-footer">
             {selectedProject ? (
@@ -2977,9 +3386,13 @@ export default function App() {
                         onPatchStoryDetails={onPatchStoryDetails}
                         onPatchStoryRelease={onPatchStoryRelease}
                         onPatchStoryAssignees={onPatchStoryAssignees}
+                        onCreateTask={onCreateTask}
+                        onPatchTask={onPatchTask}
+                        onDeleteTask={onDeleteTask}
                         onPostComment={onPostComment}
                         onPatchComment={onPatchComment}
                         onDeleteComment={onDeleteComment}
+                        setErr={setErr}
                       />
                     </div>
                   </div>
@@ -3059,6 +3472,8 @@ export default function App() {
                             height={260}
                             placeholder="Context, acceptance criteria, links... (optional)"
                             textareaProps={{ id: "as-new-story-desc" }}
+                            insertToolbar
+                            projectId={projectId}
                           />
                           <div className="form-text">Leave blank if details come later — you can edit the story anytime.</div>
                         </div>
@@ -3480,6 +3895,7 @@ export default function App() {
                             <i className="bi bi-chat-text text-secondary" aria-hidden />
                           </span>
                           <textarea
+                            ref={chatTextareaRef}
                             className="form-control as-chat-textarea"
                             rows={2}
                             placeholder="Type your message... (Enter send, Shift+Enter newline)"
@@ -3850,6 +4266,25 @@ export default function App() {
             </>
           )}
 
+          {mainTab === "wiki" && (
+            <>
+              {!projectId ? (
+                <div className="as-page-head mb-3">
+                  <h1 className="as-page-title">Docs</h1>
+                  <p className="as-page-desc mb-0">Select a project to open the wiki.</p>
+                </div>
+              ) : (
+                <ProjectWikiPage
+                  projectId={projectId}
+                  initialSlug={workspace?.wikiSlug != null ? workspace.wikiSlug : null}
+                  setErr={setErr}
+                  onWikiDocRealtimeFocus={setWikiRealtimeDocId}
+                  wikiRealtimeCommentsBump={wikiRealtimeCommentsBump}
+                />
+              )}
+            </>
+          )}
+
           {mainTab === "settings" && (
             <div className="as-settings-layout">
               <div className="as-page-head d-flex flex-wrap justify-content-between align-items-start gap-2">
@@ -4161,26 +4596,28 @@ export default function App() {
           <div className="as-drawer-backdrop" role="presentation" onClick={closeStoryDrawer} aria-hidden />
           <aside className="as-drawer" aria-label="Story details">
             <div className="as-drawer-hd">
-              <div className="min-w-0 flex-grow-1">
+              <div className="as-drawer-hd-title min-w-0">
                 {storyDetail.story_key ? (
                   <div className="small text-white-50 font-monospace text-truncate mb-0">{storyDetail.story_key}</div>
                 ) : null}
                 <span className="fw-semibold text-truncate d-block">{storyDetail.title}</span>
               </div>
-              {projectId ? (
-                <button
-                  type="button"
-                  className="btn btn-sm btn-outline-primary flex-shrink-0"
-                  title="Open full story page (shareable URL)"
-                  onClick={() => navigate(`/p/${projectId}/story/${storyDetail.id}`)}
-                >
-                  <i className="bi bi-box-arrow-up-right me-1" aria-hidden />
-                  Full page
+              <div className="as-drawer-hd-actions">
+                {projectId ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-primary flex-shrink-0"
+                    title="Open full story page (shareable URL)"
+                    onClick={() => navigate(`/p/${projectId}/story/${storyDetail.id}`)}
+                  >
+                    <i className="bi bi-box-arrow-up-right me-1" aria-hidden />
+                    Full page
+                  </button>
+                ) : null}
+                <button type="button" className="btn btn-sm btn-outline-secondary flex-shrink-0" onClick={closeStoryDrawer} aria-label="Close">
+                  <i className="bi bi-x-lg" />
                 </button>
-              ) : null}
-              <button type="button" className="btn btn-sm btn-outline-secondary flex-shrink-0" onClick={closeStoryDrawer} aria-label="Close">
-                <i className="bi bi-x-lg" />
-              </button>
+              </div>
             </div>
             <div className="as-drawer-bd">
               <StoryDetailBody
@@ -4195,14 +4632,19 @@ export default function App() {
                 onPatchStoryDetails={onPatchStoryDetails}
                 onPatchStoryRelease={onPatchStoryRelease}
                 onPatchStoryAssignees={onPatchStoryAssignees}
+                onCreateTask={onCreateTask}
+                onPatchTask={onPatchTask}
+                onDeleteTask={onDeleteTask}
                 onPostComment={onPostComment}
                 onPatchComment={onPatchComment}
                 onDeleteComment={onDeleteComment}
+                setErr={setErr}
               />
             </div>
           </aside>
         </>
       )}
+      </AgileMarkdownProjectContext.Provider>
     </div>
   );
 }

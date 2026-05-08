@@ -138,7 +138,7 @@ Response:
       "name": "Mia dev",
       "role": "Software implementation",
       "description": "Code changes, tests, refactors, and delivery.",
-      "workspace": "ai-dev/workspace",
+      "workspace": "agents/ai-dev/workspace",
       "supported_item_kinds": ["task", "notification"]
     }
   ],

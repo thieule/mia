@@ -1,0 +1,112 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "./workspace",
+      "model": "${GEMINI_MODEL}",
+      "provider": "gemini",
+      "timezone": "UTC",
+      "reflectAfterTools": true,
+      "textOnlyToolNudgeRounds": 2
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "${OPENROUTER_API_KEY}"
+    },
+    "gemini": {
+      "apiKey": "${GEMINI_API_KEY}"
+    }
+  },
+  "channels": {
+    "discord": {
+      "enabled": false,
+      "token": "${DISCORD_BOT_TOKEN_MIA_TECH}",
+      "allowFrom": [
+        "*"
+      ],
+      "adminUserIds": [
+        "${DISCORD_ADMIN_USER_IDS}"
+      ],
+      "groupPolicy": "open",
+      "streaming": true,
+      "intents": 37377,
+      "readReceiptEmoji": "👀",
+      "workingEmoji": "🔧",
+      "workingEmojiDelay": 2.0
+    }
+  },
+  "gateway": {
+    "port": 18792
+  },
+  "working_queue": {
+    "enabled": true,
+    "interval_s": 3,
+    "max_tasks_per_tick": 2
+  },
+  "tools": {
+    "restrictToWorkspace": true,
+    "exec": {
+      "enable": true,
+      "timeout": 180
+    },
+    "web": {
+      "enable": true,
+      "search": {
+        "provider": "brave"
+      }
+    },
+    "mcpServers": {
+      "registry": {
+        "command": "python",
+        "args": [
+          "../../ai-tools/registry/server.py"
+        ],
+        "env": {
+          "AI_TOOL_SECRET": "${AI_TOOL_SECRET}"
+        }
+      },
+      "pytest_runner": {
+        "command": "python",
+        "args": [
+          "../../ai-tools/servers/pytest_runner/server.py"
+        ],
+        "env": {
+          "AI_TOOL_SECRET": "${AI_TOOL_SECRET}",
+          "TEST_RUNS_PATH": "${TEST_RUNS_PATH_MIA_TECH}"
+        }
+      },
+      "linux_deploy": {
+        "command": "python",
+        "args": [
+          "../../ai-tools/servers/linux_deploy/server.py"
+        ],
+        "env": {
+          "AI_TOOL_SECRET": "${AI_TOOL_SECRET}",
+          "LINUX_DEPLOY_ALLOWED_HOSTS": "${LINUX_DEPLOY_ALLOWED_HOSTS}",
+          "LINUX_DEPLOY_DEFAULT_USER": "${LINUX_DEPLOY_DEFAULT_USER}",
+          "LINUX_DEPLOY_IDENTITY_FILE": "${LINUX_DEPLOY_IDENTITY_FILE}",
+          "LINUX_DEPLOY_STRICT_HOST_KEY_CHECKING": "${LINUX_DEPLOY_STRICT_HOST_KEY_CHECKING}",
+          "LINUX_DEPLOY_SSH_PORT": "${LINUX_DEPLOY_SSH_PORT}"
+        },
+        "toolTimeout": 600
+      },
+      "github": {
+        "url": "${GITHUB_MCP_URL}",
+        "headers": {
+          "Authorization": "${GITHUB_TOKEN}"
+        }
+      },
+      "agile-studio": {
+        "type": "streamableHttp",
+        "url": "http://127.0.0.1:9121/mcp",
+        "headers": {
+          "Authorization": "Bearer mcp_pClGg2_YlJWZJgYyJS-A5vLM1vwUBIQ8"
+        },
+        "toolTimeout": 30,
+        "enabledTools": [
+          "*"
+        ]
+      }
+    }
+  }
+}

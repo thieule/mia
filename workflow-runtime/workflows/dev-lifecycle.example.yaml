@@ -8,23 +8,23 @@ description: >
   Chuỗi vai trò: mỗi bước dùng config mia tương ứng (ai-ba, ai-tech, ai-dev, ai-qc) nếu đủ file .env.
 
 # Đường dẫn tính từ thư mục file yaml (workflows/).
-# Mỗi mục có thể thêm: workspace: ../../ai-ba/workspace (nếu không đặt, tự suy từ .../config/config.json)
+# Mỗi mục có thể thêm: workspace: ../../agents/ai-ba/workspace (nếu không đặt, tự suy từ .../config/config.json)
 agent_profiles:
   ba:
-    config: ../../ai-ba/config/config.json
-    env: ../../ai-ba/.env
+    config: ../../agents/ai-ba/config/config.json
+    env: ../../agents/ai-ba/.env
   tech:
-    config: ../../ai-tech/config/config.json
-    env: ../../ai-tech/.env
+    config: ../../agents/ai-tech/config/config.json
+    env: ../../agents/ai-tech/.env
   dev:
-    config: ../../ai-dev/config/config.json
-    env: ../../ai-dev/.env
+    config: ../../agents/ai-dev/config/config.json
+    env: ../../agents/ai-dev/.env
   pm:
-    config: ../../ai-pm/config/config.json
-    env: ../../ai-pm/.env
+    config: ../../agents/ai-pm/config/config.json
+    env: ../../agents/ai-pm/.env
   qc:
-    config: ../../ai-qc/config/config.json
-    env: ../../ai-qc/.env
+    config: ../../agents/ai-qc/config/config.json
+    env: ../../agents/ai-qc/.env
 
 # execution.mode: inline = chạy Mia trong cùng process (runtime).
 #   queue = ghi từng bước vào <agent>/workspace/working_queue/pending, chờ done/ (cần mỗi agent chạy gateway, workingQueue.enabled).

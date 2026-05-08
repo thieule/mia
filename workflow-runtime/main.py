@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Run Mia with `channel=workflow`: ad-hoc `--prompt`, or a YAML pipeline (`--workflow` + `--request`).
 
-Install in the same venv (PATH alone is not enough): `pip install -r requirements.txt` or `pip install -e ../core`.
-Copy a `.env` (e.g. from `../ai-tech/EXAMPLE_.env`) if keys are not already set.
+Install in the same venv (PATH alone is not enough): `pip install -r requirements.txt` or `pip install -e ../agents/core`.
+Copy a `.env` (e.g. from `../agents/ai-tech/EXAMPLE_.env`) if keys are not already set.
 
-  python main.py -c ..\\ai-tech\\config\\config.json --env ..\\ai-tech\\.env --prompt "List three files in workspace/agent"
+  python main.py -c ..\\agents\\ai-tech\\config\\config.json --env ..\\agents\\ai-tech\\.env --prompt "List three files in workspace/agent"
 
-  python main.py -c ..\\ai-tech\\config\\config.json --env ..\\ai-tech\\.env ^
+  python main.py -c ..\\agents\\ai-tech\\config\\config.json --env ..\\agents\\ai-tech\\.env ^
     -w workflows\\dev-lifecycle.example.yaml --request "Order app requirements"
 
   python new_project.py my-product
@@ -24,7 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
-CORE = REPO / "core"
+CORE = REPO / "agents" / "core"
 
 
 def _require_py() -> None:
@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
         "-c",
         type=Path,
         default=None,
-        help="Mia config.json. Default: ai-tech, or <project-dir>/config.json when --project-dir is provided.",
+        help="Mia config.json. Default: agents/ai-tech, or <project-dir>/config.json when --project-dir is provided.",
     )
     p.add_argument(
         "--env",
@@ -223,7 +223,7 @@ def _apply_project_dir_and_env(args: argparse.Namespace) -> None:
         if args.project_dir is not None and (Path(args.project_dir).resolve() / "config.json").is_file():
             args.config = Path(args.project_dir).resolve() / "config.json"
         else:
-            args.config = REPO / "ai-tech" / "config" / "config.json"
+            args.config = REPO / "agents" / "ai-tech" / "config" / "config.json"
     else:
         args.config = args.config if isinstance(args.config, Path) else Path(args.config)
     args.config = args.config.resolve()

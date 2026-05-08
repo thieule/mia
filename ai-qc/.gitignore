@@ -1,8 +1,0 @@
-# Local secrets
-.env
-
-# Volatile nanobot paths
-/workspace/memory/
-/workspace/cron/
-/workspace/**/history.jsonl
-/workspace/sessions/

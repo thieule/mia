@@ -375,6 +375,41 @@ class StoryPatch(BaseModel):
         return _normalize_story_status(v)
 
 
+class StoryTaskCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    body: Optional[str] = None
+    done: bool = False
+    sort_order: Optional[int] = None
+    assignee_ids: list[int] = Field(default_factory=list)
+    reporter_id: Optional[int] = None
+
+
+class StoryTaskPatch(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    body: Optional[str] = None
+    done: Optional[bool] = None
+    sort_order: Optional[int] = None
+    assignee_ids: Optional[list[int]] = None
+    reporter_id: Optional[int] = None
+
+
+class StoryTaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    story_id: int
+    title: str
+    body: Optional[str] = None
+    done: bool
+    sort_order: int
+    assignee_ids: list[int] = Field(default_factory=list)
+    assignee_id: Optional[int] = None
+    """First assignee (same convention as ``StoryOut``)."""
+    reporter_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class StoryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -395,6 +430,7 @@ class StoryOut(BaseModel):
     reporter_id: Optional[int]
     created_at: datetime
     updated_at: datetime
+    tasks: list[StoryTaskOut] = Field(default_factory=list)
 
 
 class CommentCreate(BaseModel):
@@ -453,6 +489,168 @@ class StoryStatusEventOut(BaseModel):
     to_status: str
     created_at: datetime
     actor: Optional[StoryStatusActorOut] = None
+
+
+# --- Wiki / Docs ---
+class WikiFolderCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(..., min_length=1, max_length=255)
+    parent_id: Optional[int] = None
+
+
+class WikiFolderPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+
+
+class WikiFolderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    parent_id: Optional[int] = None
+    name: str
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class WikiFolderTreeNode(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    parent_id: Optional[int] = None
+    name: str
+    sort_order: int = 0
+    children: list["WikiFolderTreeNode"] = Field(default_factory=list)
+
+
+class WikiFolderTreeResponse(BaseModel):
+    tree: list[WikiFolderTreeNode]
+
+
+WikiFolderTreeNode.model_rebuild()
+
+
+class WikiDocCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    title: str = Field(..., min_length=1, max_length=500)
+    content: str = ""
+    slug: Optional[str] = Field(None, max_length=128)
+    folder_id: Optional[int] = None
+    """Thư mục wiki (``wiki_folders``); ``None`` = ngoài thư mục."""
+    story_id: Optional[int] = None
+    """Một story (tương thích cũ); gộp vào ``story_ids``."""
+    story_ids: list[int] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    is_draft: bool = True
+
+
+class WikiDocPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    title: Optional[str] = Field(None, max_length=500)
+    content: Optional[str] = None
+    slug: Optional[str] = Field(None, max_length=128)
+    folder_id: Optional[int] = None
+    """Đặt thư mục; gửi ``null`` JSON để đưa doc ra gốc (unfiled)."""
+    story_id: Optional[int] = None
+    """Một story; chỉ áp khi không gửi ``story_ids``."""
+    story_ids: Optional[list[int]] = None
+    """Thay toàn bộ liên kết story; danh sách rỗng = gỡ hết."""
+    tags: Optional[list[str]] = None
+    is_draft: Optional[bool] = None
+
+
+class WikiDocOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: int
+    folder_id: Optional[int] = None
+    story_id: Optional[int] = None
+    """Story đầu tiên trong ``story_ids`` (tương thích client cũ)."""
+    story_ids: list[int] = Field(default_factory=list)
+    story_keys: list[str] = Field(default_factory=list)
+    """Mỗi story: ``project_slug-story_number``."""
+    slug: str
+    title: str
+    content: str
+    tags: list[str] = Field(default_factory=list)
+    author_member_id: int
+    is_draft: bool
+    created_at: datetime
+    updated_at: datetime
+    story_key: Optional[str] = None
+    """Giống phần tử đầu của ``story_keys`` (tương thích)."""
+    semantic_score: Optional[float] = None
+    """Chỉ khi response từ search."""
+    embedding_dims: Optional[int] = None
+    """Số chiều vector (không trả raw vector)."""
+    context_role: Optional[str] = None
+    """attached_to_story | semantic (chỉ endpoint context)."""
+
+
+class WikiDocSearchOut(BaseModel):
+    """Kết quả tìm kiếm (text + semantic)."""
+
+    query: Optional[str] = None
+    semantic_query: Optional[str] = None
+    results: list[WikiDocOut]
+
+
+class WikiCommentCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    content: str = Field(..., min_length=1)
+    parent_id: Optional[str] = None
+    quoted_comment_id: Optional[str] = Field(None, max_length=36)
+    quoted_text: Optional[str] = Field(None, max_length=12000)
+    quote: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    text_offset_start: Optional[int] = None
+    text_offset_end: Optional[int] = None
+
+
+class WikiCommentPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    content: Optional[str] = Field(None, min_length=1)
+    status: Optional[str] = Field(None, pattern="^(open|resolved)$")
+
+
+class WikiCommentCountOut(BaseModel):
+    """Message count for sidebar badge; plus root-thread tallies for this document."""
+
+    visible_count: int
+    open_thread_count: int = 0
+    resolved_thread_count: int = 0
+
+
+class WikiCommentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    doc_id: str
+    parent_id: Optional[str] = None
+    quoted_comment_id: Optional[str] = None
+    quoted_excerpt: Optional[str] = None
+    quoted_author_display_name: Optional[str] = None
+    author_member_id: int
+    author_display_name: str = ""
+    content: str
+    quote: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    text_offset_start: Optional[int] = None
+    text_offset_end: Optional[int] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
 
 
 # --- Auth (users + JWT) ---

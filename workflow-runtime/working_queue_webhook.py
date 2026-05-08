@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HTTP endpoint để enqueue task vào `working_queue/pending` của từng agent (theo bản ghi file JSON
-của mia, xem `core/mia/working_queue/`).
+của mia, xem `agents/core/mia/working_queue/`).
 
 Chạy tách khỏi `mia gateway` — cần gateway tương ứng đang bật `workingQueue.enabled` để agent xử lý.
 
@@ -27,7 +27,7 @@ import yaml
 # Bootstrap giống main.py
 _WR = Path(__file__).resolve().parent
 _REPO = _WR.parent
-_CORE = _REPO / "core"
+_CORE = _REPO / "agents" / "core"
 if str(_CORE) not in sys.path:
     sys.path.insert(0, str(_CORE))
 
@@ -779,7 +779,7 @@ def _parse() -> argparse.Namespace:
         "--repo-root",
         type=Path,
         default=None,
-        help="Gốc monorepo a-agents (mẹ của ai-dev, ...). Mặc định: parent thư mục workflow-runtime.",
+        help="Gốc monorepo mia (cha của agents/ chứa core, ai-tools, ai-*). Mặc định: parent thư mục workflow-runtime.",
     )
     p.add_argument(
         "--agents",
@@ -822,7 +822,7 @@ def _parse() -> argparse.Namespace:
 def main() -> int:
     from aiohttp import web
     if not _CORE.is_dir() or not (_CORE / "mia").is_dir():
-        print("Không tìm thấy mia: chạy với venv đã cài: pip install -e ../core", file=sys.stderr)
+        print("Không tìm thấy mia: chạy với venv đã cài: pip install -e ../agents/core", file=sys.stderr)
         return 1
     if str(_CORE) not in sys.path:
         sys.path.insert(0, str(_CORE))
