@@ -61,6 +61,7 @@ from agile_hub.schemas import (
     WikiDocCreate,
     WikiDocPatch,
     WikiCommentCreate,
+    WikiCommentOut,
     WikiDocSearchOut,
     WikiFolderCreate,
     WikiFolderOut,
@@ -805,11 +806,13 @@ def agile_comment_create(
             return json_out({"error": str(e)})
         c2 = crud.comment_get(db, c.id) or c
         try:
-            return json_out(CommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json"))
+            payload = CommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json")
         except ValidationError as e:
             return json_out(
                 {"error": "serialize_failed", "comment_id": c.id, "detail": e.errors(include_url=False)}
             )
+        chat_sync.notify_story_chat_event(s.project_id, s.id, "story.comment.created", {"comment": payload})
+        return json_out(payload)
 
 
 @mcp.tool()
@@ -822,7 +825,8 @@ def agile_comment_update(
     """
     b = CommentUpdate(body=new_body)
     with mcp_session() as db:
-        if crud.story_get(db, story_id) is None:
+        s_story = crud.story_get(db, story_id)
+        if s_story is None:
             return json_out({"error": "not_found", "story_id": story_id})
         c = crud.comment_get(db, comment_id)
         if c is None or c.story_id != story_id:
@@ -834,7 +838,9 @@ def agile_comment_update(
         except PermissionError as e:
             return json_out({"error": str(e)})
         c2 = crud.comment_get(db, c.id) or c
-        return json_out(CommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json"))
+        out = CommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json")
+        chat_sync.notify_story_chat_event(s_story.project_id, s_story.id, "story.comment.updated", {"comment": out})
+        return json_out(out)
 
 
 @mcp.tool()
@@ -843,15 +849,18 @@ def agile_comment_delete(
 ) -> str:
     """Delete comment. editor_member_id = author."""
     with mcp_session() as db:
-        if crud.story_get(db, story_id) is None:
+        s = crud.story_get(db, story_id)
+        if s is None:
             return json_out({"error": "not_found", "story_id": story_id})
         c = crud.comment_get(db, comment_id)
         if c is None or c.story_id != story_id:
             return json_out({"error": "not_found", "comment_id": comment_id})
+        cid = c.id
         try:
             crud.comment_delete(db, c, editor_member_id=editor_member_id)
         except PermissionError as e:
             return json_out({"error": str(e)})
+        chat_sync.notify_story_chat_event(s.project_id, s.id, "story.comment.deleted", {"comment_id": cid})
         return json_out({"ok": True})
 
 
@@ -1153,7 +1162,10 @@ def agile_wiki_comment_create(
                 )
         except Exception as ex:
             _log_mcp.warning("wiki comment MCP fanout skipped: %s", ex)
-        return json_out(crud.wiki_comment_to_dict(db, row))
+        wdump = crud.wiki_comment_to_dict(db, row)
+        wjson = WikiCommentOut.model_validate(wdump).model_dump(mode="json")
+        chat_sync.notify_wiki_doc_chat_event(pid, did, "wiki.comment.created", {"comment": wjson})
+        return json_out(wdump)
 
 
 def _parse_story_ids_csv(story_ids_csv: str, story_id: Optional[int]) -> list[int]:

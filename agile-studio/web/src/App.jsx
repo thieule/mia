@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { io } from "socket.io-client";
 import { apiDelete, apiGet, apiPatch, apiPost, clearAuth, getStoredUser } from "./api.js";
@@ -16,6 +16,7 @@ import {
   saveNotifications,
   textMentionsDisplayName,
 } from "./notifications.js";
+import { replaceTrailingMention } from "./mentionText.jsx";
 
 function formatChatMessageTime(iso) {
   if (!iso) return "";
@@ -412,6 +413,8 @@ function StoryDetailBody({
   const onProject = me?.member_id != null && projectMembers.some((row) => row.member_id === me.member_id);
   const [editingCommentId, setEditingCommentId] = useState(null);
   const [editDraft, setEditDraft] = useState("");
+  const [commentMentionCaretCreate, setCommentMentionCaretCreate] = useState(null);
+  const [commentMentionCaretEdit, setCommentMentionCaretEdit] = useState(null);
   const [editingStoryMeta, setEditingStoryMeta] = useState(false);
   const [storyTitleDraft, setStoryTitleDraft] = useState("");
   const [storyDescDraft, setStoryDescDraft] = useState("");
@@ -456,13 +459,20 @@ function StoryDetailBody({
     [commentMentionIndex]
   );
   const onPickCommentMention = useCallback((displayName, mode) => {
-    const mentionToken = `@${mentionKeyFromName(displayName)}`;
     if (mode === "edit") {
-      setEditDraft((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${mentionToken} `)));
+      const { next, caret } = replaceTrailingMention(editDraft, displayName);
+      if (next !== editDraft) {
+        setEditDraft(next);
+        setCommentMentionCaretEdit({ start: caret, end: caret });
+      }
       return;
     }
-    setCmBody((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${mentionToken} `)));
-  }, [setCmBody]);
+    const { next, caret } = replaceTrailingMention(cmBody, displayName);
+    if (next !== cmBody) {
+      setCmBody(next);
+      setCommentMentionCaretCreate({ start: caret, end: caret });
+    }
+  }, [cmBody, editDraft, setCmBody]);
 
   const startStoryMetaEdit = () => {
     setStoryTitleDraft(storyDetail.title);
@@ -945,6 +955,8 @@ function StoryDetailBody({
                     onChange={setEditDraft}
                     height={160}
                     textareaProps={{ required: true }}
+                    selectionFocus={commentMentionCaretEdit}
+                    onSelectionFocusDone={() => setCommentMentionCaretEdit(null)}
                   />
                   <div className="d-flex gap-2">
                     <button className="btn btn-primary btn-sm" type="submit" disabled={!editDraft.trim()}>
@@ -988,6 +1000,8 @@ function StoryDetailBody({
           textareaProps={{ required: true }}
           insertToolbar
           projectId={storyDetail.project_id}
+          selectionFocus={commentMentionCaretCreate}
+          onSelectionFocusDone={() => setCommentMentionCaretCreate(null)}
         />
         <button
           className="btn btn-primary btn-sm"
@@ -1151,6 +1165,8 @@ export default function App() {
   const [activeChatId, setActiveChatId] = useState("general");
   const [chatInput, setChatInput] = useState("");
   const [chatMessagesByChannel, setChatMessagesByChannel] = useState({});
+  const [wikiRealtimeDocId, setWikiRealtimeDocId] = useState(null);
+  const [wikiRealtimeCommentsBump, setWikiRealtimeCommentsBump] = useState(0);
   const [chatConnected, setChatConnected] = useState(false);
   const [typingByChannel, setTypingByChannel] = useState({});
 
@@ -1166,6 +1182,15 @@ export default function App() {
   const apiCenterAgentWsRef = useRef(null);
   const chatTypingStopTimerRef = useRef(null);
   const chatTypingPurgeTimerRef = useRef(null);
+  const chatTextareaRef = useRef(null);
+  const chatCaretAfterMentionRef = useRef(null);
+  const wikiRealtimeDocIdRef = useRef(null);
+  /** Ref chứa phiên bản mới nhất của fetch comment story — tránh tái đăng ký socket.io. */
+  const refreshStoryCommentsForSocketRef = useRef(async (_sid) => {});
+
+  useEffect(() => {
+    wikiRealtimeDocIdRef.current = wikiRealtimeDocId;
+  }, [wikiRealtimeDocId]);
   /** Agent đang trả lời: POST /chat/typing + renew (TTL UI ~3.5s). */
   const agentTypingIntervalRef = useRef(null);
   const agentTypingSafetyTimerRef = useRef(null);
@@ -1361,6 +1386,25 @@ export default function App() {
     setStoryDetail(null);
     setComments([]);
   }, []);
+
+  const refreshStoryCommentsForSocket = useCallback(async (targetStoryId) => {
+    const sid = Number(targetStoryId);
+    if (!Number.isFinite(sid) || storyId !== sid) return;
+    try {
+      const rows = await apiGet(`/stories/${sid}/comments`);
+      setComments(Array.isArray(rows) ? rows : []);
+    } catch {
+      /* realtime path — không chặn UX */
+    }
+  }, [storyId]);
+
+  useEffect(() => {
+    refreshStoryCommentsForSocketRef.current = refreshStoryCommentsForSocket;
+  }, [refreshStoryCommentsForSocket]);
+
+  useEffect(() => {
+    if (mainTab !== "wiki") setWikiRealtimeDocId(null);
+  }, [mainTab]);
 
   const closeProjectsHub = useCallback(() => setShowProjectsHub(false), []);
   const closeMasterDataHub = useCallback(() => {
@@ -1585,9 +1629,29 @@ export default function App() {
   );
 
   const onPickMention = useCallback((displayName) => {
-    const mentionToken = `@${mentionKeyFromName(displayName)}`;
-    setChatInput((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${mentionToken} `)));
+    setChatInput((prev) => {
+      const { next, caret } = replaceTrailingMention(prev, displayName);
+      if (next === prev) return prev;
+      chatCaretAfterMentionRef.current = caret;
+      return next;
+    });
   }, []);
+
+  useLayoutEffect(() => {
+    const caret = chatCaretAfterMentionRef.current;
+    if (caret == null) return;
+    chatCaretAfterMentionRef.current = null;
+    const el = chatTextareaRef.current;
+    if (!el || typeof el.setSelectionRange !== "function") return;
+    try {
+      el.focus({ preventScroll: false });
+      const len = el.value?.length ?? 0;
+      const p = Math.max(0, Math.min(caret, len));
+      el.setSelectionRange(p, p);
+    } catch {
+      /* ignore */
+    }
+  }, [chatInput]);
 
   useEffect(() => {
     if (!chatChannelItems.length) return;
@@ -2046,9 +2110,10 @@ export default function App() {
     [activeChatRoom, projectId, myChatUserId]
   );
 
-  const storyDrawerOpen = storyId != null;
+  /** Socket.IO chat-service: Chat tab, wiki (feedback), hoặc trang chi tiết story. */
+  const chatSocketShouldConnect = Boolean(projectId) && (mainTab === "chat" || mainTab === "wiki" || isStoryPage);
   useEffect(() => {
-    if (!projectId || (mainTab !== "chat" && !storyDrawerOpen)) return;
+    if (!chatSocketShouldConnect) return;
     const socket = io(CHAT_WS_NAMESPACE, { transports: ["websocket", "polling"] });
     chatSocketRef.current = socket;
     socket.on("connect", () => setChatConnected(true));
@@ -2068,27 +2133,18 @@ export default function App() {
     socket.on("chat:event", (evt) => {
       if (!evt || evt.type !== "event") return;
       const pid = Number(evt.projectId);
-      const sid = Number(evt.storyId);
-      if (pid !== projectIdRef.current || sid !== storyIdRef.current) return;
-      const et = evt.eventType;
-      const pl = evt.payload && typeof evt.payload === "object" ? evt.payload : {};
-      if (et === "story.comment.created") {
-        const c = pl.comment;
-        if (!c?.id) return;
-        setComments((prev) => {
-          if (prev.some((x) => x.id === c.id)) return prev;
-          const next = [...prev, c];
-          next.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-          return next;
-        });
-      } else if (et === "story.comment.updated") {
-        const c = pl.comment;
-        if (!c?.id) return;
-        setComments((prev) => prev.map((x) => (x.id === c.id ? c : x)));
-      } else if (et === "story.comment.deleted") {
-        const cid = Number(pl.comment_id);
-        if (!Number.isFinite(cid)) return;
-        setComments((prev) => prev.filter((x) => x.id !== cid));
+      if (pid !== projectIdRef.current) return;
+      const et = String(evt.eventType || "");
+      if (et.startsWith("story.comment.")) {
+        const sid = Number(evt.storyId);
+        if (!Number.isFinite(sid) || sid !== storyIdRef.current) return;
+        refreshStoryCommentsForSocketRef.current?.(sid);
+        return;
+      }
+      if (et.startsWith("wiki.comment.")) {
+        const docId = String(evt.docId || "").trim();
+        if (!docId || docId !== wikiRealtimeDocIdRef.current) return;
+        setWikiRealtimeCommentsBump((n) => n + 1);
       }
     });
     socket.on("chat:messageDeleted", (payload) => {
@@ -2132,17 +2188,27 @@ export default function App() {
       socket.disconnect();
       chatSocketRef.current = null;
     };
-  }, [mainTab, projectId, storyDrawerOpen]);
+  }, [chatSocketShouldConnect, projectId]);
 
   useEffect(() => {
     const sock = chatSocketRef.current;
-    if (!sock || !chatConnected || projectId == null || storyId == null) return;
+    if (!sock || !chatConnected || projectId == null || storyId == null || !isStoryPage) return;
     const channelId = storyCommentsChannelId(projectId, storyId);
     sock.emit("chat:join", { channelId });
     return () => {
       sock.emit("chat:leave", { channelId });
     };
-  }, [projectId, storyId, chatConnected]);
+  }, [projectId, storyId, chatConnected, isStoryPage]);
+
+  useEffect(() => {
+    const sock = chatSocketRef.current;
+    if (!sock || !chatConnected || projectId == null || mainTab !== "wiki" || !wikiRealtimeDocId) return;
+    const channelId = `${projectId}_wiki_doc_${wikiRealtimeDocId}`;
+    sock.emit("chat:join", { channelId });
+    return () => {
+      sock.emit("chat:leave", { channelId });
+    };
+  }, [projectId, mainTab, wikiRealtimeDocId, chatConnected]);
 
   useEffect(() => {
     if (mainTab !== "chat") {
@@ -3829,6 +3895,7 @@ export default function App() {
                             <i className="bi bi-chat-text text-secondary" aria-hidden />
                           </span>
                           <textarea
+                            ref={chatTextareaRef}
                             className="form-control as-chat-textarea"
                             rows={2}
                             placeholder="Type your message... (Enter send, Shift+Enter newline)"
@@ -4211,6 +4278,8 @@ export default function App() {
                   projectId={projectId}
                   initialSlug={workspace?.wikiSlug != null ? workspace.wikiSlug : null}
                   setErr={setErr}
+                  onWikiDocRealtimeFocus={setWikiRealtimeDocId}
+                  wikiRealtimeCommentsBump={wikiRealtimeCommentsBump}
                 />
               )}
             </>

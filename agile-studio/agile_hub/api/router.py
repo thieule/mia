@@ -77,6 +77,10 @@ def _comment_out_json(db: Session, c: models.StoryComment) -> dict:
     return CommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json")
 
 
+def _wiki_comment_out_json(db: Session, row: models.WikiComment) -> dict:
+    return WikiCommentOut.model_validate(crud.wiki_comment_to_dict(db, row)).model_dump(mode="json")
+
+
 def _story_or_404(db: Session, story_id: int) -> models.Story:
     s = crud.story_get(db, story_id)
     if s is None:
@@ -793,8 +797,7 @@ def create_comment(
             ),
         },
     )
-    background_tasks.add_task(
-        chat_sync.notify_story_chat_event,
+    chat_sync.notify_story_chat_event(
         p.id,
         s.id,
         "story.comment.created",
@@ -842,8 +845,7 @@ def patch_comment(
                 ),
             },
         )
-        background_tasks.add_task(
-            chat_sync.notify_story_chat_event,
+        chat_sync.notify_story_chat_event(
             p.id,
             s.id,
             "story.comment.updated",
@@ -884,8 +886,7 @@ def delete_comment(
         changed_fields=["comment"],
         data={"project_id": p.id, "story_id": s.id, "story_key": st_key, "comment_id": cid},
     )
-    background_tasks.add_task(
-        chat_sync.notify_story_chat_event,
+    chat_sync.notify_story_chat_event(
         p.id,
         s.id,
         "story.comment.deleted",
@@ -1216,6 +1217,12 @@ def wiki_comments_create_route(
             db, project_id, doc, row, current.member_id,
         ),
     )
+    chat_sync.notify_wiki_doc_chat_event(
+        project_id,
+        doc_id,
+        "wiki.comment.created",
+        {"comment": _wiki_comment_out_json(db, row)},
+    )
     return WikiCommentOut.model_validate(crud.wiki_comment_to_dict(db, row))
 
 
@@ -1291,6 +1298,12 @@ def wiki_comments_patch_route(
             }
         ),
     )
+    chat_sync.notify_wiki_doc_chat_event(
+        project_id,
+        doc_id,
+        "wiki.comment.updated",
+        {"comment": _wiki_comment_out_json(db, row2)},
+    )
     return WikiCommentOut.model_validate(crud.wiki_comment_to_dict(db, row2))
 
 
@@ -1335,5 +1348,11 @@ def wiki_comments_delete_route(
             "author_member_id": current.member_id,
             "deleted_thread_root": was_root,
         },
+    )
+    chat_sync.notify_wiki_doc_chat_event(
+        project_id,
+        doc_id,
+        "wiki.comment.deleted",
+        {"comment_id": cid},
     )
     return Response(status_code=204)

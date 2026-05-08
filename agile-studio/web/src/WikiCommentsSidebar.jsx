@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { apiDelete, apiGet, apiPatch, apiPost, getStoredUser } from "./api.js";
-import { mentionKeyFromName } from "./mentionText.jsx";
+import { mentionKeyFromName, replaceTrailingMention } from "./mentionText.jsx";
 import { renderMarkdownWithMentions } from "./markdownWithMentions.jsx";
 import { buildWikiTextAnchor, resolveWikiTextAnchor } from "./wikiCommentAnchor.js";
 
@@ -68,6 +68,8 @@ export default function WikiCommentsSidebar({
   onCollapseSidebar,
   /** Refresh parent feedback badge (e.g. after create / edit / resolve). */
   onCommentsInvalidate,
+  /** Bumped qua socket `chat:event` (wiki.comment.*) để reload danh sách feedback. */
+  realtimeReloadSignal = 0,
 }) {
   const [comments, setComments] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -86,6 +88,10 @@ export default function WikiCommentsSidebar({
   setErrRef.current = setErr;
   /** Bumped on each load start; also bump after local mutations so stale in-flight GET cannot restore removed rows. */
   const loadGenRef = useRef(0);
+  const wikiNewBodyTaRef = useRef(null);
+  const wikiEditTaRef = useRef(null);
+  const pendingWikiNewCaretRef = useRef(null);
+  const pendingWikiEditCaretRef = useRef(null);
 
   useEffect(() => {
     if (!projectId) {
@@ -140,17 +146,54 @@ export default function WikiCommentsSidebar({
   }, [editDraft.text, mentionMembers]);
 
   const pickNewMention = useCallback((displayName) => {
-    const tok = `@${mentionKeyFromName(displayName)}`;
-    setNewBody((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${tok} `)));
+    setNewBody((prev) => {
+      const { next, caret } = replaceTrailingMention(prev, displayName);
+      if (next === prev) return prev;
+      pendingWikiNewCaretRef.current = caret;
+      return next;
+    });
   }, []);
 
   const pickEditMention = useCallback((displayName) => {
-    const tok = `@${mentionKeyFromName(displayName)}`;
-    setEditDraft((p) => ({
-      ...p,
-      text: p.text.replace(/(?:^|\s)@([^\s@]*)$/, (all) => all.replace(/@([^\s@]*)$/, `${tok} `)),
-    }));
+    setEditDraft((p) => {
+      const { next, caret } = replaceTrailingMention(p.text, displayName);
+      if (next === p.text) return p;
+      pendingWikiEditCaretRef.current = caret;
+      return { ...p, text: next };
+    });
   }, []);
+
+  useLayoutEffect(() => {
+    const c = pendingWikiNewCaretRef.current;
+    if (c == null) return;
+    pendingWikiNewCaretRef.current = null;
+    const el = wikiNewBodyTaRef.current;
+    if (!el || typeof el.setSelectionRange !== "function") return;
+    try {
+      el.focus({ preventScroll: false });
+      const len = el.value?.length ?? 0;
+      const p = Math.max(0, Math.min(c, len));
+      el.setSelectionRange(p, p);
+    } catch {
+      /* ignore */
+    }
+  }, [newBody]);
+
+  useLayoutEffect(() => {
+    const c = pendingWikiEditCaretRef.current;
+    if (c == null) return;
+    pendingWikiEditCaretRef.current = null;
+    const el = wikiEditTaRef.current;
+    if (!el || typeof el.setSelectionRange !== "function") return;
+    try {
+      el.focus({ preventScroll: false });
+      const len = el.value?.length ?? 0;
+      const p = Math.max(0, Math.min(c, len));
+      el.setSelectionRange(p, p);
+    } catch {
+      /* ignore */
+    }
+  }, [editDraft.text]);
 
   const load = useCallback(async () => {
     if (!projectId || !docId) return;
@@ -182,6 +225,12 @@ export default function WikiCommentsSidebar({
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (!realtimeReloadSignal) return;
+    load();
+    onCommentsInvalidate?.();
+  }, [realtimeReloadSignal, load, onCommentsInvalidate]);
 
   const threads = useMemo(() => {
     const flat = [...comments].sort(
@@ -456,6 +505,7 @@ export default function WikiCommentsSidebar({
               </div>
             ) : null}
             <textarea
+              ref={wikiEditTaRef}
               className="form-control form-control-sm"
               rows={4}
               value={editDraft.text}
@@ -695,6 +745,7 @@ export default function WikiCommentsSidebar({
           </div>
         ) : null}
         <textarea
+          ref={wikiNewBodyTaRef}
           className="form-control form-control-sm mb-2"
           rows={3}
           placeholder="Write feedback… (@mention)"

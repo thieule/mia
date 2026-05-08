@@ -78,6 +78,23 @@ Hoặc:
 `eventType`: `story.comment.created` | `story.comment.updated` | `story.comment.deleted`  
 (`deleted` dùng `payload.comment_id`.)
 
+### Wiki doc feedback broadcast (internal)
+
+`POST /api/chat/internal/wiki-doc-events/broadcast`
+
+```json
+{
+  "projectId": 1,
+  "docId": "uuid-doc",
+  "eventType": "wiki.comment.created",
+  "payload": { "comment": {} }
+}
+```
+
+`eventType`: `wiki.comment.created` | `wiki.comment.updated` | `wiki.comment.deleted` (`deleted`: `payload.comment_id`).
+
+Client join room `{projectId}_wiki_doc_{docId}` (virtual, `chat:join`).
+
 ## WebSocket (Socket.IO)
 
 Namespace: `/ws/chat`
@@ -90,8 +107,8 @@ Events:
 - server push:
   - `chat:message` (message payload)
   - `chat:event` — envelope realtime không lưu DB, luôn có `type: "event"`:
-    - `eventType`: `story.comment.created` | `story.comment.updated` | `story.comment.deleted`
-    - `projectId`, `storyId`, `payload`
+    - Story: `eventType` `story.comment.*`; `projectId`, `storyId`, `payload`
+    - Wiki doc: `eventType` `wiki.comment.*`; `projectId`, `docId`, `payload`
   - `chat:joined`, `chat:left`, `chat:sent`, `chat:error`
 
 Mỗi room tương ứng **1 channel** hoặc room ảo story như trên.

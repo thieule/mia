@@ -5,6 +5,7 @@ import { DeleteMessageQueryDto } from "./dto/delete-message-query.dto";
 import { EnsureDirectChannelsDto, EnsureProjectChannelsDto } from "./dto/ensure-direct.dto";
 import { ReactMessageDto } from "./dto/react-message.dto";
 import { StoryEventBroadcastDto } from "./dto/story-event-broadcast.dto";
+import { WikiDocEventBroadcastDto } from "./dto/wiki-doc-event-broadcast.dto";
 import { SendMessageDto } from "./dto/send-message.dto";
 import { TypingDto } from "./dto/typing.dto";
 import { ChatService } from "./chat.service";
@@ -83,6 +84,19 @@ export class ChatController {
       eventType: body.eventType,
       projectId: body.projectId,
       storyId: body.storyId,
+      payload: body.payload,
+    });
+    return { ok: true };
+  }
+
+  @Post("internal/wiki-doc-events/broadcast")
+  async broadcastWikiDocEvent(@Body() body: WikiDocEventBroadcastDto) {
+    const docId = (body.docId || "").trim();
+    this.chatGateway.broadcastWikiDocEvent(body.projectId, docId, {
+      type: "event",
+      eventType: body.eventType,
+      projectId: body.projectId,
+      docId,
       payload: body.payload,
     });
     return { ok: true };

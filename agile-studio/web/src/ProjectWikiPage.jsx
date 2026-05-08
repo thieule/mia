@@ -175,7 +175,14 @@ function WikiFolderNode({
 }
 
 /** Project Documentation / wiki: folder tree, list, search, edit, story links, wiki:slug. */
-export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
+export default function ProjectWikiPage({
+  projectId,
+  initialSlug,
+  setErr,
+  /** Truyền doc đang mở lên App để join Socket.IO room realtime feedback. */
+  onWikiDocRealtimeFocus,
+  wikiRealtimeCommentsBump = 0,
+}) {
   const navigate = useNavigate();
   const [libraryDocs, setLibraryDocs] = useState([]);
   /** When non-null, sidebar shows search hits instead of full library (still grouped by folder). */
@@ -279,6 +286,14 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
   useEffect(() => {
     loadLibraryDocs();
   }, [loadLibraryDocs]);
+
+  useEffect(() => {
+    if (!onWikiDocRealtimeFocus) return;
+    onWikiDocRealtimeFocus(selId ?? null);
+    return () => {
+      onWikiDocRealtimeFocus(null);
+    };
+  }, [selId, onWikiDocRealtimeFocus]);
 
   useEffect(() => {
     loadStories();
@@ -1098,6 +1113,7 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
               setErr={setErr}
               onCollapseSidebar={() => setWikiCommentsPanelOpen(false)}
               onCommentsInvalidate={invalidateWikiCommentBadge}
+              realtimeReloadSignal={wikiRealtimeCommentsBump}
             />
           </div>
         ) : null}
