@@ -602,6 +602,57 @@ class WikiDocSearchOut(BaseModel):
     results: list[WikiDocOut]
 
 
+class WikiCommentCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    content: str = Field(..., min_length=1)
+    parent_id: Optional[str] = None
+    quoted_comment_id: Optional[str] = Field(None, max_length=36)
+    quoted_text: Optional[str] = Field(None, max_length=12000)
+    quote: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    text_offset_start: Optional[int] = None
+    text_offset_end: Optional[int] = None
+
+
+class WikiCommentPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    content: Optional[str] = Field(None, min_length=1)
+    status: Optional[str] = Field(None, pattern="^(open|resolved)$")
+
+
+class WikiCommentCountOut(BaseModel):
+    """Message count for sidebar badge; plus root-thread tallies for this document."""
+
+    visible_count: int
+    open_thread_count: int = 0
+    resolved_thread_count: int = 0
+
+
+class WikiCommentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    doc_id: str
+    parent_id: Optional[str] = None
+    quoted_comment_id: Optional[str] = None
+    quoted_excerpt: Optional[str] = None
+    quoted_author_display_name: Optional[str] = None
+    author_member_id: int
+    author_display_name: str = ""
+    content: str
+    quote: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    text_offset_start: Optional[int] = None
+    text_offset_end: Optional[int] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
 # --- Auth (users + JWT) ---
 class UserRegister(BaseModel):
     email: EmailStr

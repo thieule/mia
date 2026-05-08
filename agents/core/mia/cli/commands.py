@@ -694,6 +694,15 @@ async def _cleanup_gateway_admin(runner) -> None:
         await runner.cleanup()
 
 
+def _gateway_verbose_stdlib_logging() -> None:
+    """DEBUG on root for troubleshooting; keep OpenAI/httpx/httpcore quiet — they log full bodies incl. tools[]."""
+    import logging
+
+    logging.basicConfig(level=logging.DEBUG)
+    for name in ("openai", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 @app.command()
 def gateway(
     port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
@@ -711,9 +720,7 @@ def gateway(
     from mia.session.manager import SessionManager
 
     if verbose:
-        import logging
-
-        logging.basicConfig(level=logging.DEBUG)
+        _gateway_verbose_stdlib_logging()
 
     cli_config = config
     config = _load_runtime_config(cli_config, workspace)

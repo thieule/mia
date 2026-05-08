@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from mia.utils.helpers import safe_filename, truncate_text
 from mia.working_queue.models import WorkingQueueTaskPayload
@@ -21,10 +22,15 @@ def _load_workspace_project_file(workspace: Path | None, filename: str) -> str |
     return path.read_text(encoding="utf-8").strip()
 
 
+_CHAT_HIST_MAX_TURNS = 44
+_CHAT_HIST_LINE_MAX = 480
+_CHAT_HIST_SUMMARY_MAX = 3600
+_CHAT_HIST_BLOCK_MAX = 9800
+
 _FALLBACK_AGILE_STUDIO_DATA_NOTIFICATION = """[Agile Studio — DATA NOTIFICATION]
 Workspace file missing: add `{subdir}/{filename}` under your agent workspace (same folder as SOUL.md).
 
-Rules: read Notification text and Context JSON (`event_type`, `data`, `recipient_hints`). Do **not** edit Agile stories, comments, or project settings unless the user **explicitly** asks or workspace approval rules apply. Do **not** call MCP `agile_chat_send` to **project group channels** (e.g. `general`) for automated status/data notifications — only story comments or your queue summary. For `agile_studio.comment.*`, reply **on the story** via MCP `agile_comment_create` when the comment asks something of you — do not rely on group chat alone. No large refactors from notifications alone.
+Rules: read Notification text and Context JSON (`event_type`, `data`, `recipient_hints`). Do **not** edit Agile stories, comments, or project settings unless the user **explicitly** asks or workspace approval rules apply. Do **not** call MCP `agile_chat_send` to **project group channels** (e.g. `general`) for automated status/data notifications — only story comments, **wiki doc feedback** (`agile_wiki_comment_create`), or your queue summary. For `agile_studio.comment.*`, reply **on the story** via MCP `agile_comment_create` when the comment asks something of you. For `wiki_comment_created` / `wiki_comment_updated` when you are @mentioned, reply **in the wiki doc feedback thread** via `agile_wiki_comment_create` with `parent_id=wiki_thread_root_id` from the payload — not `agile_comment_create`. No large refactors from notifications alone.
 """.format(subdir=_PROJECT_PROMPT_SUBDIR, filename=_AGILE_STUDIO_DATA_NOTIFICATION_FILE)
 
 
@@ -34,6 +40,39 @@ def _is_agile_studio_chat(task: WorkingQueueTaskPayload) -> bool:
         return True
     eb = (task.enqueued_by or "").strip()
     return eb.startswith("api-center:chat")
+
+
+def _format_agile_chat_history_block(chat: dict[str, Any]) -> str:
+    """Turn conversation_history (+ optional conversation_summary) into prompt text with size caps."""
+    summary_raw = str(chat.get("conversation_summary") or "").strip()
+    hist = chat.get("conversation_history")
+    chunks: list[str] = []
+    if summary_raw:
+        chunks.append(
+            "Older thread summary (optional; may be produced by the client or a future job):\n"
+            + truncate_text(summary_raw, _CHAT_HIST_SUMMARY_MAX)
+        )
+    if not isinstance(hist, list) or not hist:
+        return "\n\n".join(chunks).strip()
+    tail = hist[-_CHAT_HIST_MAX_TURNS:]
+    omitted = len(hist) - len(tail)
+    if omitted > 0:
+        chunks.append(f"(Skipped {omitted} older messages; recent turns only below.)")
+    parts: list[str] = []
+    for h in tail:
+        if not isinstance(h, dict):
+            continue
+        c = str(h.get("content") or "").strip()
+        if not c:
+            continue
+        who = str(h.get("sender_type") or "user")
+        parts.append(f"- ({who}) {truncate_text(c, _CHAT_HIST_LINE_MAX)}")
+    if parts:
+        body = "Recent conversation:\n" + "\n".join(parts)
+        if len(body) > _CHAT_HIST_BLOCK_MAX:
+            body = truncate_text(body, _CHAT_HIST_BLOCK_MAX).rstrip() + "\n… [history truncated]"
+        chunks.append(body)
+    return "\n\n".join(chunks).strip()
 
 
 def _build_agile_studio_chat_prompt(task: WorkingQueueTaskPayload) -> str:
@@ -51,29 +90,30 @@ def _build_agile_studio_chat_prompt(task: WorkingQueueTaskPayload) -> str:
     sender_name = str(sender.get("name") or "").strip()
     sender_id = str(sender.get("id") or "").strip()
 
-    hist_lines = ""
-    hist = chat.get("conversation_history")
-    if isinstance(hist, list) and hist:
-        tail = hist[-8:]
-        parts: list[str] = []
-        for h in tail:
-            if not isinstance(h, dict):
-                continue
-            c = str(h.get("content") or "").strip()
-            if not c:
-                continue
-            who = str(h.get("sender_type") or "user")
-            parts.append(f"- ({who}) {truncate_text(c, 600)}")
-        if parts:
-            hist_lines = "Recent conversation:\n" + "\n".join(parts) + "\n\n"
+    hist_lines = _format_agile_chat_history_block(chat)
+    if hist_lines:
+        hist_lines = hist_lines + "\n\n"
+
+    meta = ctx.get("_reply_meta") if isinstance(ctx.get("_reply_meta"), dict) else {}
+    parent_trace = str(meta.get("trace_id") or "").strip() or None
 
     lines: list[str] = [
         "[Agile Studio — chat project]",
-        "Only write the content of the reply message to display to the user (like a bubble chat).",
-        "Rules:",
-        "- Reply directly; use the same language as the user (e.g. if they write in Vietnamese, reply in Vietnamese).",
-        "- Do not describe the process, do not say things like «I responded in channel…», «I responded in channel…».",
-        "- Do not summarize the meta of what was done — only the assistant's dialogue.",
+        "You run in the **same tool-enabled loop** as the working queue: use MCP (Agile Studio), `working_queue_submit`, filesystem, etc. in this turn **before** the user sees your answer.",
+        "",
+        "Plan → act → (optional) enqueue:",
+        "- **Truth**: Do not invent wiki/story/doc facts. For audits, gap analysis, «what exists», or doc coverage — **read** via MCP / repo tools first; if tools are unavailable or fail, say so instead of listing made-up story numbers.",
+        "- **Scope**: If the ask needs multiple substantial steps (research several docs, edit wiki, implement code), outline a short ordered plan, **do** what fits this turn, then enqueue the rest with `working_queue_submit` using the same `project_id`, "
+        "`source_role` e.g. `agile_studio_chat_followup`, and `context_json` including "
+        '{"origin":"agile_studio_chat","parent_queue_task_id":"' + str(task.id) + '"'
+        + (',"parent_trace_id":"' + parent_trace + '"' if parent_trace else "")
+        + ',"step_index":1,"step_total":<number_of_steps>} (set step_index/step_total to match your plan). Each queued message must be **one concrete next action**.',
+        "- **Honesty**: Do not claim work is «done» or «updated» unless a tool actually performed it in this turn or a queued task id was created for tracked follow-up.",
+        "",
+        "Chat bubble (user-visible) rules:",
+        "- Same language as the user.",
+        "- Final channel text = plain assistant dialogue only (no JSON dump, no «system» preamble). You may still use tools in the same turn; the user only sees your **last** assistant message as the bubble.",
+        "- Avoid empty meta-phrases («I responded in channel…»). It is OK to briefly say you queued follow-up tasks or verified via tools.",
         "",
     ]
     if pname:
@@ -99,12 +139,14 @@ def _build_agile_studio_chat_prompt(task: WorkingQueueTaskPayload) -> str:
     lines.append(truncate_text(user_msg, 8000))
     lines.append("")
     if hist_lines:
-        lines.append(truncate_text(hist_lines, 6000))
+        lines.append(truncate_text(hist_lines, 10_000))
     mentions = chat.get("mentions")
     if isinstance(mentions, list) and mentions:
         lines.append(f"Mention: {', '.join(str(x) for x in mentions[:24])}")
         lines.append("")
-    lines.append("Your reply (only the message content, no title / no JSON frame):")
+    lines.append(
+        "Now: use tools as needed, then output **only** the user-visible chat reply (bubble text):"
+    )
     return "\n".join(lines)
 
 
@@ -151,6 +193,17 @@ def _build_agile_studio_data_notification_prompt(
     if event_type:
         lines.append(f"event_type: {event_type}")
         lines.append("")
+    if event_type in ("wiki_comment_created", "wiki_comment_updated"):
+        wd = data.get("wiki_document_id")
+        wr = data.get("wiki_thread_root_id")
+        if wd and wr:
+            lines.append(
+                f"Wiki feedback: doc_id={wd!r}, thread root for replies parent_id={wr!r}. "
+                "Use MCP `agile_wiki_comment_create(project_id, doc_id, author_member_id, content, parent_id=thread_root)`. "
+                "Optional: `quoted_comment_id` / `quoted_text`. List thread with `agile_wiki_comments_list`. "
+                "**Do not** use `agile_comment_create` (stories only)."
+            )
+            lines.append("")
     if event_type in ("agile_studio.comment.created", "agile_studio.comment.updated"):
         sid = data.get("story_id")
         if sid is not None:
@@ -200,15 +253,22 @@ def build_process_prompt(task: WorkingQueueTaskPayload, workspace: Path | None =
 
     lines2: list[str] = [
         "[Working queue — TASK] This item is **actionable work** to perform (as opposed to a short notification). Session is isolated from personal chat channels.",
+        "",
+        "Process:",
+        "1. **Plan** — If the task is broad, split it into ordered substeps (mental or short note).",
+        "2. **Decompose** — For steps you cannot finish in this run, enqueue them with `working_queue_submit` "
+        f'(same `project_id`, `source_role` describing handoff, `context_json` with '
+        f'{{"follows_queue_task_id":"{task.id}","step":n,"plan_note":"..."}}). One queue item = one clear action.',
+        "3. **Execute** — Complete what you can now using tools (MCP, repo, etc.).",
+        "4. **Report** — Summarize outcomes, list any new queue task ids, and do not claim work done without tool evidence.",
+        "",
     ]
     lines2 += _shared_meta_lines(task)
     lines2.append("")
     lines2.append("Task / message:")
     lines2.append(truncate_text(task.message, 120_000))
     lines2.append("")
-    lines2.append(
-        "Execute this task per workspace policy. Summarize what you did and any follow-ups at the end."
-    )
+    lines2.append("Execute per workspace policy and the process above.")
     return "\n".join(lines2)
 
 

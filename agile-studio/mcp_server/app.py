@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import urllib.error
@@ -25,6 +26,7 @@ def _load_dotenv_file() -> None:
 
 
 _load_dotenv_file()
+_log_mcp = logging.getLogger(__name__)
 _root_str = str(_ROOT)
 if _root_str not in sys.path:
     sys.path.insert(0, _root_str)
@@ -35,7 +37,7 @@ from mcp_server.jsonutil import json_out
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
-from agile_hub import chat_api_center_bridge, chat_sync, crud, models
+from agile_hub import api_center_notify, chat_api_center_bridge, chat_sync, crud, models
 from agile_hub.schemas import (
     CommentCreate,
     CommentOut,
@@ -58,6 +60,7 @@ from agile_hub.schemas import (
     WorkflowTemplateOut,
     WikiDocCreate,
     WikiDocPatch,
+    WikiCommentCreate,
     WikiDocSearchOut,
     WikiFolderCreate,
     WikiFolderOut,
@@ -97,7 +100,9 @@ mcp = FastMCP(
     port=_MCP_PORT,
     instructions="MCP access to Agile Studio DB (same schema as API). Set AGILE_DATABASE_URL environment variable. "
     "Comment needs author_member_id (member must be in project). No JWT required. "
-    "Wiki tools require project_id. Use agile_wiki_read_doc / agile_wiki_write_doc / agile_wiki_folder_tree / agile_wiki_folder_create / agile_wiki_semantic_search / agile_wiki_story_context. "
+    "Wiki tools require project_id. Use agile_wiki_read_doc / agile_wiki_write_doc / agile_wiki_comments_list / agile_wiki_comment_create "
+    "/ agile_wiki_folder_tree / agile_wiki_folder_create / agile_wiki_semantic_search / agile_wiki_story_context "
+    "(story context includes wiki_open_comment_threads per document). "
     "Releases: planning window via starts_at/ends_at (ISO-8601 or YYYY-MM-DD); if only starts_at is set, end is end-of-that-day (same as API).",
     streamable_http_path=_MCP_HTTP_PATH,
     stateless_http=_MCP_STATELESS,
@@ -1072,6 +1077,85 @@ def agile_wiki_read_doc(project_id: int, doc_id: str) -> str:
         return json_out(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
 
 
+def _opt_str(s: Optional[str]) -> Optional[str]:
+    t = (s or "").strip()
+    return t if t else None
+
+
+@mcp.tool()
+def agile_wiki_comments_list(project_id: int, doc_id: str, include_resolved: bool = False) -> str:
+    """Liệt kê feedback/comment của một wiki doc (REST tương đương GET .../comments). ``parent_id`` null = tin gốc luồng."""
+    pid = int(project_id or 0)
+    did = (doc_id or "").strip()
+    if pid <= 0 or not did:
+        return json_out({"error": "invalid_argument", "detail": "project_id and doc_id required"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        doc = crud.wiki_doc_get(db, did)
+        if doc is None or doc.project_id != pid:
+            return json_out({"error": "not_found", "doc_id": did})
+        rows = crud.wiki_comments_list_for_doc(db, did, include_resolved=bool(include_resolved))
+        items = [crud.wiki_comment_to_dict(db, r) for r in rows]
+        return json_out({"comments": items, "count": len(items)})
+
+
+@mcp.tool()
+def agile_wiki_comment_create(
+    project_id: int,
+    doc_id: str,
+    author_member_id: int,
+    content: str,
+    parent_id: Optional[str] = None,
+    quoted_comment_id: Optional[str] = None,
+    quoted_text: Optional[str] = None,
+) -> str:
+    """Tạo feedback hoặc reply trong wiki doc (in-doc comments). Áp đặt cùng quy tắc @mention và quote như API REST.
+    - ``parent_id``: UUID của **tin gốc** luồng (wiki_thread_root_id từ thông báo hoặc từ list).
+    - ``quoted_comment_id`` / ``quoted_text``: tuỳ chọn khi quote một comment khác trong luồng."""
+    pid = int(project_id or 0)
+    aid = int(author_member_id or 0)
+    did = (doc_id or "").strip()
+    ct = (content or "").strip()
+    if pid <= 0 or aid <= 0 or not did or not ct:
+        return json_out(
+            {"error": "invalid_argument", "detail": "project_id, doc_id, author_member_id, content required"},
+        )
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "project_not_found", "project_id": pid})
+        if aid not in crud.project_member_ids(db, pid):
+            return json_out({"error": "author_not_in_project", "author_member_id": aid})
+        doc = crud.wiki_doc_get(db, did)
+        if doc is None or doc.project_id != pid:
+            return json_out({"error": "not_found", "doc_id": did})
+        body = WikiCommentCreate(
+            content=ct,
+            parent_id=_opt_str(parent_id),
+            quoted_comment_id=_opt_str(quoted_comment_id),
+            quoted_text=_opt_str(quoted_text),
+        )
+        try:
+            row = crud.wiki_comment_create(db, doc, body, aid)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        try:
+            if api_center_notify.project_allows_api_center_event_fanout(p):
+                api_center_notify.run_fanout_for_agile_studio_event(
+                    project_id=pid,
+                    project_name=p.name,
+                    event_type="wiki_comment_created",
+                    summary=f'New wiki comment on «{doc.title}»',
+                    changed_fields=["wiki_comment"],
+                    data=api_center_notify.wiki_comment_webhook_data_dict(db, pid, doc, row, aid),
+                )
+        except Exception as ex:
+            _log_mcp.warning("wiki comment MCP fanout skipped: %s", ex)
+        return json_out(crud.wiki_comment_to_dict(db, row))
+
+
 def _parse_story_ids_csv(story_ids_csv: str, story_id: Optional[int]) -> list[int]:
     raw: list[int] = []
     for part in (story_ids_csv or "").split(","):
@@ -1234,7 +1318,7 @@ def agile_wiki_semantic_search(
 
 @mcp.tool()
 def agile_wiki_story_context(project_id: int, story_id: int, limit: int = 16) -> str:
-    """Context fetch (AC6): doc gắn story + semantic liên quan trong project. project_id bắt buộc."""
+    """Context fetch: doc gắn story + semantic liên quan; kèm các thread comment wiki đang ``open`` (root) theo từng doc."""
     pid = int(project_id or 0)
     sid = int(story_id or 0)
     if pid <= 0 or sid <= 0:
@@ -1245,6 +1329,13 @@ def agile_wiki_story_context(project_id: int, story_id: int, limit: int = 16) ->
             rows = crud.wiki_context_for_story(db, pid, sid, limit=lim)
         except ValueError as e:
             return json_out({"error": str(e)})
+        doc_ids = [str(r.get("id") or "") for r in rows if (r.get("id") or "").strip()]
+        summaries = (
+            crud.wiki_comments_open_summaries_for_docs(db, doc_ids, limit_per_doc=12) if doc_ids else {}
+        )
+        for r in rows:
+            did = str(r.get("id") or "")
+            r["wiki_open_comment_threads"] = summaries.get(did, [])
         return json_out({"results": rows})
 
 

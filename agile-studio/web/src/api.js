@@ -68,8 +68,16 @@ async function handleResponse(res, path, data) {
   return data;
 }
 
-export async function apiGet(path) {
-  const res = await fetch(`${API_BASE}${path}`, { headers: { ...authHeaders() } });
+/**
+ * @param {string} path
+ * @param {RequestInit} [fetchInit] extra fetch options (e.g. `{ cache: 'no-store' }` to avoid stale GET after mutations)
+ */
+export async function apiGet(path, fetchInit = {}) {
+  const { headers: extraHeaders = {}, ...rest } = fetchInit;
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...rest,
+    headers: { ...authHeaders(), ...extraHeaders },
+  });
   const data = await parseJson(res);
   return handleResponse(res, path, data);
 }

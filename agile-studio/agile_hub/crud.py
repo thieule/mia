@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from datetime import datetime, time
 from decimal import Decimal
 import re
@@ -29,6 +31,8 @@ from .schemas import (
     WikiFolderPatch,
     WikiDocCreate,
     WikiDocPatch,
+    WikiCommentCreate,
+    WikiCommentPatch,
 )
 
 _COMMENT_MENTION_RE = re.compile(r"@([A-Za-z0-9._-]+)")
@@ -137,6 +141,29 @@ def project_ai_agent_member_ids_map(db: Session, project_id: int) -> dict[str, i
         seen.add(aid.lower())
         out[aid] = int(mem.id)
     return out
+
+
+def recipient_hints_for_wiki_comment(
+    db: Session,
+    project_id: int,
+    doc: models.WikiDocument,
+    *,
+    comment_body: str,
+    author_member_id: int,
+) -> dict[str, Any]:
+    mentioned = mentioned_agent_ids_from_comment_body(db, project_id, comment_body)
+    excerpt = (comment_body or "").strip()
+    if len(excerpt) > 4000:
+        excerpt = excerpt[:3997] + "..."
+    return {
+        "mentioned_agent_ids": mentioned,
+        "comment_excerpt": excerpt,
+        "author_member_id": author_member_id,
+        "ai_member_ids_by_agent": project_ai_agent_member_ids_map(db, project_id),
+        "wiki_document_id": doc.id,
+        "wiki_doc_slug": doc.slug,
+        "wiki_doc_title": doc.title,
+    }
 
 
 def recipient_hints_for_story_comment(
@@ -1405,3 +1432,258 @@ def wiki_doc_to_out(
         "semantic_score": semantic_score,
         "embedding_dims": emb_len,
     }
+
+
+def _wiki_comment_strip_opt(s: str | None) -> str | None:
+    if s is None:
+        return None
+    t = s.strip()
+    return t if t else None
+
+
+def _wiki_comment_thread_root_id(db: Session, start_id: str) -> str | None:
+    cid = (start_id or "").strip()
+    if not cid:
+        return None
+    seen: set[str] = set()
+    while cid:
+        if cid in seen:
+            return None
+        seen.add(cid)
+        r = db.get(models.WikiComment, cid)
+        if r is None:
+            return None
+        if r.parent_id is None:
+            return r.id
+        cid = r.parent_id
+
+
+def _wiki_comment_quote_excerpt_snap(text: str, max_len: int = 480) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if len(t) > max_len:
+        return t[: max_len - 1] + "…"
+    return t
+
+
+def _quoted_selection_in_comment(fragment: str, full: str) -> bool:
+    """True if fragment appears as a contiguous span in full (whitespace-normalized)."""
+
+    def norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    f, g = norm(fragment), norm(full)
+    return bool(f) and f in g
+
+
+def wiki_comment_to_dict(db: Session, row: models.WikiComment) -> dict:
+    m = member_get(db, row.author_member_id)
+    name = (m.display_name or "").strip() if m else ""
+    return {
+        "id": row.id,
+        "doc_id": row.doc_id,
+        "parent_id": row.parent_id,
+        "quoted_comment_id": row.quoted_comment_id,
+        "quoted_excerpt": row.quoted_excerpt,
+        "quoted_author_display_name": row.quoted_author_display_name,
+        "author_member_id": row.author_member_id,
+        "author_display_name": name,
+        "content": row.content,
+        "quote": row.quote,
+        "prefix": row.prefix,
+        "suffix": row.suffix,
+        "text_offset_start": row.text_offset_start,
+        "text_offset_end": row.text_offset_end,
+        "status": row.status,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def wiki_comments_list_for_doc(db: Session, doc_id: str, *, include_resolved: bool = False) -> list[models.WikiComment]:
+    """Danh sách comment; ẩn cả subtree khi **root thread** có status resolved (unless include_resolved)."""
+    stmt = (
+        select(models.WikiComment)
+        .where(models.WikiComment.doc_id == doc_id)
+        .order_by(models.WikiComment.created_at.asc())
+    )
+    all_rows: list[models.WikiComment] = list(db.scalars(stmt).all())
+    if include_resolved:
+        return all_rows
+    by_id = {r.id: r for r in all_rows}
+    root_resolved: set[str] = set()
+    for r in all_rows:
+        if r.parent_id is None and str(r.status) == "resolved":
+            root_resolved.add(r.id)
+
+    def thread_root(r: models.WikiComment) -> models.WikiComment | None:
+        cur: models.WikiComment | None = r
+        seen: set[str] = set()
+        while cur is not None and cur.parent_id:
+            if cur.id in seen:
+                return None
+            seen.add(cur.id)
+            cur = by_id.get(cur.parent_id)
+        return cur
+
+    out: list[models.WikiComment] = []
+    for r in all_rows:
+        root = thread_root(r)
+        if root is None:
+            continue
+        if root.id in root_resolved:
+            continue
+        out.append(r)
+    return out
+
+
+def wiki_comments_visible_count(db: Session, doc_id: str) -> int:
+    """Count messages visible with default sidebar filter (resolved root threads hidden)."""
+    return len(wiki_comments_list_for_doc(db, doc_id, include_resolved=False))
+
+
+def wiki_comment_root_thread_counts(db: Session, doc_id: str) -> tuple[int, int]:
+    """Count feedback threads (root comments only): open vs resolved."""
+    wc = models.WikiComment
+    stmt = select(wc.status).where(wc.doc_id == doc_id, wc.parent_id.is_(None))
+    statuses = list(db.scalars(stmt).all())
+    resolved_n = sum(1 for s in statuses if str(s) == "resolved")
+    open_n = len(statuses) - resolved_n
+    return open_n, resolved_n
+
+
+def wiki_comment_create(
+    db: Session, doc: models.WikiDocument, body: WikiCommentCreate, author_member_id: int
+) -> models.WikiComment:
+    parent_key: str | None = None
+    if body.parent_id:
+        par = db.get(models.WikiComment, (body.parent_id or "").strip())
+        if par is None or par.doc_id != doc.id:
+            raise ValueError("invalid parent comment")
+        parent_key = par.id
+    content = (body.content or "").strip()
+    if not content:
+        raise ValueError("content required")
+    _validate_comment_mentions_in_project(db, doc.project_id, content)
+    qc: str | None
+    px: str | None
+    sx: str | None
+    ost: int | None
+    oen: int | None
+    if parent_key:
+        qc, px, sx, ost, oen = None, None, None, None, None
+    else:
+        qc = _wiki_comment_strip_opt(body.quote)
+        px = _wiki_comment_strip_opt(body.prefix)
+        sx = _wiki_comment_strip_opt(body.suffix)
+        ost, oen = body.text_offset_start, body.text_offset_end
+
+    q_snap_id: str | None = None
+    q_excerpt: str | None = None
+    q_author_snap: str | None = None
+    raw_qcid = _wiki_comment_strip_opt(body.quoted_comment_id)
+    if raw_qcid:
+        if not parent_key:
+            raise ValueError("quoted_comment_id is only allowed on thread replies")
+        qrow = db.get(models.WikiComment, raw_qcid)
+        if qrow is None or qrow.doc_id != doc.id:
+            raise ValueError("invalid quoted comment")
+        thr = _wiki_comment_thread_root_id(db, parent_key)
+        qthr = _wiki_comment_thread_root_id(db, raw_qcid)
+        if thr is None or qthr is None or thr != qthr:
+            raise ValueError("quoted comment must be in the same feedback thread")
+        qm = member_get(db, qrow.author_member_id)
+        q_author_snap = ((qm.display_name or "").strip() if qm else "") or f"Member {qrow.author_member_id}"
+        raw_sel = _wiki_comment_strip_opt(body.quoted_text)
+        if raw_sel:
+            if not _quoted_selection_in_comment(raw_sel, qrow.content or ""):
+                raise ValueError("quoted text must be selected from that comment")
+            q_excerpt = _wiki_comment_quote_excerpt_snap(raw_sel)
+        else:
+            q_excerpt = _wiki_comment_quote_excerpt_snap(qrow.content or "")
+        q_snap_id = raw_qcid
+
+    row = models.WikiComment(
+        id=str(uuid.uuid4()),
+        doc_id=doc.id,
+        parent_id=parent_key,
+        quoted_comment_id=q_snap_id,
+        quoted_excerpt=q_excerpt,
+        quoted_author_display_name=q_author_snap,
+        author_member_id=author_member_id,
+        content=content,
+        quote=qc,
+        prefix=px,
+        suffix=sx,
+        text_offset_start=ost,
+        text_offset_end=oen,
+        status="open",
+    )
+    db.add(row)
+    db.flush()
+    db.refresh(row)
+    return row
+
+
+def wiki_comment_patch(
+    db: Session, row: models.WikiComment, body: WikiCommentPatch
+) -> models.WikiComment:
+    data = body.model_dump(exclude_unset=True)
+    if "content" in data and data["content"] is not None:
+        c = str(data["content"]).strip()
+        if not c:
+            raise ValueError("content required")
+        did = getattr(row, "doc_id", None)
+        doc = wiki_doc_get(db, did) if did else None
+        if doc is None:
+            raise ValueError("document not found for comment")
+        _validate_comment_mentions_in_project(db, doc.project_id, c)
+        row.content = c
+    if "status" in data and data["status"] is not None:
+        row.status = str(data["status"])
+    db.add(row)
+    db.flush()
+    db.refresh(row)
+    return row
+
+
+def wiki_comment_delete(db: Session, row: models.WikiComment, *, editor_member_id: int) -> None:
+    if row.author_member_id != editor_member_id:
+        raise PermissionError("Only the author can delete this comment")
+    db.delete(row)
+    db.flush()
+
+
+def wiki_comments_open_summaries_for_docs(
+    db: Session,
+    doc_ids: list[str],
+    *,
+    limit_per_doc: int = 12,
+) -> dict[str, list[dict]]:
+    """Gợn mở rộng MCP: vài comment đang open theo tài liệu (theo doc_id)."""
+    if not doc_ids:
+        return {}
+    limit_per_doc = min(max(limit_per_doc, 1), 50)
+    uniq = list(dict.fromkeys([x for x in doc_ids if (x or "").strip()]))
+    if not uniq:
+        return {}
+    out: dict[str, list[dict]] = {did: [] for did in uniq}
+    wc = models.WikiComment
+    rows = list(
+        db.scalars(
+            select(wc)
+            .where(wc.doc_id.in_(uniq), wc.status == "open", wc.parent_id.is_(None))
+            .order_by(wc.doc_id.asc(), wc.created_at.desc())
+        ).all()
+    )
+    for r in rows:
+        if len(out[r.doc_id]) >= limit_per_doc:
+            continue
+        q = (r.quote or "").strip()
+        out[r.doc_id].append(
+            {
+                "id": r.id,
+                "content_excerpt": (r.content or "").strip()[:400],
+                "quote_excerpt": (q[:280] + "…") if len(q) > 280 else q,
+            }
+        )
+    return out

@@ -37,6 +37,7 @@ class Member(Base):
     user: Mapped[Optional["User"]] = relationship(back_populates="member", uselist=False)
     comments_authored: Mapped[list["StoryComment"]] = relationship(back_populates="author")
     story_assignments: Mapped[list["StoryAssignee"]] = relationship(back_populates="member", passive_deletes=True)
+    wiki_doc_comments_authored: Mapped[list["WikiComment"]] = relationship(back_populates="author")
 
 
 class User(Base):
@@ -342,6 +343,10 @@ class WikiDocument(Base):
         back_populates="document",
         cascade="all, delete-orphan",
     )
+    wiki_comments: Mapped[list["WikiComment"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
 
 
 class WikiDocumentStory(Base):
@@ -356,3 +361,46 @@ class WikiDocumentStory(Base):
 
     document: Mapped["WikiDocument"] = relationship(back_populates="story_links")
     story: Mapped["Story"] = relationship()
+
+
+class WikiComment(Base):
+    """Bình luận / thảo luận trong nội dung wiki (neo theo trích đoạn Markdown)."""
+
+    __tablename__ = "wiki_comments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    doc_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("wiki_documents.id", ondelete="CASCADE"), nullable=False
+    )
+    parent_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("wiki_comments.id", ondelete="CASCADE"), nullable=True
+    )
+    quoted_comment_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("wiki_comments.id", ondelete="SET NULL"), nullable=True
+    )
+    quoted_excerpt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    quoted_author_display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    author_member_id: Mapped[int] = mapped_column(MUInt, ForeignKey("members.id", ondelete="RESTRICT"), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    quote: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prefix: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    suffix: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    text_offset_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    text_offset_end: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
+    )
+
+    document: Mapped["WikiDocument"] = relationship(back_populates="wiki_comments")
+    author: Mapped["Member"] = relationship(back_populates="wiki_doc_comments_authored")
+    parent: Mapped[Optional["WikiComment"]] = relationship(
+        back_populates="replies",
+        remote_side=[id],
+        foreign_keys=lambda: [WikiComment.parent_id],
+    )
+    replies: Mapped[list["WikiComment"]] = relationship(
+        back_populates="parent",
+        foreign_keys=lambda: [WikiComment.parent_id],
+    )

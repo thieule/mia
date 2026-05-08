@@ -171,6 +171,7 @@ class WorkingQueueService:
             target_agent_id = str(meta.get("target_agent_id") or "").strip() or None
             trace_id = str(meta.get("trace_id") or wtask.id).strip()
             callback_api_url = meta.get("callback_api_url")
+            chat_sender = chat.get("sender")
             body: dict[str, Any] = {
                 "task_id": wtask.id,
                 "project_id": wtask.project_id,
@@ -181,6 +182,8 @@ class WorkingQueueService:
                 "content": (content or "")[:12000],
                 "delivery_kind": delivery_kind,
             }
+            if isinstance(chat_sender, dict):
+                body["sender"] = chat_sender
             if callback_api_url:
                 body["callback_api_url"] = callback_api_url
             try:

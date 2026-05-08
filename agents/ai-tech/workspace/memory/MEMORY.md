@@ -28,9 +28,27 @@ Use one block per project (fill from **Agile Studio MCP** or the user; do not ha
 
 Do **not** link or assume paths to Agile Studio sources in git — deployment may omit that tree. Reload from **MCP** + this file when unsure.
 
-## Project: Workflows Automation - Story ID 23
+## Project: Agile Studio
 
-- Design document: "Thiết kế kỹ thuật: Tự động hóa luồng việc (Workflows Automation)"
+- github_repository: thieule/tada-demo
+- documents_storage_path: docs/
+- GitHub access key: Renewed and connectivity verified via test branch.
+- Scope: Technical designs for all project stories (including #1-#9, #23, #24) are complete.
+- Storage Strategy: Git for Markdown source of truth; Elasticsearch for metadata and semantic search (standardized to 384 dimensions).
+- Technical Design Locations:
+    - Stories #1, #2, and #3: Stored in Git at `projects/agile-studio/docs/`.
+    - Story #6: Draft on Wiki (Neo4j/Graph-RAG), missing from Git. ADR Standard: `a42e7554-1533-4234-8521-63d742d4f40b`. Waiting for Mia BA's spec update.
+    - Story #9: In the Wiki but missing from Git.
+- Story Details:
+    - Story #3 (Roadmap/Gantt): Uses frappe-gantt with auto-scheduling.
+    - Story #9 (In-doc Commenting): Uses Text Anchoring (dom-anchor-text-quote) for position maintenance.
+    - Story #24 (Workflows Automation): Uses an IF-AND-THEN rule engine model.
+- API & Validation:
+    - Rules: Title length 5-255 chars, auto-generated kebab-case slugs.
+    - Error codes: DOC_NOT_FOUND, EMBEDDING_FAILURE, SYNC_CONFLICT.
+- Live MCP tool groups: Wiki, Agile, Collaboration, and Project/Member tools.
+- AI Insights: Monte Carlo simulations for forecasting; LLM-based sentiment analysis.
+- Knowledge Graph: MySQL for explicit links; Elasticsearch for semantic links.
 
 
 

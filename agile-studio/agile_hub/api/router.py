@@ -8,9 +8,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import api_center_client, chat_sync, crud, models
+from ..chat_api_center_bridge import merge_dispatch_payload_callback_url
 from ..api_center_urls import normalize_api_center_endpoints, normalize_websocket_url
 from .. import working_queue_webhook as wq_webhook
-from ..api_center_notify import forward_webhook_to_api_center, schedule_api_center_event_fanout
+from ..api_center_notify import (
+    forward_webhook_to_api_center,
+    schedule_api_center_event_fanout,
+    wiki_comment_webhook_data_dict,
+)
 from ..schemas import (
     CommentCreate,
     CommentOut,
@@ -50,6 +55,10 @@ from ..schemas import (
     WikiFolderPatch,
     WikiFolderTreeNode,
     WikiFolderTreeResponse,
+    WikiCommentCreate,
+    WikiCommentCountOut,
+    WikiCommentOut,
+    WikiCommentPatch,
 )
 from .deps import get_current_user, get_db
 
@@ -272,7 +281,7 @@ def api_center_chat_dispatch(body: ApiCenterChatDispatchIn, db: Session = Depend
     row = crud.api_center_connection_get(db)
     if row is None or not (row.session_key or "").strip():
         raise HTTPException(400, "API Center is not connected")
-    payload = body.model_dump(exclude_none=True)
+    payload = merge_dispatch_payload_callback_url(body.model_dump(exclude_none=True))
     if os.environ.get("AGILE_HUB_CHAT_DEBUG", "").strip().lower() in ("1", "true", "yes"):
         tid = payload.get("trace_id") or ""
         print(
@@ -1131,4 +1140,200 @@ def wiki_doc_delete(
     if doc is None or doc.project_id != project_id:
         raise HTTPException(404, "Document not found")
     crud.wiki_doc_delete(db, doc)
+    return Response(status_code=204)
+
+
+@router.get(
+    "/projects/{project_id}/docs/{doc_id}/comments",
+    response_model=list[WikiCommentOut],
+)
+def wiki_comments_list_route(
+    project_id: int,
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+    include_resolved: bool = False,
+) -> list[WikiCommentOut]:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    rows = crud.wiki_comments_list_for_doc(db, doc_id, include_resolved=include_resolved)
+    return [WikiCommentOut.model_validate(crud.wiki_comment_to_dict(db, r)) for r in rows]
+
+
+@router.get(
+    "/projects/{project_id}/docs/{doc_id}/comments/count",
+    response_model=WikiCommentCountOut,
+)
+def wiki_comments_count_route(
+    project_id: int,
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiCommentCountOut:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    n = crud.wiki_comments_visible_count(db, doc_id)
+    open_tc, resolved_tc = crud.wiki_comment_root_thread_counts(db, doc_id)
+    return WikiCommentCountOut(
+        visible_count=n,
+        open_thread_count=open_tc,
+        resolved_thread_count=resolved_tc,
+    )
+
+
+@router.post("/projects/{project_id}/docs/{doc_id}/comments", response_model=WikiCommentOut)
+def wiki_comments_create_route(
+    project_id: int,
+    doc_id: str,
+    body: WikiCommentCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiCommentOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    try:
+        row = crud.wiki_comment_create(db, doc, body, current.member_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=project_id,
+        project_name=p.name,
+        event_type="wiki_comment_created",
+        summary=f'New wiki comment on «{doc.title}»',
+        changed_fields=["wiki_comment"],
+        data=wiki_comment_webhook_data_dict(
+            db, project_id, doc, row, current.member_id,
+        ),
+    )
+    return WikiCommentOut.model_validate(crud.wiki_comment_to_dict(db, row))
+
+
+@router.patch(
+    "/projects/{project_id}/docs/{doc_id}/comments/{comment_id}",
+    response_model=WikiCommentOut,
+)
+def wiki_comments_patch_route(
+    project_id: int,
+    doc_id: str,
+    comment_id: str,
+    body: WikiCommentPatch,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> WikiCommentOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    row = db.get(models.WikiComment, comment_id)
+    if row is None or row.doc_id != doc_id:
+        raise HTTPException(404, "Comment not found")
+    patch_data = body.model_dump(exclude_unset=True)
+    if not patch_data:
+        raise HTTPException(400, "No fields to update")
+    if "status" in patch_data and row.parent_id is not None:
+        raise HTTPException(
+            400,
+            "Only the root message of a feedback thread can be resolved or reopened",
+        )
+    if "content" in patch_data:
+        if row.author_member_id != current.member_id:
+            raise HTTPException(403, "Only the author may edit this comment text")
+    try:
+        row2 = crud.wiki_comment_patch(db, row, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    extra_hints = (
+        crud.recipient_hints_for_wiki_comment(
+            db,
+            project_id,
+            doc,
+            comment_body=row2.content,
+            author_member_id=current.member_id,
+        )
+        if "content" in patch_data
+        else None
+    )
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=project_id,
+        project_name=p.name,
+        event_type="wiki_comment_updated",
+        summary=f'Wiki comment updated on «{doc.title}»',
+        changed_fields=list(patch_data.keys()),
+        data=(
+            dict(
+                **wiki_comment_webhook_data_dict(db, project_id, doc, row2, current.member_id),
+                status=row2.status,
+            )
+            if extra_hints is not None
+            else {
+                "wiki_document_id": doc.id,
+                "wiki_comment_id": row2.id,
+                "wiki_thread_root_id": row2.parent_id or row2.id,
+                "doc_slug": doc.slug,
+                "doc_title": doc.title,
+                "author_member_id": current.member_id,
+                "status": row2.status,
+                "content_preview": row2.content[:600],
+            }
+        ),
+    )
+    return WikiCommentOut.model_validate(crud.wiki_comment_to_dict(db, row2))
+
+
+@router.delete(
+    "/projects/{project_id}/docs/{doc_id}/comments/{comment_id}",
+    status_code=204,
+)
+def wiki_comments_delete_route(
+    project_id: int,
+    doc_id: str,
+    comment_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    doc = crud.wiki_doc_get(db, doc_id)
+    if doc is None or doc.project_id != project_id:
+        raise HTTPException(404, "Document not found")
+    row = db.get(models.WikiComment, comment_id)
+    if row is None or row.doc_id != doc_id:
+        raise HTTPException(404, "Comment not found")
+    cid = row.id
+    was_root = row.parent_id is None
+    try:
+        crud.wiki_comment_delete(db, row, editor_member_id=current.member_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from e
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=project_id,
+        project_name=p.name,
+        event_type="wiki_comment_deleted",
+        summary=f'Wiki comment deleted on «{doc.title}»',
+        changed_fields=["wiki_comment"],
+        data={
+            "wiki_document_id": doc.id,
+            "wiki_comment_id": cid,
+            "doc_slug": doc.slug,
+            "doc_title": doc.title,
+            "author_member_id": current.member_id,
+            "deleted_thread_root": was_root,
+        },
+    )
     return Response(status_code=204)

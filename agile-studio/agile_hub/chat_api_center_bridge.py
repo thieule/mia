@@ -19,6 +19,43 @@ from agile_hub import api_center_client, crud
 
 log = logging.getLogger(__name__)
 
+_AGENT_REPLY_PATH = "/api/v1/integrations/api-center/agent-reply"
+
+
+def hub_agent_reply_callback_url() -> str | None:
+    """Base URL Hub nhận POST từ API Center khi agent trả lời xong (working-queue async).
+
+    Ưu tiên ``AGILE_API_CENTER_CALLBACK_BASE_URL`` (public/internal URL mà api_center + gateway gọi được).
+    Nếu không set: suy ra từ ``listen_host`` / ``listen_port`` — host ``0.0.0.0`` được đổi thành ``127.0.0.1``.
+    """
+    explicit = (os.environ.get("AGILE_API_CENTER_CALLBACK_BASE_URL") or "").strip().rstrip("/")
+    if explicit:
+        base = explicit
+    else:
+        try:
+            from agile_hub.config import get_settings
+
+            s = get_settings()
+            host = str(s.listen_host or "127.0.0.1").strip()
+            if host in {"0.0.0.0", "::", "[::]"}:
+                host = "127.0.0.1"
+            base = f"http://{host}:{int(s.listen_port)}".rstrip("/")
+        except Exception:
+            base = "http://127.0.0.1:9120"
+    return f"{base}{_AGENT_REPLY_PATH}"
+
+
+def merge_dispatch_payload_callback_url(payload: dict[str, Any]) -> dict[str, Any]:
+    """Gắn ``callback_api_url`` mặc định để reply sau working-queue không bị mất khi chờ lâu."""
+    if not isinstance(payload, dict):
+        return payload
+    if str(payload.get("callback_api_url") or "").strip():
+        return payload
+    cb = hub_agent_reply_callback_url()
+    if cb:
+        payload["callback_api_url"] = cb
+    return payload
+
 
 def _mention_tokens(text: str) -> list[str]:
     out: list[str] = []
@@ -89,11 +126,12 @@ def _post_agent_reply_to_chat_service(
     agent_member_id: int,
     sender_name: str,
     content: str,
-) -> None:
+) -> bool:
+    """POST tin agent vào chat-service. Trả False khi không gửi được (caller phải báo lỗi, không giả 200 OK)."""
     base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
     if not base:
         log.warning("chat_api_center_bridge: AGILE_CHAT_SERVICE_URL unset, cannot post agent reply to chat")
-        return
+        return False
     tk = (target_kind or "").strip().lower()
     body: dict[str, Any] = {
         "projectId": int(project_id),
@@ -122,11 +160,15 @@ def _post_agent_reply_to_chat_service(
             if not (200 <= sc < 300):
                 raw = resp.read().decode("utf-8", errors="replace")[:400]
                 log.warning("chat_api_center_bridge: chat-service POST %s %s", sc, raw)
+                return False
+            return True
     except urllib.error.HTTPError as e:
         msg = e.read().decode("utf-8", errors="replace")[:500]
         log.warning("chat_api_center_bridge: chat-service HTTP %s: %s", e.code, msg)
+        return False
     except urllib.error.URLError as e:
         log.warning("chat_api_center_bridge: chat-service unreachable: %s", e.reason)
+        return False
 
 
 def _dispatch_sync(
@@ -177,6 +219,9 @@ def _dispatch_sync(
         "mentions": toks,
         "conversation_history": [],
     }
+    cb = hub_agent_reply_callback_url()
+    if cb:
+        payload["callback_api_url"] = cb
     try:
         out = api_center_client.chat_dispatch(row.endpoint, row.session_key or "", payload)
         log.debug(
@@ -203,7 +248,7 @@ def _dispatch_sync(
                 mem = crud.member_get(db, agent_mid)
                 dn = (getattr(mem, "display_name", None) or "").strip() if mem else ""
                 post_name = dn or sel_agent
-                _post_agent_reply_to_chat_service(
+                posted = _post_agent_reply_to_chat_service(
                     project_id=project_id,
                     target_kind=target_kind,
                     channel_name=channel_name,
@@ -213,6 +258,11 @@ def _dispatch_sync(
                     sender_name=post_name,
                     content=reply,
                 )
+                if not posted:
+                    log.warning(
+                        "chat_api_center_bridge: chat-service post failed after sync dispatch trace_id=%s",
+                        trace_id,
+                    )
             else:
                 log.warning(
                     "chat_api_center_bridge: no project member for selected_agent_id=%s",
@@ -313,7 +363,7 @@ def ingest_api_center_agent_reply(db: Session, body: dict[str, Any]) -> dict[str
         room_uid = _dm_room_user_id_from_pair(project_id, channel_id, human_sender_id)
         if room_uid <= 0:
             raise ValueError("invalid DM channel_id")
-        _post_agent_reply_to_chat_service(
+        posted = _post_agent_reply_to_chat_service(
             project_id=project_id,
             target_kind="private_user",
             channel_name=None,
@@ -323,6 +373,8 @@ def ingest_api_center_agent_reply(db: Session, body: dict[str, Any]) -> dict[str
             sender_name=sender_name,
             content=content,
         )
+        if not posted:
+            raise ValueError("chat-service refused or unreachable when posting DM reply")
         return {"ok": True, "routed": "private_user", "trace_id": body.get("trace_id")}
 
     m_pc = re.match(rf"^{project_id}_(.+)$", channel_id)
@@ -330,7 +382,7 @@ def ingest_api_center_agent_reply(db: Session, body: dict[str, Any]) -> dict[str
         rest = str(m_pc.group(1) or "").strip()
         if not rest or rest.startswith("dm_"):
             raise ValueError("invalid channel_id for project channel")
-        _post_agent_reply_to_chat_service(
+        posted = _post_agent_reply_to_chat_service(
             project_id=project_id,
             target_kind="project_channel",
             channel_name=rest,
@@ -340,6 +392,8 @@ def ingest_api_center_agent_reply(db: Session, body: dict[str, Any]) -> dict[str
             sender_name=sender_name,
             content=content,
         )
+        if not posted:
+            raise ValueError("chat-service refused or unreachable when posting channel reply")
         return {"ok": True, "routed": "project_channel", "trace_id": body.get("trace_id")}
 
     raise ValueError("channel_id format not recognized (expected {pid}_dm_a_b or {pid}_channelName)")

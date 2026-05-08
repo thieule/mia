@@ -380,6 +380,10 @@ async def _enqueue_agent_chat_task_direct(
         f"- message: {message}\n"
         "Please reply briefly, contextually correct, and suggest the next step if needed."
     )
+    cb_raw = str(payload.get("callback_api_url") or "").strip()
+    if not cb_raw:
+        cb_raw = (os.environ.get("API_CENTER_AGILE_REPLY_URL") or "").strip()
+    callback_url = cb_raw if cb_raw else None
     return await _enqueue_agent_queue_item_direct(
         agent=agent,
         project_id=project_id,
@@ -406,7 +410,7 @@ async def _enqueue_agent_chat_task_direct(
             "_reply_meta": {
                 "trace_id": trace_id,
                 "target_agent_id": agent_id,
-                "callback_api_url": payload.get("callback_api_url"),
+                "callback_api_url": callback_url,
             },
         },
         item_kind="task",
@@ -825,11 +829,28 @@ def _build_notification_message(payload: dict[str, Any], agent_id: str) -> str:
                 )
     lines.append("")
     data_story_id = data.get("story_id")
+    wiki_doc_id = data.get("wiki_document_id") or data.get("doc_id")
+    wiki_root = data.get("wiki_thread_root_id") or data.get("parent_comment_id")
+    wiki_events = {"wiki_comment_created", "wiki_comment_updated"}
     comment_events = {
         "agile_studio.comment.created",
         "agile_studio.comment.updated",
     }
-    if event_type in comment_events and data_story_id is not None:
+    if event_type in wiki_events and wiki_doc_id:
+        lines.append(
+            "Wiki document feedback (@mention thread): **post your answer in the same doc feedback thread** using MCP "
+            "`agile_wiki_comment_create(project_id, doc_id, author_member_id, content=…)`. "
+            f"- project_id={project_id or '(from payload)'} "
+            f"- doc_id={wiki_doc_id!r} (wiki document UUID) "
+            f"- parent_id={wiki_root!r} (**thread root** id — use exactly this UUID so the reply nests under "
+            "the correct feedback thread; it is wiki_thread_root_id from the payload)."
+            " Optionally `quoted_comment_id` / `quoted_text` when quoting part of another message."
+            " List existing messages with `agile_wiki_comments_list(project_id, doc_id)` if needed."
+            " Use author_member_id from hints for your AI member."
+            " Do **not** use `agile_comment_create` (that is for **stories**, not wiki). "
+            "`agile_chat_send` to group **general** is discouraged for wiki feedback answers."
+        )
+    elif event_type in comment_events and data_story_id is not None:
         lines.append(
             "Story-comment thread: **reply on the story** using MCP "
             "`agile_comment_create(story_id, author_member_id, body=…)` "
@@ -1034,6 +1055,15 @@ async def _ingest_working_queue_chat_reply(payload: dict[str, Any]) -> dict[str,
             "delivery_kind": delivery_kind,
         }
     )
+    if mode == "none":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "agent_reply_not_delivered",
+                "delivery_status": status,
+                "hint": "Check API_CENTER_AGILE_REPLY_URL/TOKEN, Hub AGILE_AGENT_REPLY_TOKEN, and Hub→chat-service AGILE_CHAT_SERVICE_URL",
+            },
+        )
     return {"ok": True, "task_id": task_id, "delivery_mode": mode, "delivery_status": status}
 
 
@@ -1062,6 +1092,12 @@ async def _dispatch_reply(
     """
     Returns (delivery_mode, delivery_status)
     """
+    meta = reply_payload.get("metadata") if isinstance(reply_payload.get("metadata"), dict) else {}
+    # Hub không có route MCP ``/agent-chat/reply`` đầy đủ — webhook hoàn thành queue nên ưu tiên HTTP ``agent-reply``.
+    if meta.get("mode") == "working_queue_webhook":
+        ok_api, st_api = await _send_reply_via_api(reply_payload)
+        if ok_api:
+            return "api", st_api
     # MCP first
     if target_agent_id and target_agent_id in mcp_records and isinstance(mcp_records[target_agent_id], dict):
         ok, status = await _send_reply_via_mcp(mcp_records[target_agent_id], reply_payload)

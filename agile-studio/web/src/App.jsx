@@ -1,21 +1,13 @@
-import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import ReactMarkdown from "react-markdown";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
 import { io } from "socket.io-client";
 import { apiDelete, apiGet, apiPatch, apiPost, clearAuth, getStoredUser } from "./api.js";
 import KanbanBoard from "./KanbanBoard.jsx";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
-import { MarkdownPreviewPre } from "./markdownMermaidPreview.jsx";
+import { renderMarkdownWithMentions } from "./markdownWithMentions.jsx";
 import ProjectWikiPage from "./ProjectWikiPage.jsx";
 import StoryDocsTab from "./StoryDocsTab.jsx";
-import {
-  AgileMarkdownAnchor,
-  AgileMarkdownProjectContext,
-  agileMarkdownUrlTransform,
-  linkifyAgileStandaloneShortLinks,
-} from "./agileMarkdownLink.jsx";
+import { AgileMarkdownProjectContext } from "./agileMarkdownLink.jsx";
 import {
   loadNotifications,
   makeNotification,
@@ -24,18 +16,6 @@ import {
   saveNotifications,
   textMentionsDisplayName,
 } from "./notifications.js";
-
-/** LLM đôi khi dùng ¶ thay cho xuống dòng — đưa về newline để remark không lỗi cấu trúc. */
-function normalizeChatMarkdownSource(raw) {
-  let s = String(raw || "")
-    .replace(/\u00b6/g, "\n")
-    .replace(/\r\n/g, "\n");
-  // Literal `\n` / `\r` (two-char escapes from APIs or double-encoded JSON) → real newlines
-  if (s.includes("\\n") || s.includes("\\r")) {
-    s = s.replace(/\\r\\n/g, "\n").replace(/\\r/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
-  }
-  return s;
-}
 
 function formatChatMessageTime(iso) {
   if (!iso) return "";
@@ -46,79 +26,6 @@ function formatChatMessageTime(iso) {
   } catch {
     return "";
   }
-}
-
-/**
- * react-markdown có thể throw với một số chuỗi (bảng/list lỗi, ký tự lạ) — fallback plain text.
- */
-class ChatMarkdownErrorBoundary extends Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false };
-  }
-
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-
-  componentDidUpdate(prevProps) {
-    if (prevProps.source !== this.props.source) {
-      this.setState({ hasError: false });
-    }
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <pre className="mb-0 small as-chat-md-fallback" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-          {this.props.source}
-        </pre>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-/** Markdown trong bubble chat — link nội bộ SPA; ngoài app → tab mới; @mention tách khỏi MD. */
-const CHAT_MARKDOWN_COMPONENTS = {
-  a: AgileMarkdownAnchor,
-  pre: MarkdownPreviewPre,
-};
-
-/**
- * Markdown (GFM) + highlight @mention giống bubble chat — tách tại token @ để không làm hỏng parser.
- * mentionIndex: Map từ mentionKey (lowercase) → display name (như commentMentionIndex / chat mentionIndex).
- */
-function renderMarkdownWithMentions(content, mentionIndex) {
-  const idxMap = mentionIndex instanceof Map ? mentionIndex : new Map();
-  const normalized = normalizeChatMarkdownSource(content);
-  const parts = normalized.split(/(@[^\s@]+)/g);
-  return parts.map((p, idx) => {
-    if (!p.startsWith("@")) {
-      if (!p) return null;
-      const md = linkifyAgileStandaloneShortLinks(normalizeChatMarkdownSource(p));
-      return (
-        <div key={idx} className="as-chat-md as-md-prose-view">
-          <ChatMarkdownErrorBoundary source={md}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkBreaks]}
-              components={CHAT_MARKDOWN_COMPONENTS}
-              urlTransform={agileMarkdownUrlTransform}
-            >
-              {md}
-            </ReactMarkdown>
-          </ChatMarkdownErrorBoundary>
-        </div>
-      );
-    }
-    const key = p.slice(1).toLowerCase();
-    const matched = idxMap.has(key);
-    return (
-      <span key={idx} className={matched ? "as-chat-mention" : ""}>
-        {p}
-      </span>
-    );
-  });
 }
 
 const STORY_STATUSES = [
@@ -269,14 +176,21 @@ function findAgentForMentionToken(token, apiCenterAgents, projectMembers) {
   return null;
 }
 
-/** Ưu tiên mention theo thứ tự xuất hiện trong message. */
-function firstResolvedMentionedAgent(mentionMatches, apiCenterAgents, projectMembers) {
+/** Mọi agent được @ (không trùng id) — để group chat gọi được BA + Tech trong một tin. */
+function allResolvedMentionedAgents(mentionMatches, apiCenterAgents, projectMembers) {
+  const seen = new Set();
+  const out = [];
   for (const m of mentionMatches) {
     const a = findAgentForMentionToken(m, apiCenterAgents, projectMembers);
-    if (a) return a;
+    if (!a?.id || seen.has(a.id)) continue;
+    seen.add(a.id);
+    out.push(a);
   }
-  return null;
+  return out;
 }
+
+/** Gửi kèm queue chat; worker (prompt.py) sẽ cắt theo ngân sách ký tự. */
+const CHAT_DISPATCH_HISTORY_LIMIT = 48;
 
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1633,7 +1547,7 @@ export default function App() {
     requestAnimationFrame(() => {
       requestAnimationFrame(scrollToBottom);
     });
-  }, [mainTab, activeChatRoom?.channelId, chatMessagesByChannel]);
+  }, [mainTab, activeChatRoom?.channelId, chatMessagesByChannel, activeChatMessages.length, activeChatMessages.at(-1)?.id]);
 
   const mentionIndex = useMemo(() => {
     const map = new Map();
@@ -1885,7 +1799,7 @@ export default function App() {
         .replace(/[.,;:!?)\]]+$/g, "")
         .toLowerCase()
     );
-    const targetAgentFromMention = firstResolvedMentionedAgent(mentionMatches, apiCenterAgents, projectMembers);
+    const mentionedAgents = allResolvedMentionedAgents(mentionMatches, apiCenterAgents, projectMembers);
     const directAgentTarget =
       roomSnapshot.targetKind === "private_user"
         ? (() => {
@@ -1894,20 +1808,26 @@ export default function App() {
             return matchAgentIdToCatalog(String(row.member.agent_id || "").toLowerCase(), apiCenterAgents);
           })()
         : null;
-    const targetAgent = targetAgentFromMention || directAgentTarget;
-    const agentMemberForTyping = targetAgent
-      ? resolveAiMemberForAgentReply(projectMembers, targetAgent.id, apiCenterAgents)
+    const agentsToNotify =
+      roomSnapshot.targetKind === "private_user"
+        ? directAgentTarget
+          ? [directAgentTarget]
+          : mentionedAgents
+        : mentionedAgents;
+    const primaryAgent = agentsToNotify[0] || null;
+    const agentMemberForTyping = primaryAgent
+      ? resolveAiMemberForAgentReply(projectMembers, primaryAgent.id, apiCenterAgents)
       : null;
     chatDebug("onSendChatMessage", {
       mentionMatches,
-      targetAgentId: targetAgent?.id,
+      agentIds: agentsToNotify.map((a) => a.id),
       apiCenterConnected,
       channelId: roomSnapshot.channelId,
     });
     setChatInput("");
     emitTyping(false);
-    if (apiCenterConnected && targetAgent) {
-      const history = (chatMessagesByChannel[roomSnapshot.channelId] || []).slice(-8).map((m) => ({
+    if (apiCenterConnected && agentsToNotify.length > 0) {
+      const history = (chatMessagesByChannel[roomSnapshot.channelId] || []).slice(-CHAT_DISPATCH_HISTORY_LIMIT).map((m) => ({
         sender_id: String(m.senderUserId),
         sender_type: Number(m.senderUserId) === Number(myChatUserId) ? "human" : "agent",
         content: String(m.content || ""),
@@ -1916,8 +1836,7 @@ export default function App() {
       const fromStories = findStoryKeysFromLoadedStories(content, stories);
       const fromSlugPattern = findStoryKeysByProjectSlugPattern(content, selectedProject?.slug);
       const mentionedStoryKeys = [...new Set([...fromStories, ...fromSlugPattern])];
-      const dispatchPayload = {
-        trace_id: `tr_${Date.now()}`,
+      const baseDispatch = {
         project_id: String(projectId),
         project_context: {
           name: selectedProject?.name || `Project ${projectId}`,
@@ -1930,7 +1849,6 @@ export default function App() {
         sender: { id: String(myChatUserId || 0), name: myName },
         message: content,
         mentions: mentionMatches,
-        target_agent_id: String(targetAgent.id),
         conversation_history: history,
         ...(mentionedStoryKeys.length
           ? {
@@ -1942,6 +1860,7 @@ export default function App() {
             }
           : {}),
       };
+
       if (agentMemberForTyping?.member_id && userMessageId) {
         resetAgentProcessingUiImmediate();
         const aid = Number(agentMemberForTyping.member_id);
@@ -1950,9 +1869,10 @@ export default function App() {
           room: roomSnapshot,
           senderUserId: aid,
           senderName:
-            agentMemberForTyping.member?.display_name || targetAgent.name || String(targetAgent.id),
+            agentMemberForTyping.member?.display_name || primaryAgent.name || String(primaryAgent.id),
           viewerMemberId: myChatUserId,
         };
+        const firstTrace = `tr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
         agentUiLeadTimerRef.current = setTimeout(() => {
           agentUiLeadTimerRef.current = null;
           agentProcessingShownAtRef.current = Date.now();
@@ -1981,7 +1901,7 @@ export default function App() {
             reaction: "doing",
             action: "add",
           }).catch(() => {});
-          beginAgentTypingPulse(typingPayload, dispatchPayload.trace_id, stopAgentTypingIndicator);
+          beginAgentTypingPulse(typingPayload, firstTrace, stopAgentTypingIndicator);
         }, AGENT_CHAT_UI_LEAD_MS);
       } else if (agentMemberForTyping?.member_id) {
         startAgentTypingIndicator(
@@ -1990,43 +1910,59 @@ export default function App() {
             room: roomSnapshot,
             senderUserId: Number(agentMemberForTyping.member_id),
             senderName:
-              agentMemberForTyping.member?.display_name || targetAgent.name || String(targetAgent.id),
+              agentMemberForTyping.member?.display_name || primaryAgent.name || String(primaryAgent.id),
             viewerMemberId: myChatUserId,
           },
-          dispatchPayload.trace_id
+          `tr_${Date.now()}`
         );
       }
-      sendAgentDispatch(dispatchPayload)
-        .then(async ({ via, ack }) => {
-          chatDebug("dispatch settled", { via, should_respond: ack?.should_respond, reply_len: ack?.reply_text?.length });
-          if (via === "ws") return;
-          try {
-            if (!ack?.should_respond || !ack?.reply_text) return;
-            const agentMember = resolveAiMemberForAgentReply(projectMembers, targetAgent.id, apiCenterAgents);
-            if (!agentMember?.member_id) return;
-            const dmPeerUserId = dmPeerUserIdForAgentSend(roomSnapshot, agentMember.member_id, myChatUserId);
-            await fetch(`${CHAT_API_BASE}/chat/messages`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                projectId,
-                targetKind: roomSnapshot.targetKind,
-                channelName: roomSnapshot.channelName || undefined,
-                userId: dmPeerUserId,
-                senderUserId: Number(agentMember.member_id),
-                senderName: agentMember.member?.display_name || targetAgent.name || String(targetAgent.id),
-                content: String(ack.reply_text),
-              }),
+
+      let dispatchIndex = 0;
+      const dispatchOne = (targetAgent) => {
+        const trace_id = `tr_${Date.now()}_${dispatchIndex++}_${Math.random().toString(36).slice(2, 9)}`;
+        const dispatchPayload = {
+          ...baseDispatch,
+          trace_id,
+          target_agent_id: String(targetAgent.id),
+        };
+        return sendAgentDispatch(dispatchPayload)
+          .then(async ({ via, ack }) => {
+            chatDebug("dispatch settled", targetAgent.id, {
+              via,
+              should_respond: ack?.should_respond,
+              reply_len: ack?.reply_text?.length,
             });
-          } finally {
+            if (via === "ws") return;
+            try {
+              if (!ack?.should_respond || !ack?.reply_text) return;
+              const agentMember = resolveAiMemberForAgentReply(projectMembers, targetAgent.id, apiCenterAgents);
+              if (!agentMember?.member_id) return;
+              const dmPeerUserId = dmPeerUserIdForAgentSend(roomSnapshot, agentMember.member_id, myChatUserId);
+              await fetch(`${CHAT_API_BASE}/chat/messages`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  projectId,
+                  targetKind: roomSnapshot.targetKind,
+                  channelName: roomSnapshot.channelName || undefined,
+                  userId: dmPeerUserId,
+                  senderUserId: Number(agentMember.member_id),
+                  senderName: agentMember.member?.display_name || targetAgent.name || String(targetAgent.id),
+                  content: String(ack.reply_text),
+                }),
+              });
+            } finally {
+              stopAgentTypingIndicator();
+            }
+          })
+          .catch((err) => {
+            chatDebug("dispatch failed", targetAgent.id, err);
             stopAgentTypingIndicator();
-          }
-        })
-        .catch((err) => {
-          chatDebug("dispatch failed", err);
-          stopAgentTypingIndicator();
-        });
-    } else if (content.includes("@") && apiCenterConnected && !targetAgent) {
+          });
+      };
+
+      for (const a of agentsToNotify) void dispatchOne(a);
+    } else if (content.includes("@") && apiCenterConnected && agentsToNotify.length === 0) {
       chatDebug("mention nhưng không resolve được agent — kiểm tra catalog / member AI / @token");
     }
   }, [
@@ -2287,8 +2223,9 @@ export default function App() {
 
         const channelId = String(data?.channel_id || data?.channelId || "");
         const replyTrace = String(data?.trace_id || "").trim();
+        /** Multi-agent: mọi reply trên đúng channel đều tắt typing (trace chỉ gắn agent đầu). */
         const stopTypingIfOurReply = () => {
-          if (!replyTrace || replyTrace === agentTypingTraceRef.current) stopAgentTypingRef.current();
+          stopAgentTypingRef.current();
         };
 
         const content = String(data?.reply_text || data?.message || data?.content || "").trim();

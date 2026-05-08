@@ -21,6 +21,36 @@ from . import api_center_client, crud, models
 log = logging.getLogger(__name__)
 
 
+def wiki_comment_webhook_data_dict(
+    db: Session,
+    project_id: int,
+    doc: models.WikiDocument,
+    row: models.WikiComment,
+    author_member_id: int,
+) -> dict[str, Any]:
+    """Payload ``data`` for ``wiki_comment_*`` webhook / API Center (matches router fanout shape)."""
+    return {
+        "wiki_document_id": doc.id,
+        "wiki_comment_id": row.id,
+        "wiki_thread_root_id": row.parent_id or row.id,
+        "doc_slug": doc.slug,
+        "doc_title": doc.title,
+        "author_member_id": author_member_id,
+        "content_preview": (row.content or "")[:600],
+        "quote_preview": (row.quote or "")[:400],
+        "parent_comment_id": row.parent_id,
+        "quoted_comment_id": getattr(row, "quoted_comment_id", None),
+        "quoted_excerpt_preview": ((getattr(row, "quoted_excerpt", None) or "")[:400]),
+        "recipient_hints": crud.recipient_hints_for_wiki_comment(
+            db,
+            project_id,
+            doc,
+            comment_body=row.content,
+            author_member_id=author_member_id,
+        ),
+    }
+
+
 def project_allows_api_center_event_fanout(p: models.Project) -> bool:
     raw = getattr(p, "settings_json", None)
     if not raw or not isinstance(raw, dict):
@@ -160,6 +190,28 @@ def run_fanout_for_agile_studio_event(
                     return
             else:
                 agent_ids = catalog_ids
+            et = (event_type or "").strip()
+            if et in {"wiki_comment_created", "wiki_comment_updated"}:
+                hints = data.get("recipient_hints") if isinstance(data.get("recipient_hints"), dict) else {}
+                menc_raw = hints.get("mentioned_agent_ids")
+                menc_l = (
+                    {str(x).strip().lower() for x in menc_raw if str(x).strip()}
+                    if isinstance(menc_raw, list)
+                    else set()
+                )
+                if not menc_l:
+                    log.debug(
+                        "api_center fanout: %s — no AI @mentions in wiki comment, skip agent dispatch",
+                        et,
+                    )
+                    return
+                agent_ids = [a for a in agent_ids if str(a).strip().lower() in menc_l]
+                if not agent_ids:
+                    log.info(
+                        "api_center fanout: %s — mentioned agents not in project/catalog, skip",
+                        et,
+                    )
+                    return
             payload = _fanout_payload(
                 project_id=project_id,
                 project_name=project_name or p.name,

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiGet } from "./api.js";
 
 function mdLinkLabel(raw) {
-  const s = String(raw ?? "").trim() || "Không tên";
+  const s = String(raw ?? "").trim() || "Untitled";
   return s.replace(/[\[\]]/g, "");
 }
 
@@ -18,7 +18,7 @@ function insertStoryMarkdown(story, textApi, close, execute) {
 
 function insertDocMarkdown(projectId, doc, textApi, close, execute) {
   if (!doc || !textApi || projectId == null) return;
-  const label = mdLinkLabel(doc.title || doc.slug || "Tài liệu");
+  const label = mdLinkLabel(doc.title || doc.slug || "Document");
   const slug = String(doc.slug || "").trim();
   if (!slug) return;
   const safeWikiSlug = /^[a-zA-Z0-9_-]+$/.test(slug);
@@ -94,110 +94,120 @@ function MarkdownInsertPopover({ close, execute, textApi, projectId }) {
 
   if (projectId == null) {
     return (
-      <div className="as-md-insert-popover small text-secondary border rounded shadow-sm bg-white">
-        Chọn project để chèn story hoặc tài liệu.
+      <div className="as-md-insert-popover as-md-insert-popover--panel">
+        <p className="as-md-insert-popover-empty mb-0">Select a project to insert Story or Wiki links.</p>
       </div>
     );
   }
 
   if (!textApi) {
     return (
-      <div className="as-md-insert-popover small text-secondary border rounded shadow-sm bg-white p-2">
-        Không có vùng soạn thảo — chỉ dùng khi đang chỉnh sửa Markdown.
+      <div className="as-md-insert-popover as-md-insert-popover--panel">
+        <p className="as-md-insert-popover-empty mb-0">Markdown editor area is not available.</p>
       </div>
     );
   }
 
   return (
-    <div className="as-md-insert-popover border rounded shadow-sm bg-white">
-      <div className="as-md-insert-popover-hd small fw-semibold text-secondary px-2 pt-2 pb-1">Chèn liên kết</div>
-      <input
-        type="search"
-        className="form-control form-control-sm mx-2 mb-2"
-        placeholder="Tìm theo tiêu đề, key, slug…"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        aria-label="Lọc story hoặc tài liệu"
-      />
-      <div className="btn-group btn-group-sm px-2 mb-2 w-100" role="group">
-        <button
-          type="button"
-          className={`btn btn-outline-secondary flex-grow-1 ${tab === "story" ? "active" : ""}`}
-          onClick={() => setTab("story")}
-        >
-          Story
-        </button>
-        <button
-          type="button"
-          className={`btn btn-outline-secondary flex-grow-1 ${tab === "document" ? "active" : ""}`}
-          onClick={() => setTab("document")}
-        >
-          Tài liệu
-        </button>
+    <div className="as-md-insert-popover as-md-insert-popover--panel" role="dialog" aria-label="Insert Story or Wiki link">
+      <div className="as-md-insert-popover-hd">
+        <span className="as-md-insert-popover-hd-title">
+          <i className="bi bi-link-45deg me-1" aria-hidden />
+          Insert link
+        </span>
+        <span className="as-md-insert-popover-hd-hint text-muted small">Stories & wiki docs</span>
       </div>
-      <div className="as-md-insert-list px-2 pb-2">
-        {loading ? (
-          <div className="small text-secondary py-2 text-center">
-            <span className="spinner-border spinner-border-sm me-2" role="status" />
-            Đang tải…
-          </div>
-        ) : err ? (
-          <div className="small text-danger py-1">{err}</div>
-        ) : tab === "story" ? (
-          filteredStories.length === 0 ? (
-            <div className="small text-secondary fst-italic py-1">Không có story.</div>
+      <div className="as-md-insert-popover-body">
+        <div className="as-md-insert-search-wrap">
+          <i className="bi bi-search as-md-insert-search-ico" aria-hidden />
+          <input
+            type="search"
+            className="form-control form-control-sm as-md-insert-search"
+            placeholder="Search by title, key, slug…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Filter stories and documents"
+          />
+        </div>
+        <div className="as-md-insert-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "story"}
+            className={`as-md-insert-tab ${tab === "story" ? "active" : ""}`}
+            onClick={() => setTab("story")}
+          >
+            <i className="bi bi-kanban me-1" aria-hidden />
+            Stories
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "document"}
+            className={`as-md-insert-tab ${tab === "document" ? "active" : ""}`}
+            onClick={() => setTab("document")}
+          >
+            <i className="bi bi-file-earmark-text me-1" aria-hidden />
+            Wiki
+          </button>
+        </div>
+        <div className="as-md-insert-list">
+          {loading ? (
+            <div className="as-md-insert-state">
+              <span className="spinner-border spinner-border-sm text-primary me-2" role="status" />
+              Loading…
+            </div>
+          ) : err ? (
+            <div className="as-md-insert-state text-danger">{err}</div>
+          ) : tab === "story" ? (
+            filteredStories.length === 0 ? (
+              <div className="as-md-insert-state text-muted fst-italic">No stories found.</div>
+            ) : (
+              <ul className="as-md-insert-ul">
+                {filteredStories.map((s) => (
+                  <li key={s.id}>
+                    <button
+                      type="button"
+                      className="as-md-insert-row as-md-insert-row--story"
+                      onClick={() => onPickStory(s)}
+                    >
+                      <span className="as-md-insert-row-meta">{s.story_key || `#${s.id}`}</span>
+                      <span className="as-md-insert-row-title">{s.title || "Untitled"}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )
+          ) : filteredDocs.length === 0 ? (
+            <div className="as-md-insert-state text-muted fst-italic">No wiki documents found.</div>
           ) : (
-            <ul className="list-unstyled mb-0 small">
-              {filteredStories.map((s) => (
-                <li key={s.id}>
+            <ul className="as-md-insert-ul">
+              {filteredDocs.map((d) => (
+                <li key={d.id}>
                   <button
                     type="button"
-                    className="btn btn-link btn-sm text-start text-body text-decoration-none p-1 w-100 as-md-insert-row"
-                    onClick={() => onPickStory(s)}
+                    className="as-md-insert-row as-md-insert-row--doc"
+                    onClick={() => onPickDoc(d)}
                   >
-                    <span className="font-monospace text-secondary me-1">{s.story_key || `#${s.id}`}</span>
-                    <span className="text-truncate d-inline-block align-bottom" style={{ maxWidth: "100%" }}>
-                      {s.title || "Untitled"}
-                    </span>
+                    <span className="as-md-insert-row-title">{d.title || "Untitled"}</span>
                   </button>
                 </li>
               ))}
             </ul>
-          )
-        ) : filteredDocs.length === 0 ? (
-          <div className="small text-secondary fst-italic py-1">Không có tài liệu.</div>
-        ) : (
-          <ul className="list-unstyled mb-0 small">
-            {filteredDocs.map((d) => (
-              <li key={d.id}>
-                <button
-                  type="button"
-                  className="btn btn-link btn-sm text-start text-body text-decoration-none p-1 w-100 as-md-insert-row"
-                  onClick={() => onPickDoc(d)}
-                >
-                  <span className="text-truncate d-inline-block align-bottom" style={{ maxWidth: "55%" }}>
-                    {d.title || "Untitled"}
-                  </span>
-                  <span className="font-monospace text-secondary ms-1 small text-truncate d-inline-block align-bottom">
-                    {d.slug ? `· ${d.slug}` : ""}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
 /**
- * Lệnh toolbar MDEditor: dropdown chèn markdown link story / wiki (chuẩn universal link).
+ * MDEditor toolbar command: dropdown to insert story / wiki Markdown links.
  */
 export function createMarkdownInsertCommands(projectId) {
   /**
-   * MDEditor chỉ render lệnh có keyCommand; lệnh có children (popover) bắt buộc dùng
-   * keyCommand "group" + groupName để barPopup[groupName] mở .w-md-editor-toolbar-child.
+   * MDEditor only renders commands with keyCommand; popover commands must use
+   * keyCommand "group" + groupName so barPopup[groupName] opens .w-md-editor-toolbar-child.
    */
   const cmd = {
     name: "insert-agile-link",
@@ -205,16 +215,18 @@ export function createMarkdownInsertCommands(projectId) {
     groupName: "agile-insert",
     execute: () => {},
     icon: (
-      <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-        <path
-          fill="currentColor"
-          d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"
-        />
-      </svg>
+      <span className="as-md-insert-toolbar-trigger">
+        <span className="as-md-insert-toolbar-trigger-icons" aria-hidden>
+          <i className="bi bi-kanban" />
+          <i className="bi bi-file-earmark-text" />
+        </span>
+        <span className="as-md-insert-toolbar-trigger-label">Story · Wiki</span>
+      </span>
     ),
     buttonProps: {
-      "aria-label": "Chèn liên kết story hoặc tài liệu",
-      title: "Chèn story / tài liệu",
+      className: "as-md-insert-toolbar-btn",
+      "aria-label": "Insert Story or Wiki link into Markdown",
+      title: "Insert Story / Wiki link",
     },
     children: ({ close, execute, textApi }) => (
       <MarkdownInsertPopover close={close} execute={execute} textApi={textApi} projectId={projectId} />

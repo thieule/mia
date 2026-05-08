@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
+import WikiCommentsSidebar from "./WikiCommentsSidebar.jsx";
 import { apiDelete, apiGet, apiPost, apiPut } from "./api.js";
 
 function sortIds(a, b) {
@@ -59,7 +60,6 @@ function WikiTreeDocRow({ doc, selId, onSelectDoc }) {
       </button>
       {keys.length ? (
         <div className="as-wiki-tree-doc-meta">
-          <span className="font-monospace text-truncate">{doc.slug}</span>
           <div className="as-wiki-story-chips as-wiki-story-chips--compact">
             {keys.slice(0, 3).map((k) => (
               <span key={k} className="as-wiki-chip">
@@ -69,11 +69,7 @@ function WikiTreeDocRow({ doc, selId, onSelectDoc }) {
             {keys.length > 3 ? <span className="as-wiki-chip as-wiki-chip-more">+{keys.length - 3}</span> : null}
           </div>
         </div>
-      ) : (
-        <div className="as-wiki-tree-doc-meta">
-          <span className="font-monospace text-truncate">{doc.slug}</span>
-        </div>
-      )}
+      ) : null}
     </li>
   );
 }
@@ -208,6 +204,40 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  /** In-doc feedback: Markdown selection + anchored range focus. */
+  const [wikiMdSelection, setWikiMdSelection] = useState(null);
+  const [wikiSelFocus, setWikiSelFocus] = useState(null);
+  /** Wider editor when false (lg+); mobile toggles stacked feedback panel. */
+  const [wikiCommentsPanelOpen, setWikiCommentsPanelOpen] = useState(false);
+  /** Left: folder tree + document list (lg+ slide; mobile hide block). */
+  const [wikiLibraryOpen, setWikiLibraryOpen] = useState(true);
+  /** Feedback count (default sidebar filter); bump revision after sidebar mutations. */
+  const [wikiCommentBadgeCount, setWikiCommentBadgeCount] = useState(null);
+  const [wikiCommentCountRevision, setWikiCommentCountRevision] = useState(0);
+  const invalidateWikiCommentBadge = useCallback(() => {
+    setWikiCommentCountRevision((n) => n + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!projectId || !selId) {
+      setWikiCommentBadgeCount(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await apiGet(`/projects/${projectId}/docs/${selId}/comments/count`, { cache: "no-store" });
+        if (cancelled) return;
+        const n = r?.visible_count;
+        setWikiCommentBadgeCount(typeof n === "number" ? n : null);
+      } catch {
+        if (!cancelled) setWikiCommentBadgeCount(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, selId, wikiCommentCountRevision]);
 
   const loadStories = useCallback(async () => {
     if (!projectId) return;
@@ -306,6 +336,8 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
   const applyDoc = useCallback(
     (d, { syncUrl = true } = {}) => {
       if (!d) return;
+      setWikiMdSelection(null);
+      setWikiSelFocus(null);
       setSelId(d.id);
       setTitle(d.title || "");
       setBody(d.content || "");
@@ -347,7 +379,7 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     };
   }, [projectId, initialSlug, applyDoc, setErr]);
 
-  /** Story » Docs "New document": location.state.createDocForStoryId + nonce → tạo doc có story_ids, mở editor. */
+  /** Story » Docs "New document": location.state.createDocForStoryId + nonce → create doc with story_ids and open editor. */
   useEffect(() => {
     if (!projectId) return;
     const raw = location.state?.createDocForStoryId;
@@ -574,6 +606,9 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     if (!window.confirm("Delete this document?")) return;
     try {
       await apiDelete(`/projects/${projectId}/docs/${selId}`);
+      setWikiMdSelection(null);
+      setWikiSelFocus(null);
+      setWikiCommentsPanelOpen(false);
       setSelId(null);
       lastSavedRef.current = {
         title: "",
@@ -598,6 +633,17 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
     return tree.find((x) => x.id === selId) ?? null;
   }, [selId, libraryDocs, docsForTree]);
 
+  const mainColClass = useMemo(() => {
+    const lib = wikiLibraryOpen;
+    if (!selId) {
+      return lib ? "col-lg-8 col-xl-8" : "col-lg-12 col-xl-12";
+    }
+    if (wikiCommentsPanelOpen) {
+      return lib ? "col-lg-5 col-xl-5" : "col-lg-9 col-xl-9";
+    }
+    return lib ? "col-lg-8 col-xl-8" : "col-lg-12 col-xl-12";
+  }, [selId, wikiCommentsPanelOpen, wikiLibraryOpen]);
+
   return (
     <div className="as-wiki-page">
       <header className="as-wiki-header as-page-head d-flex flex-wrap justify-content-between align-items-start gap-3 mb-3">
@@ -617,11 +663,40 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
         ) : null}
       </header>
 
-      <div className="as-wiki-workbench">
+      <div className={`as-wiki-workbench position-relative ${wikiLibraryOpen ? "" : "as-wiki-library-collapsed"}`}>
+        {!wikiLibraryOpen ? (
+          <button
+            type="button"
+            className="btn btn-sm btn-light border as-wiki-library-reveal"
+            onClick={() => setWikiLibraryOpen(true)}
+            title="Show library"
+            aria-label="Show document library"
+          >
+            <i className="bi bi-chevron-double-right" aria-hidden />
+          </button>
+        ) : null}
         <div className="row g-0 as-wiki-grid">
-        <div className="col-12 col-lg-4 col-xl-4 order-1 as-wiki-col as-wiki-col--nav">
+        <div
+          className={`order-1 as-wiki-col as-wiki-col--nav ${
+            wikiLibraryOpen
+              ? "col-12 col-lg-4 col-xl-4"
+              : "col-12 d-none d-lg-block as-wiki-col--nav-collapsed"
+          }`}
+        >
           <aside className="as-wiki-sidebar h-100">
             <div className="as-wiki-sidebar-toolbar">
+              <div className="as-wiki-sidebar-top-actions d-flex justify-content-end align-items-center mb-2">
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline-secondary as-wiki-library-toggle border-0 shadow-none text-body-secondary"
+                  aria-pressed={wikiLibraryOpen}
+                  onClick={() => setWikiLibraryOpen((v) => !v)}
+                  title={wikiLibraryOpen ? "Hide library (folders & documents)" : "Show library"}
+                  aria-label={wikiLibraryOpen ? "Hide document library sidebar" : "Show document library sidebar"}
+                >
+                  <i className={`bi ${wikiLibraryOpen ? "bi-layout-sidebar-inset-reverse" : "bi-layout-sidebar"}`} aria-hidden />
+                </button>
+              </div>
               <div className="input-group as-wiki-search-group mb-3">
                 <input
                   type="search"
@@ -753,19 +828,48 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
           </aside>
         </div>
 
-        <div className="col-12 col-lg-8 col-xl-8 order-2 as-wiki-col as-wiki-col--main">
+        <div
+          className={`col-12 order-2 as-wiki-col as-wiki-col--main as-wiki-main-resize ${mainColClass}`}
+        >
           <main className="as-wiki-editor-wrap as-wiki-editor-wrap--main h-100">
             {selId ? (
               <>
                 <div className="as-wiki-editor-toolbar">
-                  <div className="as-wiki-title-row mb-0">
-                    <input
-                      className="form-control form-control-lg as-wiki-title-input w-100"
-                      value={title}
-                      onChange={(e) => setTitle(e.target.value)}
-                      placeholder="Document title"
-                      aria-label="Document title"
-                    />
+                  <div className="d-flex flex-wrap flex-lg-nowrap align-items-start gap-2 w-100 mb-0">
+                    <div className="flex-grow-1 min-w-0 as-wiki-title-row mb-0">
+                      <input
+                        className="form-control form-control-lg as-wiki-title-input w-100"
+                        value={title}
+                        onChange={(e) => setTitle(e.target.value)}
+                        placeholder="Document title"
+                        aria-label="Document title"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-light border-0 shadow-none as-wiki-comments-toggle flex-shrink-0 position-relative text-body-secondary"
+                      aria-pressed={wikiCommentsPanelOpen}
+                      aria-label={
+                        wikiCommentsPanelOpen
+                          ? "Hide feedback"
+                          : `Show feedback${wikiCommentBadgeCount != null ? ` (${wikiCommentBadgeCount})` : ""}`
+                      }
+                      title={wikiCommentsPanelOpen ? "Hide feedback" : "Show feedback"}
+                      onClick={() => setWikiCommentsPanelOpen((o) => !o)}
+                    >
+                      <i className={`bi ${wikiCommentsPanelOpen ? "bi-layout-sidebar-inset-reverse" : "bi-chat-left-text"}`} aria-hidden />
+                      <span className="d-none d-sm-inline ms-1">Feedback</span>
+                      {wikiCommentBadgeCount != null ? (
+                        <span
+                          className={`badge rounded-pill ms-1 as-wiki-comments-badge ${
+                            wikiCommentBadgeCount > 0 ? "text-bg-secondary" : "text-bg-light text-muted border"
+                          }`}
+                          aria-hidden
+                        >
+                          {wikiCommentBadgeCount > 99 ? "99+" : wikiCommentBadgeCount}
+                        </span>
+                      ) : null}
+                    </button>
                   </div>
                 </div>
 
@@ -777,6 +881,22 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                     previewMode="live"
                     insertToolbar
                     projectId={projectId}
+                    selectionFocus={wikiSelFocus}
+                    onSelectionFocusDone={() => setWikiSelFocus(null)}
+                    textareaProps={{
+                      onSelect: (ev) => {
+                        const ta = ev.target;
+                        if (!ta || typeof ta.selectionStart !== "number") return;
+                        const a = ta.selectionStart;
+                        const b = ta.selectionEnd;
+                        if (a === b) return;
+                        setWikiMdSelection({
+                          start: a,
+                          end: b,
+                          text: ta.value.slice(a, b),
+                        });
+                      },
+                    }}
                   />
 
                   <div className="as-wiki-editor-meta-row d-flex flex-wrap align-items-center gap-2 mt-3 pt-3">
@@ -807,9 +927,6 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                   >
                     <div className="as-wiki-link-section-hd" id="wiki-story-links-label">
                       <span className="as-wiki-link-label">Linked stories</span>
-                      <span className="as-wiki-link-hint">
-                        Search to add stories. They appear as tags; use × to remove a link.
-                      </span>
                     </div>
 
                     <div className="as-wiki-story-tags-bar" role="group" aria-label="Linked stories">
@@ -930,13 +1047,35 @@ export default function ProjectWikiPage({ projectId, initialSlug, setErr }) {
                   </div>
                   <p className="mb-2 fw-medium">Select a document or create a new one</p>
                   <p className="small text-secondary mb-0">
-                    Choose a document in the tree on the left, or create a new one.
+                    {wikiLibraryOpen
+                      ? "Choose a document in the tree on the left, or create a new one."
+                      : "Click the chevron on the left edge of the editor to show the library again."}
                   </p>
                 </div>
               </div>
             )}
           </main>
         </div>
+
+        {selId ? (
+          <div
+            className={`col-12 col-lg-3 col-xl-3 order-3 as-wiki-col as-wiki-col--comments d-flex flex-column min-h-0 as-wiki-comments-slide ${
+              wikiCommentsPanelOpen ? "" : "d-none"
+            }`}
+          >
+            <WikiCommentsSidebar
+              projectId={projectId}
+              docId={selId}
+              markdownBody={body}
+              mdSelection={wikiMdSelection}
+              onClearMdSelection={() => setWikiMdSelection(null)}
+              onFocusMarkdownRange={(a, b) => setWikiSelFocus({ start: a, end: b })}
+              setErr={setErr}
+              onCollapseSidebar={() => setWikiCommentsPanelOpen(false)}
+              onCommentsInvalidate={invalidateWikiCommentBadge}
+            />
+          </div>
+        ) : null}
         </div>
       </div>
     </div>

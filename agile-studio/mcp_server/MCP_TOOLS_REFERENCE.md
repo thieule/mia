@@ -362,6 +362,23 @@ Lưu vector embedding trong MySQL (`embedding_json`). Có thể trỏ `AGILE_EMB
 ### `agile_wiki_list_docs(project_id, story_id=None, in_folder_id=None, unfiled_only=False, q="", limit=50)`
 - Liệt kê / lọc theo `story_id`, từ khóa `q`, và hoặc `in_folder_id` (doc trong thư mục đó) hoặc `unfiled_only` (không thư mục) — không dùng đồng thời `in_folder_id` với `unfiled_only`.
 
+### `agile_wiki_comments_list(project_id, doc_id, include_resolved=False)`
+- Feedback trong wiki doc (cùng nghiệp vụ với REST GET `.../docs/{doc_id}/comments`).
+- **Params**: `project_id`, `doc_id` (UUID doc); `include_resolved` giống query API.
+- **Response success**: `{ "comments": WikiCommentDict[], "count": number }` — mỗi phần tử có `id`, `parent_id`, `content`, v.v. (shape từ `wiki_comment_to_dict`).
+
+### `agile_wiki_comment_create(project_id, doc_id, author_member_id, content, parent_id=None, quoted_comment_id=None, quoted_text=None)`
+- Tạo feedback gốc hoặc reply trong luồng (cùng quy tắc @mention / quote như REST).
+- **Params**:
+  - `author_member_id`: member phải thuộc project (AI hoặc human).
+  - `parent_id`: khi **reply**, truyền UUID của **tin gốc luồng** (thread root), không phải reply trung gian — khớp field `wiki_thread_root_id` trong payload webhook/API Center nếu có.
+  - `quoted_comment_id` / `quoted_text`: tuỳ chọn (quote một comment trong luồng).
+- **Response success**: một object comment (WikiComment dict).
+- **Response error**: `invalid_argument`, `project_not_found`, `not_found`, `author_not_in_project`, hoặc message từ `ValueError` khi schema luồng không hợp lệ.
+- Sau khi tạo thành công, server có thể fanout `wiki_comment_created` tới API Center (nếu project bật); lỗi fanout không làm fail tool.
+
+**Lưu ý:** Comment **story** dùng `agile_comment_*`; feedback **wiki doc** dùng hai tool trên — không trộn.
+
 ---
 
 ## 10) Gợi ý chuẩn hoá khi gọi tool từ AI
