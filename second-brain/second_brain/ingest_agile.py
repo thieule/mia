@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from second_brain.commit_links import link_commit_tasks_and_stories
 from second_brain.es_store import delete_by_ref, index_chunk
 from second_brain.neo4j_store import node_ref, node_ref_slug, run_write
+
+_log = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -78,6 +82,132 @@ def apply_agile_event(payload: dict[str, Any]) -> dict[str, Any]:
         )
         _idx(ref=pref, label="Project", text=_iw(pid, summary, et, data), event_type=et)
         return {"ok": True, "event_type": et, "ref": pref}
+
+    if et == "agile_studio.project.updated":
+        pref = node_ref(project_id, "project", project_id)
+        name = str(payload.get("project_name") or data.get("name") or f"project-{project_id}")
+        run_write(
+            """
+            MERGE (p:Project {ref: $pref})
+            SET p.project_id = $project_id, p.name = $name, p.ingested_at = $ts
+            """,
+            {"pref": pref, "project_id": project_id, "name": name[:512], "ts": ts},
+        )
+        _idx(ref=pref, label="Project", text=_iw(project_id, summary, et, data), event_type=et)
+        return {"ok": True, "event_type": et, "ref": pref}
+
+    if et == "agile_studio.project.member_added":
+        mid = int(data.get("member_id") or 0)
+        if mid <= 0:
+            return {"ok": False, "error": "missing_member_id", "event_type": et}
+        pref = node_ref(project_id, "project", project_id)
+        mref = node_ref(project_id, "member", mid)
+        role = str(data.get("role") or "")[:64]
+        run_write(
+            """
+            MERGE (p:Project {ref: $pref})
+            SET p.project_id = $project_id, p.ingested_at = coalesce(p.ingested_at, $ts)
+            MERGE (m:Member {ref: $mref})
+            SET m.project_id = $project_id, m.agile_id = $mid, m.role = $role, m.ingested_at = $ts
+            MERGE (m)-[:MEMBER_OF]->(p)
+            """,
+            {"pref": pref, "mref": mref, "project_id": project_id, "mid": mid, "role": role, "ts": ts},
+        )
+        _idx(ref=mref, label="Member", text=_iw(project_id, summary, et, data), event_type=et)
+        return {"ok": True, "event_type": et, "ref": mref}
+
+    if et == "agile_studio.project.member_removed":
+        mid = int(data.get("member_id") or 0)
+        if mid <= 0:
+            return {"ok": False, "error": "missing_member_id", "event_type": et}
+        pref = node_ref(project_id, "project", project_id)
+        mref = node_ref(project_id, "member", mid)
+        run_write(
+            """
+            MATCH (m:Member {ref: $mref})-[r:MEMBER_OF]->(p:Project {ref: $pref})
+            WHERE m.project_id = $project_id AND p.project_id = $project_id
+            DELETE r
+            """,
+            {"mref": mref, "pref": pref, "project_id": project_id},
+        )
+        return {"ok": True, "event_type": et, "member_ref": mref}
+
+    if et == "agile_studio.release.created":
+        rid = int(data.get("release_id") or 0)
+        if rid <= 0:
+            return {"ok": False, "error": "missing_release_id", "event_type": et}
+        name = str(data.get("name") or "")[:512]
+        status = str(data.get("status") or "")[:64]
+        pref = node_ref(project_id, "project", project_id)
+        rref = node_ref(project_id, "release", rid)
+        run_write(
+            """
+            MERGE (p:Project {ref: $pref})
+            SET p.project_id = $project_id, p.ingested_at = coalesce(p.ingested_at, $ts)
+            MERGE (r:Release {ref: $rref})
+            SET r.project_id = $project_id, r.agile_id = $rid, r.name = $name, r.status = $status,
+                r.ingested_at = $ts
+            MERGE (p)-[:CONTAINS]->(r)
+            """,
+            {
+                "pref": pref,
+                "rref": rref,
+                "project_id": project_id,
+                "rid": rid,
+                "name": name,
+                "status": status,
+                "ts": ts,
+            },
+        )
+        _idx(ref=rref, label="Release", text=_iw(project_id, summary, et, data), event_type=et, status=status)
+        return {"ok": True, "event_type": et, "ref": rref}
+
+    if et == "agile_studio.release.updated":
+        rid = int(data.get("release_id") or 0)
+        if rid <= 0:
+            return {"ok": False, "error": "missing_release_id", "event_type": et}
+        pref = node_ref(project_id, "project", project_id)
+        rref = node_ref(project_id, "release", rid)
+        name = str(data.get("name") or "")[:512]
+        status = str(data.get("status") or "")[:64]
+        sets = ["r.ingested_at = $ts"]
+        params: dict[str, Any] = {
+            "pref": pref,
+            "rref": rref,
+            "project_id": project_id,
+            "rid": rid,
+            "ts": ts,
+        }
+        if name:
+            sets.append("r.name = $name")
+            params["name"] = name
+        if status:
+            sets.append("r.status = $status")
+            params["status"] = status
+        run_write(
+            f"""
+            MERGE (p:Project {{ref: $pref}})
+            SET p.project_id = $project_id, p.ingested_at = coalesce(p.ingested_at, $ts)
+            MERGE (r:Release {{ref: $rref}})
+            SET r.project_id = $project_id, r.agile_id = $rid, {", ".join(sets)}
+            MERGE (p)-[:CONTAINS]->(r)
+            """,
+            params,
+        )
+        _idx(ref=rref, label="Release", text=_iw(project_id, summary, et, data), event_type=et, status=status or "")
+        return {"ok": True, "event_type": et, "ref": rref}
+
+    if et == "agile_studio.release.deleted":
+        rid = int(data.get("release_id") or 0)
+        if rid <= 0:
+            return {"ok": False, "error": "missing_release_id", "event_type": et}
+        rref = node_ref(project_id, "release", rid)
+        run_write(
+            "MATCH (r:Release {ref: $rref}) DETACH DELETE r",
+            {"rref": rref},
+        )
+        delete_by_ref(rref)
+        return {"ok": True, "event_type": et, "deleted": rref}
 
     if et in ("agile_studio.story.created", "agile_studio.story.updated"):
         sid = int(data.get("story_id") or 0)
@@ -375,7 +505,16 @@ def apply_agile_event(payload: dict[str, Any]) -> dict[str, Any]:
                 "ts": ts,
             },
         )
+        link_commit_tasks_and_stories(
+            project_id=project_id,
+            pref=pref,
+            cref=cref,
+            message=msg,
+            ts=ts,
+            run_write_fn=run_write,
+        )
         _idx(ref=cref, label="Commit", text=f"{repo}\n{sha}\n{msg}\n{summary}", event_type=et)
         return {"ok": True, "event_type": et, "ref": cref}
 
+    _log.info("second_brain agile ingest skipped (event_type not mapped): %s", et)
     return {"ok": True, "skipped": True, "event_type": et}

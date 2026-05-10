@@ -8,7 +8,6 @@ import hmac
 import json
 import logging
 import os
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from second_brain.code_static_multilang import EXT_TO_LANG, analyze_code_file
+from second_brain.commit_links import link_commit_tasks_and_stories
 from second_brain.es_store import delete_by_ref, index_chunk
 from second_brain.neo4j_store import node_ref, node_ref_slug, run_write
 
@@ -198,20 +198,6 @@ def _index_code_diff_es(
     )
 
 
-def _parse_task_ids(message: str) -> list[int]:
-    pat = (os.environ.get("SECOND_BRAIN_COMMIT_TASK_PATTERN") or "").strip()
-    if not pat:
-        pat = r"(?:task|ticket|tid)\s*[#:_-]?\s*(\d+)"
-    found = re.findall(pat, message, flags=re.IGNORECASE)
-    out: list[int] = []
-    for x in found:
-        try:
-            out.append(int(x))
-        except ValueError:
-            continue
-    return sorted(set(out))
-
-
 def _delete_codefile_graph(project_id: int, path: str) -> str:
     fref = node_ref_slug(project_id, "codefile", path)
     run_write(
@@ -338,16 +324,14 @@ def _ingest_one_github_commit(
         },
     )
 
-    for tid in _parse_task_ids(message):
-        tref = node_ref(project_id, "task", tid)
-        run_write(
-            """
-            MATCH (t:Task {ref: $tref}), (c:Commit {ref: $cref})
-            WHERE t.project_id = $project_id AND c.project_id = $project_id
-            MERGE (t)-[:IMPLEMENTED_BY]->(c)
-            """,
-            {"tref": tref, "cref": cref, "project_id": project_id},
-        )
+    link_commit_tasks_and_stories(
+        project_id=project_id,
+        pref=pref,
+        cref=cref,
+        message=message,
+        ts=ts,
+        run_write_fn=run_write,
+    )
 
     fragment: dict[str, int] = {
         "files_indexed": 0,
@@ -670,3 +654,68 @@ def apply_github_push(payload: dict[str, Any]) -> dict[str, Any]:
         stats["commits"] += 1
 
     return {"ok": True, "repository": full_name, "project_id": project_id, "stats": stats}
+
+
+def apply_github_compare(repository: str, base: str, head: str) -> dict[str, Any]:
+    """
+    So sánh hai ref GitHub (branch hoặc SHA) — không ghi Neo4j/ES.
+    GET /repos/{owner}/{repo}/compare/{base}...{head}
+    """
+    full_name = repository.strip()
+    if "/" not in full_name or full_name.count("/") != 1:
+        return {"ok": False, "error": "bad_repository", "hint": "owner/repo"}
+
+    owner, _, repo_name = full_name.partition("/")
+    token = (os.environ.get("SECOND_BRAIN_GITHUB_TOKEN") or "").strip()
+    if not token:
+        return {"ok": False, "error": "missing_github_token"}
+
+    max_files = int((os.environ.get("SECOND_BRAIN_GITHUB_COMPARE_MAX_FILES") or "40").strip() or "40")
+    max_files = max(1, min(max_files, 200))
+    max_patch = int((os.environ.get("SECOND_BRAIN_GITHUB_COMPARE_MAX_PATCH_BYTES") or "16000").strip() or "16000")
+    max_patch = max(512, min(max_patch, 490000))
+
+    b = urllib.parse.quote(base.strip(), safe="")
+    h = urllib.parse.quote(head.strip(), safe="")
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/compare/{b}...{h}"
+    data = _github_get_json(url, token)
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "github_compare_failed", "repository": full_name}
+
+    files_raw = data.get("files")
+    files_out: list[dict[str, Any]] = []
+    if isinstance(files_raw, list):
+        for item in files_raw[:max_files]:
+            if not isinstance(item, dict):
+                continue
+            patch = item.get("patch")
+            ps = patch.strip() if isinstance(patch, str) else ""
+            if len(ps) > max_patch:
+                ps = ps[:max_patch] + "\n...(truncated)"
+            files_out.append(
+                {
+                    "filename": item.get("filename"),
+                    "status": item.get("status"),
+                    "additions": item.get("additions"),
+                    "deletions": item.get("deletions"),
+                    "changes": item.get("changes"),
+                    "patch": ps if ps else None,
+                }
+            )
+
+    return {
+        "ok": True,
+        "repository": full_name,
+        "base": base.strip(),
+        "head": head.strip(),
+        "ahead_by": data.get("ahead_by"),
+        "behind_by": data.get("behind_by"),
+        "total_commits": data.get("total_commits"),
+        "merge_base_commit": (
+            data.get("merge_base_commit").get("sha")
+            if isinstance(data.get("merge_base_commit"), dict)
+            else None
+        ),
+        "files": files_out,
+        "files_truncated": isinstance(files_raw, list) and len(files_raw) > len(files_out),
+    }

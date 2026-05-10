@@ -16,8 +16,8 @@ Khả năng lập chỉ mục và truy vấn tri thức từ **codebase**, **tà
 
 | Thành phần | Mục tiêu thiết kế | Ghi chú triển khai hiện tại (xem mục 7) |
 |------------|-------------------|----------------------------------------|
-| **Git Integration** | Webhook GitHub → đồng bộ mã, diff, commit | **Một phần:** `POST /ingest/github-webhook` (push) + PAT đọc file qua GitHub API; `:Commit`, `:CodeFile`, `(Commit)-[:MODIFIES]->(CodeFile)`, `:CodeFunction` + `DEFINES`/`CALLS`: Python (`ast`); JS/TS/TSX/JSX, Java, Go, HTML, CSS, Vue (`<script>`→TS) qua **Tree-sitter** khi cài dependency. Không clone repo local. |
-| **Agile Studio Sync** | Story, Task, Comment, Wiki real-time | **Một phần:** Hub → `POST /ingest/agile-event`. Không phải toàn bộ thực thể Agile (vd. release, một số edge case). |
+| **Git Integration** | Webhook GitHub → đồng bộ mã, diff, commit | **Một phần:** `POST /ingest/github-webhook` (push), `POST /ingest/github-compare`, MCP `brain_github_compare` / `brain_refresh_github_code`; PAT; graph code + ES `code`/`code_diff`; parse commit → task + story (`IMPLEMENTS`). Không clone repo local. |
+| **Agile Studio Sync** | Story, Task, Comment, Wiki real-time | **Một phần:** Hub → `POST /ingest/agile-event` gồm project create/update, member add/remove, release CRUD, story, comments, task comments, wiki; event khác → skipped + log. |
 | **Processing Layer** | Chunking function/class/đoạn; embedding | **Một phần:** Agile/Wiki theo sự kiện; code GitHub theo **file** + symbol đa ngôn ngữ (Python AST + Tree-sitter); embedding **Gemini** (mục 10). |
 
 ### 2.2. Storage Strategy (Hybrid)
@@ -47,7 +47,8 @@ Chi tiết vận hành: mục **10**.
 |-------------------|------------|
 | Nodes: Story, Task, Member, Decision, Commit | Có (wiki page = **`Document`**, không nhãn `Wiki`) |
 | `(Story)-[:HAS_TASK]->(Task)` | **Có** khi Hub gửi `story_ids` trên task comment + ingest task comment |
-| `(Task)-[:IMPLEMENTED_BY]->(Commit)` | **Một phần:** GitHub commit message khớp regex task id (`SECOND_BRAIN_COMMIT_TASK_PATTERN`) |
+| `(Task)-[:IMPLEMENTED_BY]->(Commit)` | **Có** khi message khớp `SECOND_BRAIN_COMMIT_TASK_PATTERN` (GitHub ingest + stub git Hub) |
+| `(Commit)-[:IMPLEMENTS]->(Story)` | **Có** khi message khớp `SECOND_BRAIN_COMMIT_STORY_PATTERN` (+ tuỳ chọn `SECOND_BRAIN_COMMIT_FIXES_PATTERN`) |
 | `(Commit)-[:MODIFIES]->(File/Function)` | **Một phần:** `(Commit)-[:MODIFIES]->(:CodeFile)`; function là nút riêng `:CodeFunction` |
 | `(Decision)-[:DECIDED_IN]->(Story)` | **Có** khi `brain_remember_decision` có `story_ref` |
 
@@ -159,10 +160,10 @@ Ngoài các mục đã nêu, các hạng mục sau **chưa có** trong hoặc ng
 ## 8. Khoảng trống & lộ trình kỹ thuật
 
 1. **IMPORTS** / call-graph liên file đầy đủ (Tree-sitter hiện chỉ symbol + CALLS heuristic trong file).
-2. Parse story key / issue link đầy đủ trong commit message (ngoài regex task id).
+2. **Đã có:** parse story/issue trong commit (regex + tuỳ chọn `FIXES_PATTERN`). **Còn thiếu:** khóa kiểu `PROJ-12` cố định theo project slug nếu cần.
 3. Job queue / sync state (MySQL hoặc Redis) nếu cần scale ingest.
 4. ADR: validate enum trong MCP `brain_remember_decision`; workflow PR compliance tự động.
-5. Auth MCP (JWT / project scope) khi expose internet.
+5. Auth MCP: tuỳ chọn **`SECOND_BRAIN_MCP_SECRET`** (Bearer / header) cho `/mcp`; OAuth đầy đủ qua FastMCP nếu cần sau.
 6. **Embedding:** giám sát quota Gemini, retry/backoff, batch re-embed sau đổi model/dim.
 
 ---

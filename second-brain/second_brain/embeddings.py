@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import struct
+import time
 import urllib.error
 import urllib.request
 
@@ -59,19 +60,46 @@ def _embed_gemini_rest(text: str, *, output_dim: int) -> list[float]:
         "taskType": "RETRIEVAL_DOCUMENT",
         "outputDimensionality": output_dim,
     }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
-        _log.warning("Gemini embed HTTP %s: %s", e.code, err_body[:500])
-        raise RuntimeError(f"Gemini embedContent failed: HTTP {e.code}") from e
+    body_bytes = json.dumps(body).encode("utf-8")
+    max_retries = max(1, int((os.environ.get("SECOND_BRAIN_EMBED_MAX_RETRIES") or "3").strip() or "3"))
+    backoff = float((os.environ.get("SECOND_BRAIN_EMBED_RETRY_DELAY_SEC") or "1.25").strip() or "1.25")
+
+    payload: dict | None = None
+    last_http: urllib.error.HTTPError | None = None
+    for attempt in range(max_retries):
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            break
+        except urllib.error.HTTPError as e:
+            last_http = e
+            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            retryable = e.code in (408, 429, 500, 502, 503, 504)
+            if not retryable or attempt >= max_retries - 1:
+                _log.warning("Gemini embed HTTP %s: %s", e.code, err_body[:500])
+                raise RuntimeError(f"Gemini embedContent failed: HTTP {e.code}") from e
+            _log.warning(
+                "Gemini embed HTTP %s, retry %s/%s in %.1fs",
+                e.code,
+                attempt + 1,
+                max_retries,
+                backoff * (attempt + 1),
+            )
+            time.sleep(backoff * (attempt + 1))
+        except urllib.error.URLError as e:
+            if attempt >= max_retries - 1:
+                raise RuntimeError(f"Gemini embedContent network error: {e}") from e
+            _log.warning("Gemini embed URLError, retry %s/%s: %s", attempt + 1, max_retries, e)
+            time.sleep(backoff * (attempt + 1))
+
+    if payload is None:
+        raise RuntimeError("Gemini embedContent failed after retries") from last_http
 
     vec = _parse_embedding_response(payload)
     if len(vec) != output_dim:

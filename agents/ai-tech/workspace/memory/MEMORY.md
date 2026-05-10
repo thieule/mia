@@ -51,7 +51,12 @@ Do **not** link or assume paths to Agile Studio sources in git — deployment ma
     - Story #25 (Roadmap/Gantt View): Status: Current.
     - Story #26 (AI Insights): Uses Monte Carlo simulations for forecasting and Sentiment Analysis for comments.
     - Story #27 (Experience Store): Uses JSONB diffs to track user corrections and refine AI behavior.
-    - Story #28 (Project Second Brain): Uses Neo4j for schema, ADR tracking, and RAG Chatbot. Ticket #28 ("Triển khai Commit Linking tự động") is awaiting explicit approval from @tony before implementation.
+    - Story #28 (Project Second Brain): Status: Current. Technical design: "Project Second Brain & Codebase Intelligence" (ID: 29f3fe98-07d5-478d-86d0-890bd47313f7).
+        - Approach: Code Ingestion Pipeline (logic-based chunking), Hybrid Indexing (Elasticsearch vector search, Neo4j code graph).
+        - Tech: Tree-sitter for incremental static analysis via GitHub webhooks.
+        - Schema: Nodes (Module, Service, Class, Interface, Function, File); Relationships (CONTAINS, DEFINES, CALLS, INHERITS_FROM, IMPORTS).
+        - Features: Architecture Visualization, Codebase Understanding, Implementation Assistance.
+        - Note: Requires explicit approval from @tony before starting implementation tasks.
     - Story #29 (Git Integration): Features Commit Linking, AI PR Review, and Traceability Matrix.
     - Story #32 (Real-time Events): Uses Redis Pub/Sub and WebSocket/SSE for event broadcasting.
 - API & Validation:

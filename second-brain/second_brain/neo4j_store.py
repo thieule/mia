@@ -45,6 +45,7 @@ def ensure_constraints(driver: Driver) -> None:
         "CREATE CONSTRAINT sb_project_ref IF NOT EXISTS FOR (n:Project) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codefile_ref IF NOT EXISTS FOR (n:CodeFile) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codefunction_ref IF NOT EXISTS FOR (n:CodeFunction) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_release_ref IF NOT EXISTS FOR (n:Release) REQUIRE n.ref IS UNIQUE",
     ]
     with driver.session() as session:
         for cypher in stmts:

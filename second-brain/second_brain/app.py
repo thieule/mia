@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import hashlib
 import json
 import logging
@@ -32,13 +33,19 @@ try:
 except ImportError as e:  # pragma: no cover
     raise SystemExit("pip install mcp") from e
 
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from second_brain.adr_extract import propose_adr_json
 from second_brain.cypher_guard import assert_read_only_cypher
 from second_brain.ingest_agile import apply_agile_event
-from second_brain.ingest_github import apply_github_code_refresh, apply_github_push, verify_github_signature
+from second_brain.ingest_github import (
+    apply_github_code_refresh,
+    apply_github_compare,
+    apply_github_push,
+    verify_github_signature,
+)
 from second_brain import es_store
 from second_brain.lesson_extract import propose_lesson_json
 from second_brain.neo4j_store import close_driver, ensure_constraints, neo4j_driver, node_ref, run_read, run_write
@@ -79,6 +86,7 @@ ALLOWED_REL_TYPES = frozenset(
         "DEFINES",
         "CALLS",
         "CONTAINS",
+        "MEMBER_OF",
     }
 )
 
@@ -87,12 +95,13 @@ mcp = FastMCP(
     host=_MCP_HOST.strip() or "127.0.0.1",
     port=_MCP_PORT,
     instructions="Second Brain: Neo4j knowledge graph + Elasticsearch (vector / hybrid). "
-    "HTTP: /ingest/agile-event, /ingest/github-webhook (GitHub push). "
+    "HTTP: /ingest/agile-event, /ingest/github-webhook (push), /ingest/github-compare (diff two refs). "
     "Tools: brain_query_graph, brain_get_neighborhood, brain_upsert_relation, brain_search_knowledge "
-    "(mode vector|hybrid), brain_refresh_github_code (sync repo/branch/commit into graph+ES), "
+    "(mode vector|hybrid), brain_github_compare (GitHub API compare, read-only), "
+    "brain_refresh_github_code (sync repo/branch/commit into graph+ES), "
     "brain_remember_decision, brain_remember_lesson, brain_extract_lesson_from_text, "
     "brain_extract_adr_from_text, brain_feedback_create, brain_supersede_decision. "
-    "Set NEO4J_*, ELASTICSEARCH_URL, GEMINI_API_KEY.",
+    "Set NEO4J_*, ELASTICSEARCH_URL, GEMINI_API_KEY. Optional SECOND_BRAIN_MCP_SECRET (Bearer / X-Second-Brain-MCP-Secret).",
     streamable_http_path=_MCP_HTTP_PATH,
     stateless_http=_MCP_STATELESS,
     json_response=_MCP_JSON_RESPONSE,
@@ -186,6 +195,42 @@ async def _ingest_github_webhook(request: Request) -> JSONResponse:
     except Exception as e:
         _log.exception("github ingest failed")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/ingest/github-compare", methods=["POST"])
+async def _ingest_github_compare(request: Request) -> JSONResponse:
+    """So sánh hai ref (giống MCP `brain_github_compare`), bảo vệ bằng X-Second-Brain-Secret."""
+    if not _ingest_secret_ok(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "expected_object"}, status_code=400)
+    repo = str(body.get("repository") or "").strip()
+    base = str(body.get("base") or "").strip()
+    head = str(body.get("head") or "").strip()
+    if not repo or not base or not head:
+        return JSONResponse({"ok": False, "error": "repository_base_head_required"}, status_code=400)
+    try:
+        out = apply_github_compare(repo, base, head)
+        code = 200 if out.get("ok") else 400
+        return JSONResponse(out, status_code=code)
+    except Exception as e:
+        _log.exception("github compare failed")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.tool()
+def brain_github_compare(repository: str, base: str, head: str) -> str:
+    """So sánh hai ref GitHub (`base`...`head`, branch hoặc SHA). Cần SECOND_BRAIN_GITHUB_TOKEN; không ghi Neo4j/ES."""
+    out = apply_github_compare(
+        (repository or "").strip(),
+        (base or "").strip(),
+        (head or "").strip(),
+    )
+    return json.dumps(out, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
@@ -595,6 +640,35 @@ def mcp_base_url() -> str:
     return f"http://{_MCP_HOST}:{_MCP_PORT}"
 
 
+class _McpSecretGate(BaseHTTPMiddleware):
+    """Khi đặt SECOND_BRAIN_MCP_SECRET: chỉ cho phép gọi endpoint MCP nếu Bearer hoặc header khớp."""
+
+    def __init__(self, app: Any, *, secret: str, mcp_path: str):
+        super().__init__(app)
+        self._digest = hashlib.sha256(secret.encode("utf-8")).digest()
+        self._mcp_base = (mcp_path or "/mcp").strip() or "/mcp"
+
+    async def dispatch(self, request: Request, call_next: Any):  # noqa: ANN401
+        path = request.url.path
+        base = self._mcp_base.rstrip("/") or "/mcp"
+        norm = path.rstrip("/") or "/"
+        if norm != base and not path.startswith(base + "/"):
+            return await call_next(request)
+
+        bearer = (request.headers.get("authorization") or "").strip()
+        token = ""
+        if bearer.lower().startswith("bearer "):
+            token = bearer[7:].strip()
+        if not token:
+            token = (request.headers.get("x-second-brain-mcp-secret") or "").strip()
+        if not token:
+            return JSONResponse({"error": "mcp_unauthorized"}, status_code=401)
+        got = hashlib.sha256(token.encode("utf-8")).digest()
+        if not hmac.compare_digest(got, self._digest):
+            return JSONResponse({"error": "mcp_unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
 def run() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     try:
@@ -612,14 +686,30 @@ def run() -> None:
             close_driver()
         return
     if transport == "streamable-http":
+        import uvicorn
+
         path = getattr(mcp.settings, "streamable_http_path", "/mcp")
+        starlette_app = mcp.streamable_http_app()
+        mcp_secret = (os.environ.get("SECOND_BRAIN_MCP_SECRET") or "").strip()
+        if mcp_secret:
+            starlette_app.add_middleware(_McpSecretGate, secret=mcp_secret, mcp_path=_MCP_HTTP_PATH)
+            print(
+                f"Second Brain MCP: SHARED SECRET enabled for {path} "
+                f"(Authorization: Bearer … hoặc X-Second-Brain-MCP-Secret)",
+                file=sys.stderr,
+            )
         print(
             f"Second Brain MCP (streamable HTTP): POST {mcp_base_url()}{path} — GET /health — "
-            f"POST /ingest/agile-event — POST /ingest/github-webhook",
+            f"POST /ingest/agile-event — POST /ingest/github-webhook — POST /ingest/github-compare",
             file=sys.stderr,
         )
         try:
-            mcp.run(transport="streamable-http")
+            uvicorn.run(
+                starlette_app,
+                host=mcp.settings.host,
+                port=mcp.settings.port,
+                log_level=mcp.settings.log_level.lower(),
+            )
         finally:
             close_driver()
         return
