@@ -25,6 +25,10 @@ StoryStatus = Literal[
 ReleaseStatus = Literal["planning", "active", "released", "archived"]
 ProjectStatus = Literal["active", "archived"]
 
+TaskTicketStatus = Literal["open", "in_progress", "blocked", "done"]
+TaskTicketPriority = Literal["low", "medium", "high", "urgent"]
+TaskTicketType = Literal["task", "bug", "feature", "chore", "technical_debt", "docs", "support", "other"]
+
 _LEGACY_STORY_STATUS_MAP: dict[str, str] = {
     "icebox": "icebox_in_progress",
     "backlog": "backlog_unstart",
@@ -239,6 +243,42 @@ class WorkflowTemplateOut(BaseModel):
     updated_at: datetime
 
 
+class WorkspaceRoleCreate(BaseModel):
+    slug: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    sort_order: int = 0
+
+
+class WorkspaceRolePatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class WorkspaceRoleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    slug: str
+    name: str
+    description: Optional[str]
+    sort_order: int
+    is_system: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _mysql_zero_datetime(cls, v: object) -> object:
+        """MySQL có thể trả về '0000-00-00 …' khi INSERT không gán cột datetime — tránh lỗi Pydantic."""
+        if isinstance(v, datetime) and v.year < 1900:
+            return datetime(1970, 1, 1, 0, 0, 0)
+        if isinstance(v, str) and v.strip().startswith("0000-00-00"):
+            return datetime(1970, 1, 1, 0, 0, 0)
+        return v
+
+
 class ApiCenterConnectIn(BaseModel):
     endpoint: str = Field(..., min_length=1, max_length=2048)
     secret: str = Field(..., min_length=1, max_length=1024)
@@ -379,35 +419,74 @@ class StoryTaskCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     body: Optional[str] = None
     done: bool = False
+    task_status: Optional[TaskTicketStatus] = None
+    """If omitted, derived from ``done`` (done → done, else open)."""
+    ticket_priority: TaskTicketPriority = "medium"
+    ticket_type: TaskTicketType = "task"
+    due_at: Optional[datetime] = None
+    acceptance_criteria: Optional[str] = None
     sort_order: Optional[int] = None
     assignee_ids: list[int] = Field(default_factory=list)
     reporter_id: Optional[int] = None
+    story_ids: list[int] = Field(default_factory=list)
+    """Stories in the same project to link (optional). Omit or empty = project-only ticket."""
 
 
 class StoryTaskPatch(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=500)
     body: Optional[str] = None
     done: Optional[bool] = None
+    task_status: Optional[TaskTicketStatus] = None
+    ticket_priority: Optional[TaskTicketPriority] = None
+    ticket_type: Optional[TaskTicketType] = None
+    due_at: Optional[datetime] = None
+    acceptance_criteria: Optional[str] = None
     sort_order: Optional[int] = None
     assignee_ids: Optional[list[int]] = None
     reporter_id: Optional[int] = None
+    story_ids: Optional[list[int]] = None
+    """Replace all story links when set (including empty list for no stories)."""
 
 
 class StoryTaskOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    story_id: int
+    project_id: int
+    story_ids: list[int] = Field(default_factory=list)
+    story_id: Optional[int] = None
+    """First linked story (compat with older clients)."""
     title: str
     body: Optional[str] = None
     done: bool
+    task_status: str = "open"
+    ticket_priority: str = "medium"
+    ticket_type: str = "task"
+    due_at: Optional[datetime] = None
+    acceptance_criteria: Optional[str] = None
     sort_order: int
     assignee_ids: list[int] = Field(default_factory=list)
     assignee_id: Optional[int] = None
     """First assignee (same convention as ``StoryOut``)."""
     reporter_id: Optional[int] = None
+    watcher_member_ids: list[int] = Field(default_factory=list)
+    story_keys: list[str] = Field(default_factory=list)
+    story_titles: list[str] = Field(default_factory=list)
+    story_key: Optional[str] = None
+    """First linked story key (project-wide listing convenience)."""
+    story_title: Optional[str] = None
+    """First linked story title."""
     created_at: datetime
     updated_at: datetime
+
+
+class StoryTaskListPage(BaseModel):
+    """Paginated ``GET /projects/{id}/tasks`` response."""
+
+    items: list[StoryTaskOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class StoryOut(BaseModel):
@@ -463,6 +542,20 @@ class CommentOut(BaseModel):
 
     id: int
     story_id: int
+    author_member_id: int
+    body: str
+    created_at: datetime
+    updated_at: datetime
+    author: Optional[CommentAuthorOut] = None
+
+
+class TaskCommentOut(BaseModel):
+    """Comment on a project ticket (`story_tasks`)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    story_task_id: int
     author_member_id: int
     body: str
     created_at: datetime
@@ -653,11 +746,47 @@ class WikiCommentOut(BaseModel):
     updated_at: datetime
 
 
+# --- Project invites (email) ---
+class ProjectInviteCreate(BaseModel):
+    email: EmailStr
+    role: str = Field("member", max_length=64)
+
+
+class ProjectInvitePendingOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    role: str
+    created_at: datetime
+    expires_at: datetime
+
+
+class ProjectInvitePreviewOut(BaseModel):
+    valid: bool
+    reason: Optional[str] = None
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
+    project_slug: Optional[str] = None
+    email: Optional[str] = None
+    expires_at: Optional[datetime] = None
+
+
+class MyProjectInviteOut(BaseModel):
+    token: str
+    project_id: int
+    project_name: str
+    project_slug: str
+    role: str
+    expires_at: datetime
+
+
 # --- Auth (users + JWT) ---
 class UserRegister(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=128)
     display_name: str = Field(..., min_length=1, max_length=255)
+    invite_token: Optional[str] = Field(None, max_length=96)
 
 
 class UserLogin(BaseModel):

@@ -217,3 +217,16 @@ def test_window_cuts_mid_tool_group():
     # leaving orphan tool results for split_a at the front.
     history = session.get_history(max_messages=6)
     _assert_no_orphans(history)
+
+
+def test_history_window_without_user_drops_leading_tool_only_turn():
+    """Gemini rejects an assistant(tool_calls) turn if nothing before it is a user/tool-resume."""
+    session = Session(key="test:gemini-head")
+    session.messages.extend(_tool_turn("only", 0))
+    session.messages.append({"role": "assistant", "content": "final"})
+
+    history = session.get_history(max_messages=500)
+    _assert_no_orphans(history)
+    assert history[0]["role"] == "assistant"
+    assert history[0].get("content") == "final"
+    assert not history[0].get("tool_calls")

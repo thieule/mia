@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Agile Studio MCP server: connects over stdio or streamable HTTP. Any MCP-compatible client may use it (not tied to a specific IDE)."""
+
 import json
 import logging
 import os
@@ -42,6 +44,7 @@ from agile_hub.schemas import (
     CommentCreate,
     CommentOut,
     CommentUpdate,
+    TaskCommentOut,
     MemberCreate,
     MemberOut,
     ProjectCreate,
@@ -100,7 +103,11 @@ mcp = FastMCP(
     host=_MCP_HOST,
     port=_MCP_PORT,
     instructions="MCP access to Agile Studio DB (same schema as API). Set AGILE_DATABASE_URL environment variable. "
-    "Comment needs author_member_id (member must be in project). No JWT required. "
+    "Story comments: agile_comments_list / agile_comment_create / agile_comment_update / agile_comment_delete (author_member_id in project). "
+    "Project tickets (tasks): agile_project_tasks_list / agile_project_task_get / agile_project_task_create / agile_project_task_update / agile_project_task_delete / "
+    "agile_project_task_watch_add / agile_project_task_watch_remove — story_ids in JSON for links; empty = project-only ticket. "
+    "Ticket comments: agile_task_comments_list / agile_task_comment_create / agile_task_comment_update / agile_task_comment_delete (same @mention rules as story). "
+    "No JWT required. "
     "Wiki tools require project_id. Use agile_wiki_read_doc / agile_wiki_write_doc / agile_wiki_comments_list / agile_wiki_comment_create "
     "/ agile_wiki_folder_tree / agile_wiki_folder_create / agile_wiki_semantic_search / agile_wiki_story_context "
     "(story context includes wiki_open_comment_threads per document). "
@@ -244,7 +251,8 @@ def agile_studio_info() -> str:
         {
             "name": "agile_studio_mcp",
             "agile_database_url_set": has_url,
-            "note": "Tools use shared MySQL connection; comment needs author_member_id in project.",
+            "note": "Tools use shared MySQL connection; story/ticket comments need author_member_id in project. "
+            "Project tickets: agile_project_task_* + agile_task_comment_* + watch_add/remove.",
             "releases": "Create/update with starts_at/ends_at (planning window); see agile_release_create and agile_release_update docstrings.",
         }
     )
@@ -661,8 +669,10 @@ def agile_story_tasks_list(story_id: int) -> str:
     """
     List all tasks on a story.
 
-    Each item is StoryTaskOut: id, story_id, title, body (markdown), done, sort_order,
-    assignee_ids, assignee_id (first), reporter_id, timestamps.
+    Each item is StoryTaskOut: id, project_id, story_ids[], story_id (first link, compat),
+    story_keys[], story_titles[], title, body (markdown), done, sort_order,
+    task_status, ticket_priority, ticket_type, due_at, acceptance_criteria,
+    assignee_ids, assignee_id (first), reporter_id, watcher_member_ids?, timestamps.
     Assignees and reporter must be project members (human or AI).
     """
     with mcp_session() as db:
@@ -675,7 +685,13 @@ def agile_story_tasks_list(story_id: int) -> str:
 
 @mcp.tool()
 def agile_story_task_create(story_id: int, create_json: str) -> str:
-    """Create task. create_json: { title, body?, done?, sort_order?, assignee_ids?, reporter_id? }"""
+    """
+    Create task (ticket).
+
+    create_json: { title, body?, done?, task_status?, ticket_priority?, ticket_type?,
+    due_at? (ISO-8601 or null), acceptance_criteria?, sort_order?, assignee_ids?, reporter_id?,
+    story_ids? (int[], optional extra links; story_id path always included) }
+    """
     pobj = _load_json(create_json)
     body = StoryTaskCreate.model_validate(pobj)
     with mcp_session() as db:
@@ -693,8 +709,11 @@ def agile_story_task_update(story_id: int, task_id: int, patch_json: str = "{}")
     """
     PATCH a story task (only send fields to change).
 
-    patch_json: title?, body?, done?, sort_order?, assignee_ids?, reporter_id?
+    patch_json: title?, body?, done?, task_status?, ticket_priority?, ticket_type?,
+    due_at? (ISO-8601 or null), acceptance_criteria?, sort_order?, assignee_ids?, reporter_id?, story_ids?
+
     Use assignee_ids: [] to clear assignees; reporter_id: null to clear reporter.
+    Use story_ids to replace all story links ([] unlinks from every story).
     """
     pobj = _load_json(patch_json)
     body = StoryTaskPatch.model_validate(pobj)
@@ -703,7 +722,7 @@ def agile_story_task_update(story_id: int, task_id: int, patch_json: str = "{}")
         if s is None:
             return json_out({"error": "not_found", "story_id": story_id})
         st = crud.story_task_get(db, task_id)
-        if st is None or st.story_id != story_id:
+        if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
             return json_out({"error": "not_found", "task_id": task_id})
         try:
             st2 = crud.story_task_patch(db, st, body)
@@ -719,7 +738,7 @@ def agile_story_task_delete(story_id: int, task_id: int) -> str:
         if crud.story_get(db, story_id) is None:
             return json_out({"error": "not_found", "story_id": story_id})
         st = crud.story_task_get(db, task_id)
-        if st is None or st.story_id != story_id:
+        if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
             return json_out({"error": "not_found", "task_id": task_id})
         crud.story_task_delete(db, st)
         return json_out({"ok": True, "task_id": task_id})
@@ -732,12 +751,415 @@ def agile_story_task_get(story_id: int, task_id: int) -> str:
         if crud.story_get(db, story_id) is None:
             return json_out({"error": "not_found", "story_id": story_id})
         st = crud.story_task_get(db, task_id)
-        if st is None or st.story_id != story_id:
+        if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
             return json_out({"error": "not_found", "task_id": task_id})
         return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st)).model_dump(mode="json"))
 
 
-# --- comments ---
+# --- project tickets (story_tasks scoped by project_id; REST /projects/{id}/tasks) ---
+
+
+@mcp.tool()
+def agile_project_tasks_list(
+    project_id: int,
+    limit: int = 25,
+    offset: int = 0,
+    story_id: Optional[int] = None,
+    q: str = "",
+    task_status: str = "",
+    ticket_priority: str = "",
+    ticket_type: str = "",
+    assignee_member_id: int = 0,
+    watched_by_member_id: int = 0,
+) -> str:
+    """
+    List tickets (tasks) for a project with pagination (same filters as REST GET /projects/{project_id}/tasks).
+
+    Optional filters (omit or 0 / empty string to ignore): story_id, q (title search),
+    task_status, ticket_priority, ticket_type, assignee_member_id, watched_by_member_id.
+    Returns JSON { items: StoryTaskOut[], total, limit, offset }.
+    """
+    pid = int(project_id or 0)
+    if pid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id required"})
+    lim = min(max(int(limit or 25), 1), 100)
+    off = max(int(offset or 0), 0)
+    sid = int(story_id) if story_id is not None and int(story_id) > 0 else None
+    ts = (task_status or "").strip() or None
+    tp = (ticket_priority or "").strip() or None
+    tt = (ticket_type or "").strip() or None
+    qx = (q or "").strip() or None
+    aid = int(assignee_member_id) if int(assignee_member_id or 0) > 0 else None
+    wid = int(watched_by_member_id) if int(watched_by_member_id or 0) > 0 else None
+    if ts is not None and ts not in crud.TASK_STATUS_VALUES:
+        return json_out({"error": "invalid_argument", "detail": "invalid task_status"})
+    if tp is not None and tp not in crud.TASK_PRIORITY_VALUES:
+        return json_out({"error": "invalid_argument", "detail": "invalid ticket_priority"})
+    if tt is not None and tt not in crud.TASK_TYPE_VALUES:
+        return json_out({"error": "invalid_argument", "detail": "invalid ticket_type"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "not_found", "project_id": pid})
+        if sid is not None:
+            s = crud.story_get(db, sid)
+            if s is None or s.project_id != pid:
+                return json_out({"error": "not_found", "story_id": sid})
+        if aid is not None and aid not in crud.project_member_ids(db, pid):
+            return json_out({"error": "invalid_argument", "detail": "assignee_member_id not in project"})
+        if wid is not None and wid not in crud.project_member_ids(db, pid):
+            return json_out({"error": "invalid_argument", "detail": "watched_by_member_id not in project"})
+        rows, total = crud.project_tasks_page_out(
+            db,
+            pid,
+            assignee_member_id=aid,
+            task_status=ts,
+            ticket_priority=tp,
+            ticket_type=tt,
+            story_id=sid,
+            watched_by_member_id=wid,
+            q=qx,
+            limit=lim,
+            offset=off,
+        )
+        items = [StoryTaskOut.model_validate(x).model_dump(mode="json") for x in rows]
+        return json_out({"items": items, "total": total, "limit": lim, "offset": off})
+
+
+@mcp.tool()
+def agile_project_task_get(project_id: int, task_id: int) -> str:
+    """Return one ticket (StoryTaskOut) by project_id and task_id."""
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    if pid <= 0 or tid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        row = crud.story_task_out_for_project_task(db, pid, tid)
+        if row is None:
+            return json_out({"error": "not_found", "task_id": tid})
+        return json_out(StoryTaskOut.model_validate(row).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_project_task_create(project_id: int, create_json: str) -> str:
+    """
+    Create a project ticket (POST /projects/{project_id}/tasks).
+
+    create_json: { title, body?, done?, task_status?, ticket_priority?, ticket_type?,
+    due_at?, acceptance_criteria?, sort_order?, assignee_ids?, reporter_id?, story_ids? }.
+    story_ids: stories in the same project to link; omit or [] for project-only ticket.
+    """
+    pid = int(project_id or 0)
+    if pid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id required"})
+    pobj = _load_json(create_json)
+    body = StoryTaskCreate.model_validate(pobj)
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "not_found", "project_id": pid})
+        try:
+            st = crud.story_task_create_for_project(db, pid, body)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st)).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_project_task_update(project_id: int, task_id: int, patch_json: str = "{}") -> str:
+    """
+    PATCH project ticket. patch_json: same optional fields as agile_story_task_update (title, body, story_ids, …).
+    """
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    if pid <= 0 or tid <= 0:
+        return json_out({"error": "invalid_argument"})
+    pobj = _load_json(patch_json)
+    body = StoryTaskPatch.model_validate(pobj)
+    with mcp_session() as db:
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        try:
+            st2 = crud.story_task_patch(db, st, body)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st2)).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_project_task_delete(project_id: int, task_id: int) -> str:
+    """Delete a project ticket. Returns ok=true on success."""
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    if pid <= 0 or tid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        crud.story_task_delete(db, st)
+        return json_out({"ok": True, "task_id": tid})
+
+
+@mcp.tool()
+def agile_project_task_watch_add(project_id: int, task_id: int, member_id: int) -> str:
+    """
+    Subscribe a project member as watcher on a ticket (same as POST .../tasks/{task_id}/watch).
+    Returns updated StoryTaskOut (includes watcher_member_ids).
+    """
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    mid = int(member_id or 0)
+    if pid <= 0 or tid <= 0 or mid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        try:
+            crud.story_task_watch_add(db, tid, mid)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        st2 = crud.story_task_get(db, tid)
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st2)).model_dump(mode="json"))
+
+
+@mcp.tool()
+def agile_project_task_watch_remove(project_id: int, task_id: int, member_id: int) -> str:
+    """
+    Remove watcher from ticket (same as DELETE .../tasks/{task_id}/watch).
+    Returns updated StoryTaskOut.
+    """
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    mid = int(member_id or 0)
+    if pid <= 0 or tid <= 0 or mid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        crud.story_task_watch_remove(db, tid, mid)
+        st2 = crud.story_task_get(db, tid)
+        return json_out(StoryTaskOut.model_validate(crud.story_task_to_out(db, st2)).model_dump(mode="json"))
+
+
+# --- ticket (task) comments ---
+
+
+@mcp.tool()
+def agile_task_comments_list(project_id: int, task_id: int) -> str:
+    """List comments on a project ticket (task). Same shape as story comments: TaskCommentOut JSON array."""
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    if pid <= 0 or tid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        rows = crud.task_comments_list(db, tid)
+        return json_out(
+            [TaskCommentOut.model_validate(c, from_attributes=True).model_dump(mode="json") for c in rows]
+        )
+
+
+def _task_comment_body_merge(
+    body: str | None,
+    body_text: str | None,
+    text: str | None,
+    content: str | None,
+    message: str | None,
+) -> str:
+    for part in (body, body_text, text, content, message):
+        if part is None:
+            continue
+        s = str(part).strip()
+        if s:
+            return s
+    return ""
+
+
+@mcp.tool()
+def agile_task_comment_create(
+    project_id: int,
+    task_id: int,
+    author_member_id: int,
+    body: str | None = None,
+    body_text: str | None = None,
+    text: str | None = None,
+    content: str | None = None,
+    message: str | None = None,
+) -> str:
+    """
+    Create comment on a project ticket. author_member_id must be in the project.
+    Pass non-empty text as body, body_text, text, content, or message (same as agile_comment_create).
+    """
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    aid = int(author_member_id or 0)
+    if pid <= 0 or tid <= 0 or aid <= 0:
+        return json_out({"error": "invalid_argument", "detail": "project_id, task_id, author_member_id required"})
+    merged = _task_comment_body_merge(body, body_text, text, content, message)
+    if not merged:
+        return json_out(
+            {
+                "error": "validation_error",
+                "detail": "Provide non-empty comment text as body, body_text, text, content, or message.",
+            }
+        )
+    try:
+        cc = CommentCreate(body=merged)
+    except ValidationError as e:
+        return json_out({"error": "validation_error", "detail": e.errors(include_url=False)})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "not_found", "project_id": pid})
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        try:
+            c = crud.task_comment_create(db, st, author_member_id=aid, body=cc)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        c2 = crud.task_comment_get(db, c.id) or c
+        try:
+            payload = TaskCommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json")
+        except ValidationError as e:
+            return json_out(
+                {"error": "serialize_failed", "comment_id": c.id, "detail": e.errors(include_url=False)}
+            )
+        try:
+            if api_center_notify.project_allows_api_center_event_fanout(p):
+                api_center_notify.run_fanout_for_agile_studio_event(
+                    project_id=pid,
+                    project_name=p.name,
+                    event_type="agile_studio.task_comment.created",
+                    summary=f'New comment on ticket "{st.title[:80]}"',
+                    changed_fields=["task_comment"],
+                    data={
+                        "project_id": p.id,
+                        "task_id": st.id,
+                        "comment_id": c.id,
+                        "author_member_id": aid,
+                        "recipient_hints": crud.recipient_hints_for_task_comment(
+                            db,
+                            p.id,
+                            comment_body=c.body,
+                            author_member_id=aid,
+                        ),
+                    },
+                )
+        except Exception as ex:
+            _log_mcp.warning("task comment MCP fanout skipped: %s", ex)
+        return json_out(payload)
+
+
+@mcp.tool()
+def agile_task_comment_update(
+    project_id: int,
+    task_id: int,
+    comment_id: int,
+    new_body: str,
+    editor_member_id: int,
+) -> str:
+    """Update ticket comment; editor_member_id must be the author."""
+    b = CommentUpdate(body=new_body)
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    cid = int(comment_id or 0)
+    eid = int(editor_member_id or 0)
+    if pid <= 0 or tid <= 0 or cid <= 0 or eid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "not_found", "project_id": pid})
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        c = crud.task_comment_get(db, cid)
+        if c is None or c.story_task_id != tid:
+            return json_out({"error": "not_found", "comment_id": cid})
+        try:
+            crud.task_comment_update(db, c, editor_member_id=eid, body=b)
+        except ValueError as e:
+            return json_out({"error": str(e)})
+        except PermissionError as e:
+            return json_out({"error": str(e)})
+        c2 = crud.task_comment_get(db, c.id) or c
+        out = TaskCommentOut.model_validate(c2, from_attributes=True).model_dump(mode="json")
+        try:
+            if api_center_notify.project_allows_api_center_event_fanout(p):
+                api_center_notify.run_fanout_for_agile_studio_event(
+                    project_id=pid,
+                    project_name=p.name,
+                    event_type="agile_studio.task_comment.updated",
+                    summary=f"Comment {cid} updated on ticket {tid}",
+                    changed_fields=["body"],
+                    data={
+                        "project_id": p.id,
+                        "task_id": tid,
+                        "comment_id": cid,
+                        "recipient_hints": crud.recipient_hints_for_task_comment(
+                            db,
+                            p.id,
+                            comment_body=c2.body,
+                            author_member_id=eid,
+                        ),
+                    },
+                )
+        except Exception as ex:
+            _log_mcp.warning("task comment MCP fanout skipped: %s", ex)
+        return json_out(out)
+
+
+@mcp.tool()
+def agile_task_comment_delete(
+    project_id: int,
+    task_id: int,
+    comment_id: int,
+    editor_member_id: int,
+) -> str:
+    """Delete ticket comment; editor_member_id must be the author."""
+    pid = int(project_id or 0)
+    tid = int(task_id or 0)
+    cid = int(comment_id or 0)
+    eid = int(editor_member_id or 0)
+    if pid <= 0 or tid <= 0 or cid <= 0 or eid <= 0:
+        return json_out({"error": "invalid_argument"})
+    with mcp_session() as db:
+        p = crud.project_get(db, pid)
+        if p is None:
+            return json_out({"error": "not_found", "project_id": pid})
+        st = crud.story_task_get(db, tid)
+        if st is None or st.project_id != pid:
+            return json_out({"error": "not_found", "task_id": tid})
+        c = crud.task_comment_get(db, cid)
+        if c is None or c.story_task_id != tid:
+            return json_out({"error": "not_found", "comment_id": cid})
+        try:
+            crud.task_comment_delete(db, c, editor_member_id=eid)
+        except PermissionError as e:
+            return json_out({"error": str(e)})
+        try:
+            if api_center_notify.project_allows_api_center_event_fanout(p):
+                api_center_notify.run_fanout_for_agile_studio_event(
+                    project_id=pid,
+                    project_name=p.name,
+                    event_type="agile_studio.task_comment.deleted",
+                    summary=f"Comment {cid} deleted on ticket {tid}",
+                    changed_fields=["task_comment"],
+                    data={"project_id": p.id, "task_id": tid, "comment_id": cid},
+                )
+        except Exception as ex:
+            _log_mcp.warning("task comment MCP fanout skipped: %s", ex)
+        return json_out({"ok": True, "comment_id": cid})
+
+
+# --- comments (story) ---
 
 
 @mcp.tool()

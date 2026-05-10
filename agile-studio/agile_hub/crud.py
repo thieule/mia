@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 import re
 import secrets
 import uuid
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from . import models, wiki_embedding
@@ -21,6 +21,8 @@ from .schemas import (
     ProjectPatch,
     ProjectSettingsWrite,
     WorkflowTemplateCreate,
+    WorkspaceRoleCreate,
+    WorkspaceRolePatch,
     StoryCreate,
     StoryPatch,
     StoryTaskCreate,
@@ -36,6 +38,189 @@ from .schemas import (
 )
 
 _COMMENT_MENTION_RE = re.compile(r"@([A-Za-z0-9._-]+)")
+
+
+def _ticket_dt_naive_utc(d: datetime | None) -> datetime | None:
+    """Store due dates as naive UTC datetimes for MySQL DATETIME consistency."""
+    if d is None:
+        return None
+    if getattr(d, "tzinfo", None) is not None:
+        return d.astimezone(timezone.utc).replace(tzinfo=None)
+    return d
+
+TASK_STATUS_VALUES = frozenset({"open", "in_progress", "blocked", "done"})
+TASK_PRIORITY_VALUES = frozenset({"low", "medium", "high", "urgent"})
+TASK_TYPE_VALUES = frozenset({"task", "bug", "feature", "chore", "technical_debt", "docs", "support", "other"})
+
+INVITE_VALID_DAYS = 14
+
+_WORKSPACE_ROLE_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def workspace_role_get_by_slug(db: Session, slug: str) -> models.WorkspaceRole | None:
+    s = (slug or "").strip().lower()
+    if not s:
+        return None
+    return db.scalar(select(models.WorkspaceRole).where(models.WorkspaceRole.slug == s))
+
+
+def workspace_role_resolve_slug(db: Session, role: str | None) -> str:
+    slug = (role or "member").strip().lower() or "member"
+    if workspace_role_get_by_slug(db, slug) is None:
+        raise ValueError(
+            f"Unknown role «{slug}». Add it in Master data (Roles) or use an existing slug."
+        )
+    return slug
+
+
+def _normalize_invite_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def project_invite_revoke_pending(db: Session, project_id: int, email_norm: str) -> None:
+    now = datetime.utcnow()
+    rows = db.scalars(
+        select(models.ProjectInvite).where(
+            models.ProjectInvite.project_id == project_id,
+            models.ProjectInvite.email == email_norm,
+            models.ProjectInvite.accepted_at.is_(None),
+            models.ProjectInvite.revoked_at.is_(None),
+        )
+    ).all()
+    for r in rows:
+        r.revoked_at = now
+
+
+def project_invite_create(
+    db: Session,
+    *,
+    project_id: int,
+    email: str,
+    role: str,
+    invited_by_member_id: int | None,
+) -> models.ProjectInvite:
+    email_norm = _normalize_invite_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("Invalid email")
+    mids = project_member_ids(db, project_id)
+    u = user_get_by_email(db, email_norm)
+    if u is not None and u.member_id in mids:
+        raise ValueError("That user is already a member of this project")
+    project_invite_revoke_pending(db, project_id, email_norm)
+    token = secrets.token_urlsafe(48)[:96]
+    now = datetime.utcnow()
+    exp = now + timedelta(days=INVITE_VALID_DAYS)
+    resolved_role = workspace_role_resolve_slug(db, role)
+    row = models.ProjectInvite(
+        project_id=project_id,
+        email=email_norm,
+        token=token,
+        role=resolved_role,
+        invited_by_member_id=invited_by_member_id,
+        created_at=now,
+        expires_at=exp,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def project_invite_get_by_token(db: Session, token: str) -> models.ProjectInvite | None:
+    t = (token or "").strip()
+    if not t:
+        return None
+    return db.scalar(select(models.ProjectInvite).where(models.ProjectInvite.token == t))
+
+
+def project_invite_is_usable(row: models.ProjectInvite | None) -> tuple[bool, str]:
+    if row is None:
+        return False, "not_found"
+    now = datetime.utcnow()
+    if row.revoked_at is not None:
+        return False, "revoked"
+    if row.accepted_at is not None:
+        return False, "accepted"
+    if row.expires_at <= now:
+        return False, "expired"
+    return True, "ok"
+
+
+def project_invite_list_pending_for_project(db: Session, project_id: int) -> list[models.ProjectInvite]:
+    now = datetime.utcnow()
+    return list(
+        db.scalars(
+            select(models.ProjectInvite)
+            .where(
+                models.ProjectInvite.project_id == project_id,
+                models.ProjectInvite.accepted_at.is_(None),
+                models.ProjectInvite.revoked_at.is_(None),
+                models.ProjectInvite.expires_at > now,
+            )
+            .order_by(models.ProjectInvite.created_at.desc())
+        ).all()
+    )
+
+
+def project_invite_list_pending_for_user_email(db: Session, email: str) -> list[models.ProjectInvite]:
+    email_norm = _normalize_invite_email(email)
+    now = datetime.utcnow()
+    return list(
+        db.scalars(
+            select(models.ProjectInvite)
+            .where(
+                models.ProjectInvite.email == email_norm,
+                models.ProjectInvite.accepted_at.is_(None),
+                models.ProjectInvite.revoked_at.is_(None),
+                models.ProjectInvite.expires_at > now,
+            )
+            .order_by(models.ProjectInvite.created_at.desc())
+        ).all()
+    )
+
+
+def project_invite_accept(db: Session, token: str, user: models.User) -> tuple[models.ProjectMember, bool]:
+    """Returns (link, joined_as_new_member)."""
+    row = project_invite_get_by_token(db, token)
+    ok, reason = project_invite_is_usable(row)
+    if not ok or row is None:
+        raise ValueError(reason)
+    email_norm = _normalize_invite_email(user.email)
+    if email_norm != row.email:
+        raise ValueError("email_mismatch")
+    mids = project_member_ids(db, row.project_id)
+    if user.member_id in mids:
+        row.accepted_at = datetime.utcnow()
+        db.flush()
+        link = db.get(models.ProjectMember, (row.project_id, user.member_id))
+        if link is None:
+            raise RuntimeError("member_missing_link")
+        return link, False
+    body = ProjectMemberAdd(member_id=user.member_id, role=row.role or "member")
+    link = project_add_member(db, row.project_id, body)
+    row.accepted_at = datetime.utcnow()
+    db.flush()
+    return link, True
+
+
+def project_invite_try_accept_for_new_user(db: Session, token: str | None, user: models.User) -> bool:
+    if not (token or "").strip():
+        return False
+    try:
+        project_invite_accept(db, token.strip(), user)
+        return True
+    except ValueError:
+        return False
+
+
+def project_invite_revoke(db: Session, invite_id: int, project_id: int) -> bool:
+    row = db.get(models.ProjectInvite, invite_id)
+    if row is None or row.project_id != project_id:
+        return False
+    if row.accepted_at is not None:
+        return False
+    row.revoked_at = datetime.utcnow()
+    db.flush()
+    return True
 
 
 def _mention_key_from_display_name(name: str) -> str:
@@ -182,6 +367,25 @@ def recipient_hints_for_story_comment(
     return {
         "mentioned_agent_ids": mentioned,
         "story_assignee_agent_ids": assignees,
+        "comment_excerpt": excerpt,
+        "author_member_id": author_member_id,
+        "ai_member_ids_by_agent": project_ai_agent_member_ids_map(db, project_id),
+    }
+
+
+def recipient_hints_for_task_comment(
+    db: Session,
+    project_id: int,
+    *,
+    comment_body: str,
+    author_member_id: int,
+) -> dict[str, Any]:
+    mentioned = mentioned_agent_ids_from_comment_body(db, project_id, comment_body)
+    excerpt = (comment_body or "").strip()
+    if len(excerpt) > 4000:
+        excerpt = excerpt[:3997] + "..."
+    return {
+        "mentioned_agent_ids": mentioned,
         "comment_excerpt": excerpt,
         "author_member_id": author_member_id,
         "ai_member_ids_by_agent": project_ai_agent_member_ids_map(db, project_id),
@@ -364,6 +568,72 @@ def workflow_template_create(db: Session, body: WorkflowTemplateCreate) -> model
     return row
 
 
+def workspace_roles_list(db: Session, *, limit: int = 500) -> list[models.WorkspaceRole]:
+    lim = min(max(limit, 1), 1000)
+    return list(
+        db.scalars(
+            select(models.WorkspaceRole)
+            .order_by(models.WorkspaceRole.sort_order.asc(), models.WorkspaceRole.slug.asc())
+            .limit(lim)
+        ).all()
+    )
+
+
+def workspace_role_get(db: Session, role_id: int) -> models.WorkspaceRole | None:
+    return db.get(models.WorkspaceRole, role_id)
+
+
+def workspace_role_create(db: Session, body: WorkspaceRoleCreate) -> models.WorkspaceRole:
+    slug = body.slug.strip().lower()
+    if not _WORKSPACE_ROLE_SLUG_RE.match(slug):
+        raise ValueError(
+            "Slug must start with a letter and use only lowercase letters, digits, underscores (max 63 chars)."
+        )
+    row = models.WorkspaceRole(
+        slug=slug,
+        name=body.name.strip(),
+        description=(body.description or "").strip() or None,
+        sort_order=int(body.sort_order),
+        is_system=False,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def workspace_role_patch(db: Session, row: models.WorkspaceRole, body: WorkspaceRolePatch) -> models.WorkspaceRole:
+    if body.name is not None:
+        row.name = body.name.strip()
+    if body.description is not None:
+        row.description = (body.description or "").strip() or None
+    if body.sort_order is not None:
+        row.sort_order = int(body.sort_order)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def workspace_role_usage_count(db: Session, slug: str) -> int:
+    s = (slug or "").strip().lower()
+    n_pm = db.scalar(select(func.count()).select_from(models.ProjectMember).where(models.ProjectMember.role == s))
+    n_pi = db.scalar(
+        select(func.count()).select_from(models.ProjectInvite).where(
+            models.ProjectInvite.role == s,
+            models.ProjectInvite.accepted_at.is_(None),
+            models.ProjectInvite.revoked_at.is_(None),
+        )
+    )
+    return int(n_pm or 0) + int(n_pi or 0)
+
+
+def workspace_role_delete(db: Session, row: models.WorkspaceRole) -> None:
+    if row.is_system:
+        raise ValueError("Cannot delete a system role")
+    if workspace_role_usage_count(db, row.slug) > 0:
+        raise ValueError("Role is still used by project members or pending invitations")
+    db.delete(row)
+
+
 def project_patch(db: Session, p: models.Project, body: ProjectPatch) -> models.Project:
     if body.name is not None:
         p.name = body.name.strip()
@@ -392,7 +662,8 @@ def project_member_ids(db: Session, project_id: int) -> set[int]:
 
 
 def project_add_member(db: Session, project_id: int, body: ProjectMemberAdd) -> models.ProjectMember:
-    link = models.ProjectMember(project_id=project_id, member_id=body.member_id, role=body.role.strip() or "member")
+    resolved = workspace_role_resolve_slug(db, body.role)
+    link = models.ProjectMember(project_id=project_id, member_id=body.member_id, role=resolved)
     db.add(link)
     db.flush()
     return link
@@ -706,6 +977,64 @@ def comment_delete(db: Session, comment: models.StoryComment, *, editor_member_i
     db.flush()
 
 
+def task_comment_create(
+    db: Session, task: models.StoryTask, *, author_member_id: int, body: CommentCreate
+) -> models.StoryTaskComment:
+    mids = project_member_ids(db, task.project_id)
+    if author_member_id not in mids:
+        raise ValueError("You must be a project member to comment on this ticket")
+    clean_body = body.body.strip()
+    _validate_comment_mentions_in_project(db, task.project_id, clean_body)
+    c = models.StoryTaskComment(story_task_id=task.id, author_member_id=author_member_id, body=clean_body)
+    db.add(c)
+    db.flush()
+    return c
+
+
+def task_comments_list(db: Session, task_id: int) -> list[models.StoryTaskComment]:
+    return list(
+        db.scalars(
+            select(models.StoryTaskComment)
+            .options(joinedload(models.StoryTaskComment.author))
+            .where(models.StoryTaskComment.story_task_id == task_id)
+            .order_by(models.StoryTaskComment.created_at)
+        )
+        .unique()
+        .all()
+    )
+
+
+def task_comment_get(db: Session, comment_id: int) -> models.StoryTaskComment | None:
+    return db.scalar(
+        select(models.StoryTaskComment)
+        .options(joinedload(models.StoryTaskComment.author))
+        .where(models.StoryTaskComment.id == comment_id)
+    )
+
+
+def task_comment_update(
+    db: Session, comment: models.StoryTaskComment, *, editor_member_id: int, body: CommentUpdate
+) -> models.StoryTaskComment:
+    if comment.author_member_id != editor_member_id:
+        raise PermissionError("Only the author can edit this comment")
+    clean_body = body.body.strip()
+    task = story_task_get(db, comment.story_task_id)
+    if task is None:
+        raise ValueError("Ticket not found")
+    _validate_comment_mentions_in_project(db, task.project_id, clean_body)
+    comment.body = clean_body
+    db.add(comment)
+    db.flush()
+    return comment
+
+
+def task_comment_delete(db: Session, comment: models.StoryTaskComment, *, editor_member_id: int) -> None:
+    if comment.author_member_id != editor_member_id:
+        raise PermissionError("Only the author can delete this comment")
+    db.delete(comment)
+    db.flush()
+
+
 def story_status_event_create(
     db: Session,
     *,
@@ -748,14 +1077,260 @@ def story_touch_updated(db: Session, story_id: int) -> None:
     db.flush()
 
 
-def story_tasks_list(db: Session, story_id: int) -> list[models.StoryTask]:
-    return list(
-        db.scalars(
-            select(models.StoryTask)
-            .where(models.StoryTask.story_id == story_id)
-            .order_by(models.StoryTask.sort_order, models.StoryTask.id)
-        ).all()
+def story_task_story_ids_get(db: Session, task_id: int) -> list[int]:
+    rows = db.scalars(
+        select(models.StoryTaskStory.story_id)
+        .where(models.StoryTaskStory.task_id == task_id)
+        .order_by(models.StoryTaskStory.story_id)
+    ).all()
+    return [int(x) for x in rows]
+
+
+def story_task_story_ids_map_for_tasks(db: Session, task_ids: list[int]) -> dict[int, list[int]]:
+    if not task_ids:
+        return {}
+    rows = db.execute(
+        select(models.StoryTaskStory.task_id, models.StoryTaskStory.story_id).where(
+            models.StoryTaskStory.task_id.in_(task_ids)
+        )
+    ).all()
+    m: dict[int, list[int]] = {tid: [] for tid in task_ids}
+    for tid, sid in rows:
+        m[int(tid)].append(int(sid))
+    for tid in m:
+        m[tid].sort()
+    return m
+
+
+def story_task_linked_to_story(db: Session, task_id: int, story_id: int) -> bool:
+    return (
+        db.scalar(
+            select(func.count())
+            .select_from(models.StoryTaskStory)
+            .where(
+                models.StoryTaskStory.task_id == task_id,
+                models.StoryTaskStory.story_id == story_id,
+            )
+        )
+        or 0
+    ) > 0
+
+
+def _validate_story_ids_in_project(db: Session, project_id: int, story_ids: list[int]) -> None:
+    if not story_ids:
+        return
+    q = select(models.Story.id).where(
+        models.Story.project_id == project_id,
+        models.Story.id.in_(story_ids),
     )
+    found = set(int(x) for x in db.scalars(q).all())
+    missing = [x for x in story_ids if x not in found]
+    if missing:
+        raise ValueError("every story_id must belong to this project")
+
+
+def story_task_set_story_links(db: Session, task: models.StoryTask, story_ids: list[int], project_id: int) -> None:
+    _validate_story_ids_in_project(db, project_id, story_ids)
+    ordered = _dedupe_preserve(list(story_ids))
+    db.execute(delete(models.StoryTaskStory).where(models.StoryTaskStory.task_id == task.id))
+    for sid in ordered:
+        db.add(models.StoryTaskStory(task_id=task.id, story_id=sid))
+    db.flush()
+
+
+def story_tasks_list(db: Session, story_id: int) -> list[models.StoryTask]:
+    stmt = (
+        select(models.StoryTask)
+        .join(models.StoryTaskStory, models.StoryTaskStory.task_id == models.StoryTask.id)
+        .where(models.StoryTaskStory.story_id == story_id)
+        .order_by(models.StoryTask.sort_order, models.StoryTask.id)
+    )
+    return list(db.scalars(stmt).all())
+
+
+def _project_tasks_filtered_select(
+    project_id: int,
+    *,
+    assignee_member_id: int | None = None,
+    task_status: str | None = None,
+    ticket_priority: str | None = None,
+    ticket_type: str | None = None,
+    story_id: int | None = None,
+    watched_by_member_id: int | None = None,
+    q: str | None = None,
+):
+    stmt = select(models.StoryTask).where(models.StoryTask.project_id == project_id)
+    if story_id is not None:
+        stmt = stmt.where(
+            exists().where(
+                models.StoryTaskStory.task_id == models.StoryTask.id,
+                models.StoryTaskStory.story_id == story_id,
+            )
+        )
+    if assignee_member_id is not None:
+        stmt = stmt.where(
+            exists().where(
+                models.StoryTaskAssignee.task_id == models.StoryTask.id,
+                models.StoryTaskAssignee.member_id == assignee_member_id,
+            )
+        )
+    if task_status is not None:
+        stmt = stmt.where(models.StoryTask.task_status == task_status)
+    if ticket_priority is not None:
+        stmt = stmt.where(models.StoryTask.ticket_priority == ticket_priority)
+    if ticket_type is not None:
+        stmt = stmt.where(models.StoryTask.ticket_type == ticket_type)
+    if watched_by_member_id is not None:
+        stmt = stmt.where(
+            exists().where(
+                models.StoryTaskWatcher.task_id == models.StoryTask.id,
+                models.StoryTaskWatcher.member_id == watched_by_member_id,
+            )
+        )
+    if isinstance(q, str) and q.strip():
+        pat = f"%{q.strip()}%"
+        stmt = stmt.where(models.StoryTask.title.like(pat))
+    return stmt
+
+
+def project_tasks_count_filtered(
+    db: Session,
+    project_id: int,
+    *,
+    assignee_member_id: int | None = None,
+    task_status: str | None = None,
+    ticket_priority: str | None = None,
+    ticket_type: str | None = None,
+    story_id: int | None = None,
+    watched_by_member_id: int | None = None,
+    q: str | None = None,
+) -> int:
+    stmt = _project_tasks_filtered_select(
+        project_id,
+        assignee_member_id=assignee_member_id,
+        task_status=task_status,
+        ticket_priority=ticket_priority,
+        ticket_type=ticket_type,
+        story_id=story_id,
+        watched_by_member_id=watched_by_member_id,
+        q=q,
+    )
+    n = db.scalar(select(func.count()).select_from(stmt.subquery()))
+    return int(n or 0)
+
+
+def project_tasks_list_filtered(
+    db: Session,
+    project_id: int,
+    *,
+    assignee_member_id: int | None = None,
+    task_status: str | None = None,
+    ticket_priority: str | None = None,
+    ticket_type: str | None = None,
+    story_id: int | None = None,
+    watched_by_member_id: int | None = None,
+    q: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[models.StoryTask]:
+    stmt = _project_tasks_filtered_select(
+        project_id,
+        assignee_member_id=assignee_member_id,
+        task_status=task_status,
+        ticket_priority=ticket_priority,
+        ticket_type=ticket_type,
+        story_id=story_id,
+        watched_by_member_id=watched_by_member_id,
+        q=q,
+    )
+    stmt = stmt.order_by(models.StoryTask.updated_at.desc(), models.StoryTask.sort_order, models.StoryTask.id)
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    return list(db.scalars(stmt).all())
+
+
+def _project_tasks_rows_to_out(db: Session, project_id: int, rows: list[models.StoryTask]) -> list[dict]:
+    if not rows:
+        return []
+    p = project_get(db, project_id)
+    slug = (p.slug or "").strip() if p else ""
+    tids = [x.id for x in rows]
+    sid_map = story_task_story_ids_map_for_tasks(db, tids)
+    all_story_ids = sorted({i for lst in sid_map.values() for i in lst})
+    smap: dict[int, models.Story] = {}
+    if all_story_ids:
+        smap = {s.id: s for s in db.scalars(select(models.Story).where(models.Story.id.in_(all_story_ids))).all()}
+    amap = story_task_assignee_ids_map_for_tasks(db, tids)
+    wmap = story_task_watcher_ids_map_for_tasks(db, tids)
+    out: list[dict] = []
+    for x in rows:
+        sids = sid_map.get(x.id, [])
+        keys: list[str] = []
+        titles: list[str] = []
+        for sid in sids:
+            s = smap.get(sid)
+            if s:
+                keys.append(f"{slug}-{s.story_number}" if slug else f"#{s.story_number}")
+                titles.append(s.title or "")
+        aids = amap.get(x.id, [])
+        wids = wmap.get(x.id, [])
+        aid0 = aids[0] if aids else None
+        out.append(
+            {
+                "id": x.id,
+                "project_id": x.project_id,
+                "story_ids": sids,
+                "story_id": sids[0] if sids else None,
+                "title": x.title,
+                "body": x.body,
+                "done": bool(x.done),
+                "task_status": x.task_status or "open",
+                "ticket_priority": x.ticket_priority or "medium",
+                "ticket_type": x.ticket_type or "task",
+                "due_at": x.due_at,
+                "acceptance_criteria": x.acceptance_criteria,
+                "sort_order": x.sort_order,
+                "assignee_ids": aids,
+                "assignee_id": aid0,
+                "reporter_id": x.reporter_id,
+                "watcher_member_ids": wids,
+                "story_keys": keys,
+                "story_titles": titles,
+                "story_key": keys[0] if keys else None,
+                "story_title": titles[0] if titles else None,
+                "created_at": x.created_at,
+                "updated_at": x.updated_at,
+            }
+        )
+    return out
+
+
+def project_tasks_page_out(
+    db: Session,
+    project_id: int,
+    *,
+    assignee_member_id: int | None = None,
+    task_status: str | None = None,
+    ticket_priority: str | None = None,
+    ticket_type: str | None = None,
+    story_id: int | None = None,
+    watched_by_member_id: int | None = None,
+    q: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    filt = dict(
+        assignee_member_id=assignee_member_id,
+        task_status=task_status,
+        ticket_priority=ticket_priority,
+        ticket_type=ticket_type,
+        story_id=story_id,
+        watched_by_member_id=watched_by_member_id,
+        q=q,
+    )
+    total = project_tasks_count_filtered(db, project_id, **filt)
+    rows = project_tasks_list_filtered(db, project_id, **filt, limit=limit, offset=offset)
+    return _project_tasks_rows_to_out(db, project_id, rows), total
 
 
 def _validate_task_reporter(reporter_id: int | None, project_member_ids_set: set[int]) -> None:
@@ -788,6 +1363,57 @@ def story_task_assignee_ids_map_for_tasks(db: Session, task_ids: list[int]) -> d
     return out
 
 
+def story_task_watcher_ids_get(db: Session, task_id: int) -> list[int]:
+    rows = db.scalars(
+        select(models.StoryTaskWatcher.member_id)
+        .where(models.StoryTaskWatcher.task_id == task_id)
+        .order_by(models.StoryTaskWatcher.member_id)
+    ).all()
+    return [int(x) for x in rows]
+
+
+def story_task_watcher_ids_map_for_tasks(db: Session, task_ids: list[int]) -> dict[int, list[int]]:
+    if not task_ids:
+        return {}
+    rows = db.execute(
+        select(models.StoryTaskWatcher.task_id, models.StoryTaskWatcher.member_id)
+        .where(models.StoryTaskWatcher.task_id.in_(task_ids))
+        .order_by(models.StoryTaskWatcher.task_id, models.StoryTaskWatcher.member_id)
+    ).all()
+    out: dict[int, list[int]] = {}
+    for tid, mid in rows:
+        out.setdefault(int(tid), []).append(int(mid))
+    return out
+
+
+def story_task_watch_add(db: Session, task_id: int, member_id: int) -> None:
+    st = story_task_get(db, task_id)
+    if st is None:
+        raise ValueError("Task not found")
+    mids = project_member_ids(db, st.project_id)
+    if member_id not in mids:
+        raise ValueError("Watcher must be a project member in this project")
+    exists_row = db.scalar(
+        select(models.StoryTaskWatcher.member_id).where(
+            models.StoryTaskWatcher.task_id == task_id,
+            models.StoryTaskWatcher.member_id == member_id,
+        )
+    )
+    if exists_row is None:
+        db.add(models.StoryTaskWatcher(task_id=task_id, member_id=member_id))
+        db.flush()
+
+
+def story_task_watch_remove(db: Session, task_id: int, member_id: int) -> None:
+    db.execute(
+        delete(models.StoryTaskWatcher).where(
+            models.StoryTaskWatcher.task_id == task_id,
+            models.StoryTaskWatcher.member_id == member_id,
+        )
+    )
+    db.flush()
+
+
 def story_task_set_assignees(
     db: Session, task: models.StoryTask, member_ids: list[int], project_member_ids_set: set[int]
 ) -> None:
@@ -801,19 +1427,47 @@ def story_task_set_assignees(
     db.flush()
 
 
-def story_task_to_out(db: Session, task: models.StoryTask) -> dict:
+def story_task_to_out(db: Session, task: models.StoryTask, *, project_slug: str | None = None) -> dict:
     aids = story_task_assignee_ids_get(db, task.id)
     aid0 = aids[0] if aids else None
+    wids = story_task_watcher_ids_get(db, task.id)
+    sids = story_task_story_ids_get(db, task.id)
+    if project_slug is None:
+        p = project_get(db, task.project_id)
+        project_slug = (p.slug or "").strip() if p else ""
+    slug = project_slug or ""
+    keys: list[str] = []
+    titles: list[str] = []
+    if sids:
+        srows = db.scalars(select(models.Story).where(models.Story.id.in_(sids))).all()
+        smap = {s.id: s for s in srows}
+        for sid in sids:
+            s = smap.get(sid)
+            if s:
+                keys.append(f"{slug}-{s.story_number}" if slug else f"#{s.story_number}")
+                titles.append(s.title or "")
     return {
         "id": task.id,
-        "story_id": task.story_id,
+        "project_id": task.project_id,
+        "story_ids": sids,
+        "story_id": sids[0] if sids else None,
         "title": task.title,
         "body": task.body,
-        "done": task.done,
+        "done": bool(task.done),
+        "task_status": task.task_status or "open",
+        "ticket_priority": task.ticket_priority or "medium",
+        "ticket_type": task.ticket_type or "task",
+        "due_at": task.due_at,
+        "acceptance_criteria": task.acceptance_criteria,
         "sort_order": task.sort_order,
         "assignee_ids": aids,
         "assignee_id": aid0,
         "reporter_id": task.reporter_id,
+        "watcher_member_ids": wids,
+        "story_keys": keys,
+        "story_titles": titles,
+        "story_key": keys[0] if keys else None,
+        "story_title": titles[0] if titles else None,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
     }
@@ -823,73 +1477,95 @@ def story_tasks_out_list(db: Session, story_id: int) -> list[dict]:
     rows = story_tasks_list(db, story_id)
     if not rows:
         return []
-    amap = story_task_assignee_ids_map_for_tasks(db, [x.id for x in rows])
-    out: list[dict] = []
-    for x in rows:
-        aids = amap.get(x.id, [])
-        aid0 = aids[0] if aids else None
-        out.append(
-            {
-                "id": x.id,
-                "story_id": x.story_id,
-                "title": x.title,
-                "body": x.body,
-                "done": x.done,
-                "sort_order": x.sort_order,
-                "assignee_ids": aids,
-                "assignee_id": aid0,
-                "reporter_id": x.reporter_id,
-                "created_at": x.created_at,
-                "updated_at": x.updated_at,
-            }
-        )
-    return out
+    p = project_get(db, rows[0].project_id)
+    slug = (p.slug or "").strip() if p else ""
+    return [story_task_to_out(db, x, project_slug=slug) for x in rows]
 
 
-def _next_story_task_sort_order(db: Session, story_id: int) -> int:
+def _next_project_task_sort_order(db: Session, project_id: int) -> int:
     m = db.scalar(
         select(func.coalesce(func.max(models.StoryTask.sort_order), -1)).where(
-            models.StoryTask.story_id == story_id
+            models.StoryTask.project_id == project_id
         )
     )
     return int(m) + 1
 
 
-def story_task_create(db: Session, story_id: int, body: StoryTaskCreate) -> models.StoryTask:
-    s = story_get(db, story_id)
-    if s is None:
-        raise ValueError("Story not found")
-    mids = project_member_ids(db, s.project_id)
+def story_task_create_for_project(db: Session, project_id: int, body: StoryTaskCreate) -> models.StoryTask:
+    mids = project_member_ids(db, project_id)
     _validate_task_reporter(body.reporter_id, mids)
-    ord_ = body.sort_order if body.sort_order is not None else _next_story_task_sort_order(db, story_id)
+    ord_ = body.sort_order if body.sort_order is not None else _next_project_task_sort_order(db, project_id)
     raw_body = body.body
     body_clean = raw_body.strip() if isinstance(raw_body, str) else None
     want_aids = _dedupe_preserve(list(body.assignee_ids))
+    if body.task_status is not None:
+        ts = str(body.task_status).strip().lower()
+        if ts not in TASK_STATUS_VALUES:
+            raise ValueError("invalid task_status")
+    else:
+        ts = "done" if bool(body.done) else "open"
+    done_val = ts == "done"
+    tp = str(body.ticket_priority).strip().lower()
+    if tp not in TASK_PRIORITY_VALUES:
+        raise ValueError("invalid ticket_priority")
+    tt = str(body.ticket_type).strip().lower()
+    if tt not in TASK_TYPE_VALUES:
+        raise ValueError("invalid ticket_type")
+    due = _ticket_dt_naive_utc(body.due_at)
+    raw_ac = body.acceptance_criteria
+    ac = raw_ac.strip() if isinstance(raw_ac, str) else None
+    link_ids = _dedupe_preserve(list(body.story_ids or []))
+    _validate_story_ids_in_project(db, project_id, link_ids)
     st = models.StoryTask(
-        story_id=story_id,
+        project_id=project_id,
         title=body.title.strip(),
         body=body_clean or None,
-        done=bool(body.done),
+        done=done_val,
+        task_status=ts,
+        ticket_priority=tp,
+        ticket_type=tt,
+        due_at=due,
+        acceptance_criteria=ac or None,
         sort_order=ord_,
         reporter_id=body.reporter_id,
     )
     db.add(st)
     db.flush()
     story_task_set_assignees(db, st, want_aids, mids)
-    story_touch_updated(db, story_id)
+    story_task_set_story_links(db, st, link_ids, project_id)
+    for sid in story_task_story_ids_get(db, st.id):
+        story_touch_updated(db, sid)
     return st
+
+
+def story_task_create(db: Session, story_id: int, body: StoryTaskCreate) -> models.StoryTask:
+    s = story_get(db, story_id)
+    if s is None:
+        raise ValueError("Story not found")
+    merged = body.model_copy(
+        update={"story_ids": _dedupe_preserve(list(body.story_ids or []) + [story_id])}
+    )
+    return story_task_create_for_project(db, s.project_id, merged)
 
 
 def story_task_get(db: Session, task_id: int) -> models.StoryTask | None:
     return db.get(models.StoryTask, task_id)
 
 
+def story_task_out_for_project_task(db: Session, project_id: int, task_id: int) -> dict | None:
+    """``story_task_to_out`` when the task belongs to ``project_id``."""
+    st = story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        return None
+    p = project_get(db, project_id)
+    slug = (p.slug or "").strip() if p else ""
+    return story_task_to_out(db, st, project_slug=slug)
+
+
 def story_task_patch(db: Session, st: models.StoryTask, body: StoryTaskPatch) -> models.StoryTask:
-    s = story_get(db, st.story_id)
-    if s is None:
-        raise ValueError("Story not found")
-    mids = project_member_ids(db, s.project_id)
+    mids = project_member_ids(db, st.project_id)
     data = body.model_dump(exclude_unset=True)
+    touch_sids_before = set(story_task_story_ids_get(db, st.id))
     if "assignee_ids" in data:
         mlist = _dedupe_preserve([int(x) for x in (data.get("assignee_ids") or [])])
         story_task_set_assignees(db, st, mlist, mids)
@@ -906,21 +1582,57 @@ def story_task_patch(db: Session, st: models.StoryTask, body: StoryTaskPatch) ->
         else:
             t = str(b).strip()
             st.body = t or None
-    if "done" in data and data["done"] is not None:
-        st.done = bool(data["done"])
+    if "ticket_priority" in data and data["ticket_priority"] is not None:
+        tp = str(data["ticket_priority"]).strip().lower()
+        if tp not in TASK_PRIORITY_VALUES:
+            raise ValueError("invalid ticket_priority")
+        st.ticket_priority = tp
+    if "ticket_type" in data and data["ticket_type"] is not None:
+        tt = str(data["ticket_type"]).strip().lower()
+        if tt not in TASK_TYPE_VALUES:
+            raise ValueError("invalid ticket_type")
+        st.ticket_type = tt
+    if "due_at" in data:
+        st.due_at = _ticket_dt_naive_utc(data.get("due_at"))
+    if "acceptance_criteria" in data:
+        ac = data["acceptance_criteria"]
+        if ac is None:
+            st.acceptance_criteria = None
+        else:
+            t = str(ac).strip()
+            st.acceptance_criteria = t or None
+    done_in = data.get("done")
+    ts_in = data.get("task_status")
+    if ts_in is not None:
+        ts = str(ts_in).strip().lower()
+        if ts not in TASK_STATUS_VALUES:
+            raise ValueError("invalid task_status")
+        st.task_status = ts
+        st.done = ts == "done"
+    elif done_in is not None:
+        st.done = bool(done_in)
+        if st.done:
+            st.task_status = "done"
+        elif (st.task_status or "") == "done":
+            st.task_status = "open"
     if "sort_order" in data and data["sort_order"] is not None:
         st.sort_order = int(data["sort_order"])
+    if "story_ids" in data and data["story_ids"] is not None:
+        story_task_set_story_links(db, st, list(data["story_ids"]), st.project_id)
     db.add(st)
     db.flush()
-    story_touch_updated(db, st.story_id)
+    touch_after = set(story_task_story_ids_get(db, st.id))
+    for sid in touch_sids_before | touch_after:
+        story_touch_updated(db, sid)
     return st
 
 
 def story_task_delete(db: Session, st: models.StoryTask) -> None:
-    sid = st.story_id
+    sids = story_task_story_ids_get(db, st.id)
     db.delete(st)
     db.flush()
-    story_touch_updated(db, sid)
+    for sid in sids:
+        story_touch_updated(db, sid)
 
 
 def user_get_by_email(db: Session, email: str) -> models.User | None:

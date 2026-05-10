@@ -1,10 +1,12 @@
 import { useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { apiPost, setAuth } from "./api.js";
 
 export default function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const inviteTok = (searchParams.get("invite") || "").trim();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState(null);
@@ -21,7 +23,8 @@ export default function LoginPage() {
     try {
       const data = await apiPost("/auth/login", { email: email.trim(), password });
       setAuth(data.access_token, data.user);
-      navigate(from, { replace: true });
+      if (inviteTok) navigate(`/invite/${encodeURIComponent(inviteTok)}`, { replace: true });
+      else navigate(from, { replace: true });
     } catch (e2) {
       setErr(e2.message || "Sign-in failed");
     } finally {
@@ -80,7 +83,7 @@ export default function LoginPage() {
           </form>
           <p className="small text-secondary text-center mt-4 mb-0">
             No account yet?{" "}
-            <Link to="/register" className="fw-semibold">
+            <Link to={inviteTok ? `/register?invite=${encodeURIComponent(inviteTok)}` : "/register"} className="fw-semibold">
               Create an account
             </Link>
           </p>

@@ -1,14 +1,33 @@
-import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { apiPost, setAuth } from "./api.js";
+import { useEffect, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { apiGetPublic, apiPost, setAuth } from "./api.js";
 
 export default function RegisterPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const inviteTok = (searchParams.get("invite") || "").trim();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!inviteTok) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const prev = await apiGetPublic(`/invites/token/${encodeURIComponent(inviteTok)}`);
+        if (cancelled || !prev?.valid || !prev.email) return;
+        setEmail((cur) => (cur.trim() ? cur : prev.email));
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [inviteTok]);
 
   const onSubmit = async (e) => {
     e.preventDefault();
@@ -19,13 +38,16 @@ export default function RegisterPage() {
     }
     setLoading(true);
     try {
-      const data = await apiPost("/auth/register", {
+      const body = {
         email: email.trim(),
         password,
         display_name: displayName.trim(),
-      });
+      };
+      if (inviteTok) body.invite_token = inviteTok;
+      const data = await apiPost("/auth/register", body);
       setAuth(data.access_token, data.user);
-      navigate("/", { replace: true });
+      if (inviteTok) navigate(`/invite/${encodeURIComponent(inviteTok)}`, { replace: true });
+      else navigate("/", { replace: true });
     } catch (e2) {
       setErr(e2.message || "Registration failed");
     } finally {
@@ -103,7 +125,7 @@ export default function RegisterPage() {
           </form>
           <p className="small text-secondary text-center mt-4 mb-0">
             Already have an account?{" "}
-            <Link to="/login" className="fw-semibold">
+            <Link to={inviteTok ? `/login?invite=${encodeURIComponent(inviteTok)}` : "/login"} className="fw-semibold">
               Sign in
             </Link>
           </p>

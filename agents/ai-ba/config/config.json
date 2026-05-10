@@ -93,6 +93,14 @@
         "enabledTools": [
           "*"
         ]
+      },
+      "second-brain": {
+        "type": "streamableHttp",
+        "url": "http://127.0.0.1:9122/mcp",
+        "toolTimeout": 45,
+        "enabledTools": [
+          "*"
+        ]
       }
     }
   }

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import secrets
 from typing import Any
 
@@ -10,6 +9,7 @@ from fastapi import APIRouter, Body, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from agile_hub.chat_api_center_bridge import ingest_api_center_agent_reply
+from agile_hub.config import get_settings
 
 from .deps import get_db
 
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/integrations/api-center", tags=["api-center-callback
 
 
 def _verify_agent_reply_bearer(authorization: str | None) -> None:
-    exp = (os.environ.get("AGILE_AGENT_REPLY_TOKEN") or "").strip()
+    exp = (get_settings().agent_reply_token or "").strip()
     if not exp:
         raise HTTPException(
             status_code=503,

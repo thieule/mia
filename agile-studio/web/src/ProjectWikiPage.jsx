@@ -27,6 +27,11 @@ function collectFolderIds(nodes, s = new Set()) {
   return s;
 }
 
+/** Wiki URLs may use `/p/:id/wiki/:slug` or `/p/:id/wiki/:uuid` (document id). */
+function isWikiDocumentIdSegment(segment) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(segment || "").trim());
+}
+
 /** Root key for expand/collapse of unfiled docs block (must not collide with numeric folder ids). */
 const UNFILED_SECTION_KEY = "unfiled";
 
@@ -382,13 +387,16 @@ export default function ProjectWikiPage({
   useEffect(() => {
     if (!projectId || !initialSlug) return;
     let cancelled = false;
-    const slug = decodeURIComponent(initialSlug);
+    const segment = decodeURIComponent(initialSlug);
+    const byId = isWikiDocumentIdSegment(segment);
     (async () => {
       try {
-        const d = await apiGet(`/projects/${projectId}/docs/slug/${encodeURIComponent(slug)}`);
-        if (!cancelled) applyDoc(d, { syncUrl: false });
+        const d = byId
+          ? await apiGet(`/projects/${projectId}/docs/${encodeURIComponent(segment)}`)
+          : await apiGet(`/projects/${projectId}/docs/slug/${encodeURIComponent(segment)}`);
+        if (!cancelled) applyDoc(d, { syncUrl: byId });
       } catch {
-        if (!cancelled) setErr?.("Document not found for this slug.");
+        if (!cancelled) setErr?.("Document not found for this link.");
       }
     })();
     return () => {
@@ -680,8 +688,7 @@ export default function ProjectWikiPage({
           <p className="as-wiki-kicker mb-2">Knowledge base</p>
           <h1 className="as-wiki-page-title">Documentation</h1>
           <p className="as-wiki-lead mb-0">
-            Markdown, search, cross-links{" "}
-            <code className="as-wiki-code-hint user-select-all">[label](wiki:slug)</code> — a document can link to multiple stories.
+            Knowledge base for the project.
           </p>
         </div>
         {saving ? (

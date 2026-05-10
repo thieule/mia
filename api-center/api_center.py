@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -418,11 +419,22 @@ async def _enqueue_agent_chat_task_direct(
     )
 
 
+def _wq_progress_label(location: str) -> str:
+    loc = (location or "").strip().lower()
+    return {
+        "pending": "Đang chờ worker nhận việc",
+        "processing": "Agent đang xử lý",
+        "done": "Hoàn thành",
+        "failed": "Tác vụ lỗi",
+    }.get(loc, loc or "Đang cập nhật…")
+
+
 async def _wait_agent_task_result(
     *,
     agent: dict[str, Any],
     task_id: str,
     timeout_s: float,
+    on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[str, str]:
     ws = _agent_workspace_path(agent)
     if ws is None:
@@ -433,6 +445,8 @@ async def _wait_agent_task_result(
     end_at = time.time() + max(0.0, timeout_s)
     last_pulse = 0.0
     last_loc = ""
+    wait_started = time.time()
+    file_missing_notice = False
     while time.time() <= end_at:
         if item_path.is_file():
             try:
@@ -444,6 +458,13 @@ async def _wait_agent_task_result(
                 if loc != last_loc:
                     last_loc = loc
                     _chat_dbg("wait_task_state", f"location={loc!r}", f"task_id={task_id}")
+                    if on_progress and loc and loc not in {"done", "failed"}:
+                        try:
+                            await on_progress(
+                                {"step": loc, "label": _wq_progress_label(loc), "task_id": task_id}
+                            )
+                        except Exception:
+                            pass
                 if loc == "done":
                     txt = str(row.get("result_excerpt") or "").strip()
                     _chat_dbg("wait_task_done", f"excerpt_len={len(txt)}")
@@ -454,6 +475,22 @@ async def _wait_agent_task_result(
                     return "failed", err
         else:
             now = time.time()
+            if (
+                on_progress
+                and not file_missing_notice
+                and (now - wait_started) >= 2.0
+            ):
+                file_missing_notice = True
+                try:
+                    await on_progress(
+                        {
+                            "step": "waiting",
+                            "label": "Đang chờ worker nhận việc…",
+                            "task_id": task_id,
+                        }
+                    )
+                except Exception:
+                    pass
             if _chat_debug_enabled() and now - last_pulse >= 8.0:
                 last_pulse = now
                 _chat_dbg("wait_task_poll", "state_file_missing_yet", f"task_id={task_id}")
@@ -796,6 +833,12 @@ def _build_notification_message(payload: dict[str, Any], agent_id: str) -> str:
         lines.append(f"- changed_fields: {changed_text}")
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     hints = data.get("recipient_hints") if isinstance(data.get("recipient_hints"), dict) else {}
+    _mention_discipline_note = (
+        "**Mention discipline (anti-loop):** Seeing @mention or `direct_mention=true` does **not** force a new Agile comment. "
+        "Post **only** when the human adds a question, assigns work, asks for clarification, or needs factual follow-up "
+        "**that prior replies do not cover**. Do **not** reply again for mere thanks, ack, thumbs-up/FYI/noise, or when staying "
+        "silent avoids ping-pong. One substantive round-trip per real ask is usually enough."
+    )
     if hints:
         aid_norm = str(agent_id).strip().lower()
         mentioned = hints.get("mentioned_agent_ids") if isinstance(hints.get("mentioned_agent_ids"), list) else []
@@ -836,7 +879,14 @@ def _build_notification_message(payload: dict[str, Any], agent_id: str) -> str:
         "agile_studio.comment.created",
         "agile_studio.comment.updated",
     }
+    task_comment_events = {
+        "agile_studio.task_comment.created",
+        "agile_studio.task_comment.updated",
+    }
+    data_task_id = data.get("task_id")
     if event_type in wiki_events and wiki_doc_id:
+        lines.append(_mention_discipline_note)
+        lines.append("")
         lines.append(
             "Wiki document feedback (@mention thread): **post your answer in the same doc feedback thread** using MCP "
             "`agile_wiki_comment_create(project_id, doc_id, author_member_id, content=…)`. "
@@ -851,6 +901,8 @@ def _build_notification_message(payload: dict[str, Any], agent_id: str) -> str:
             "`agile_chat_send` to group **general** is discouraged for wiki feedback answers."
         )
     elif event_type in comment_events and data_story_id is not None:
+        lines.append(_mention_discipline_note)
+        lines.append("")
         lines.append(
             "Story-comment thread: **reply on the story** using MCP "
             "`agile_comment_create(story_id, author_member_id, body=…)` "
@@ -862,6 +914,21 @@ def _build_notification_message(payload: dict[str, Any], agent_id: str) -> str:
             "Use `agile_story_update` only when they explicitly ask to change stored story fields. "
             "`agile_chat_send` to a **project group channel** (e.g. `general`) is **discouraged** for "
             "comment-thread answers — the default answer belongs on the story."
+        )
+    elif event_type in task_comment_events and data_task_id is not None:
+        lines.append(_mention_discipline_note)
+        lines.append("")
+        lines.append(
+            "Ticket (task) comment thread: **reply on the same ticket** using MCP "
+            "`agile_task_comment_create(project_id, task_id, author_member_id, body=…)` "
+            "(or `body_text` / `text` / `content` / `message` for the comment text). "
+            f"- project_id={project_id or '(from payload)'} "
+            f"- task_id={data_task_id!r} (numeric ticket / story_task id) "
+            "- author_member_id from the hints above when present. "
+            "Use `agile_project_task_get` / `agile_task_comments_list` if you need context. "
+            "Do **not** use `agile_comment_create` (that is for **story** threads only). "
+            "`agile_chat_send` to a **project group channel** (e.g. `general`) is **discouraged** for "
+            "ticket comment answers — the default answer belongs on the ticket."
         )
     else:
         lines.append(
@@ -1118,6 +1185,7 @@ async def _process_chat_dispatch(
     *,
     payload: dict[str, Any],
     merged_agents: list[dict[str, Any]],
+    progress_emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     # contract
     project_id = str(payload.get("project_id") or "").strip()
@@ -1156,6 +1224,20 @@ async def _process_chat_dispatch(
     reply_text = ""
     agent_task_id: str | None = None
     agent_dispatch_status = "skipped"
+
+    async def _emit_prog(patch: dict[str, Any]) -> None:
+        if progress_emit is None:
+            return
+        await progress_emit(
+            {
+                "trace_id": trace_id,
+                "project_id": project_id,
+                "channel_id": channel_id,
+                "selected_agent_id": selected_agent_id,
+                **patch,
+            }
+        )
+
     if should:
         who = selected_agent_id or "agent"
         if selected_agent_id:
@@ -1172,6 +1254,13 @@ async def _process_chat_dispatch(
             )
             agent_dispatch_status = enq_status
             agent_task_id = task_id
+            if ok and task_id:
+                try:
+                    await _emit_prog(
+                        {"step": "enqueued", "label": "Đã gửi tới hàng đợi agent", "task_id": task_id}
+                    )
+                except Exception:
+                    pass
             if ok and task_id and isinstance(agent, dict):
                 wait_s_raw = (os.environ.get("API_CENTER_CHAT_WAIT_TIMEOUT_S") or "45").strip()
                 try:
@@ -1182,6 +1271,7 @@ async def _process_chat_dispatch(
                     agent=agent,
                     task_id=task_id,
                     timeout_s=wait_s,
+                    on_progress=_emit_prog,
                 )
                 agent_dispatch_status = f"{agent_dispatch_status}:{done_state}"
                 if done_state == "done" and done_text.strip():
@@ -1661,8 +1751,9 @@ def create_app(
         """Bidirectional chat bridge **browser ⇄ API Center** (not agent ⇄ API Center).
 
         Client → server: ``{"event":"chat.message.created","payload":{...}}``.
-        Server → client: ``chat.connected``, ``chat.agent.ack``, ``chat.agent.reply`` (includes ``reply_text``),
-        ``chat.agent.error``. Agent work runs via working-queue + subprocess gateway; replies return on this socket after dispatch completes.
+        Server → client: ``chat.connected``, ``chat.agent.progress`` (optional: queue/worker status),
+        ``chat.agent.ack``, ``chat.agent.reply`` (includes ``reply_text``), ``chat.agent.error``.
+        Agent work runs via working-queue + subprocess gateway; replies return on this socket after dispatch completes.
         """
         token = websocket.query_params.get("session_key", "").strip()
         if not token:
@@ -1695,7 +1786,14 @@ def create_app(
                     continue
                 _console_inbound_chat(payload, "ws")
                 try:
-                    result = await _process_chat_dispatch(payload=payload, merged_agents=agents_runtime["merged"])
+                    async def _ws_progress_emit(update: dict[str, Any]) -> None:
+                        await websocket.send_json({"event": "chat.agent.progress", **update})
+
+                    result = await _process_chat_dispatch(
+                        payload=payload,
+                        merged_agents=agents_runtime["merged"],
+                        progress_emit=_ws_progress_emit,
+                    )
                 except HTTPException as he:
                     _chat_dbg("ws_dispatch_http_exc", he.status_code, str(he.detail))
                     await websocket.send_json({"event": "chat.agent.error", "error": str(he.detail), "status": he.status_code})

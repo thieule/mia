@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -15,6 +16,7 @@ from ..api_center_notify import (
     forward_webhook_to_api_center,
     schedule_api_center_event_fanout,
     wiki_comment_webhook_data_dict,
+    wiki_document_webhook_data_dict,
 )
 from ..schemas import (
     CommentCreate,
@@ -23,8 +25,11 @@ from ..schemas import (
     MemberCreate,
     MemberOut,
     ProjectCreate,
+    ProjectInviteCreate,
+    ProjectInvitePendingOut,
     ProjectMemberAdd,
     ProjectMemberOut,
+    MyProjectInviteOut,
     ProjectOut,
     ProjectPatch,
     ReleaseCreate,
@@ -33,12 +38,17 @@ from ..schemas import (
     StoryCreate,
     WorkflowTemplateCreate,
     WorkflowTemplateOut,
+    WorkspaceRoleCreate,
+    WorkspaceRoleOut,
+    WorkspaceRolePatch,
     StoryStatusEventOut,
     StoryOut,
     StoryPatch,
     StoryTaskCreate,
+    StoryTaskListPage,
     StoryTaskOut,
     StoryTaskPatch,
+    TaskCommentOut,
     ApiCenterAgentOut,
     ApiCenterAllowMcpIn,
     ApiCenterConnectIn,
@@ -323,7 +333,7 @@ def api_center_agile_notifications(body: ApiCenterAgileNotificationIn, db: Sessi
         raise HTTPException(400, str(e)) from e
 
 
-# --- Projects ---
+# --- Master data (workflow templates, workspace roles) ---
 @router.get("/workflow-templates", response_model=list[WorkflowTemplateOut])
 def list_workflow_templates(db: Session = Depends(get_db), limit: int = 200) -> list[models.WorkflowTemplate]:
     return crud.workflow_templates_list(db, limit=min(limit, 500))
@@ -335,6 +345,44 @@ def create_workflow_template(body: WorkflowTemplateCreate, db: Session = Depends
         return crud.workflow_template_create(db, body)
     except IntegrityError:
         raise HTTPException(409, "Workflow template name already exists") from None
+
+
+@router.get("/workspace-roles", response_model=list[WorkspaceRoleOut])
+def list_workspace_roles(db: Session = Depends(get_db), limit: int = 500) -> list[models.WorkspaceRole]:
+    return crud.workspace_roles_list(db, limit=min(limit, 1000))
+
+
+@router.post("/workspace-roles", response_model=WorkspaceRoleOut)
+def create_workspace_role(body: WorkspaceRoleCreate, db: Session = Depends(get_db)) -> models.WorkspaceRole:
+    try:
+        return crud.workspace_role_create(db, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    except IntegrityError:
+        raise HTTPException(409, "Role slug already exists") from None
+
+
+@router.patch("/workspace-roles/{role_id}", response_model=WorkspaceRoleOut)
+def patch_workspace_role(role_id: int, body: WorkspaceRolePatch, db: Session = Depends(get_db)) -> models.WorkspaceRole:
+    row = crud.workspace_role_get(db, role_id)
+    if row is None:
+        raise HTTPException(404, "Role not found")
+    try:
+        return crud.workspace_role_patch(db, row, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+
+@router.delete("/workspace-roles/{role_id}", status_code=204)
+def delete_workspace_role(role_id: int, db: Session = Depends(get_db)) -> Response:
+    row = crud.workspace_role_get(db, role_id)
+    if row is None:
+        raise HTTPException(404, "Role not found")
+    try:
+        crud.workspace_role_delete(db, row)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    return Response(status_code=204)
 
 
 # --- Projects ---
@@ -475,6 +523,134 @@ def remove_project_member(
     )
 
 
+_log_inv = logging.getLogger(__name__)
+
+
+def _bg_send_project_invite_email(to_email: str, inviter_name: str, project_name: str, token: str) -> None:
+    try:
+        from ..mail import project_invite_accept_url, send_project_invite_email
+
+        send_project_invite_email(
+            to_email=to_email,
+            inviter_display_name=inviter_name,
+            project_name=project_name,
+            accept_url=project_invite_accept_url(token),
+        )
+    except Exception:
+        _log_inv.exception("Failed to send project invite email to %s", to_email)
+
+
+@router.get("/me/project-invites", response_model=list[MyProjectInviteOut])
+def list_my_project_invites(
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> list[MyProjectInviteOut]:
+    rows = crud.project_invite_list_pending_for_user_email(db, current.email)
+    out: list[MyProjectInviteOut] = []
+    for r in rows:
+        p = crud.project_get(db, r.project_id)
+        out.append(
+            MyProjectInviteOut(
+                token=r.token,
+                project_id=r.project_id,
+                project_name=p.name if p else "Project",
+                project_slug=p.slug if p else "",
+                role=r.role,
+                expires_at=r.expires_at,
+            )
+        )
+    return out
+
+
+@router.post("/projects/{project_id}/invites", response_model=ProjectInvitePendingOut)
+def create_project_invite(
+    project_id: int,
+    body: ProjectInviteCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> ProjectInvitePendingOut:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    try:
+        row = crud.project_invite_create(
+            db,
+            project_id=project_id,
+            email=str(body.email),
+            role=body.role,
+            invited_by_member_id=current.member_id,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    inviter = crud.member_get(db, current.member_id)
+    inviter_name = inviter.display_name if inviter else "Teammate"
+    background_tasks.add_task(_bg_send_project_invite_email, row.email, inviter_name, p.name, row.token)
+    return ProjectInvitePendingOut.model_validate(row)
+
+
+@router.get("/projects/{project_id}/invites/pending", response_model=list[ProjectInvitePendingOut])
+def list_pending_project_invites(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> list[ProjectInvitePendingOut]:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    rows = crud.project_invite_list_pending_for_project(db, project_id)
+    return [ProjectInvitePendingOut.model_validate(r) for r in rows]
+
+
+@router.delete("/projects/{project_id}/invites/{invite_id}", status_code=204)
+def revoke_project_invite(
+    project_id: int,
+    invite_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    if not crud.project_invite_revoke(db, invite_id, project_id):
+        raise HTTPException(404, "Invite not found or already used")
+    return Response(status_code=204)
+
+
+@router.post("/invites/token/{token}/accept", response_model=ProjectMemberOut)
+def accept_project_invite_route(
+    token: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> ProjectMemberOut:
+    try:
+        link, joined_new = crud.project_invite_accept(db, token, current)
+    except ValueError as e:
+        code = str(e)
+        if code == "email_mismatch":
+            raise HTTPException(403, "Sign-in email must match the invited email") from None
+        raise HTTPException(400, f"Cannot accept invitation ({code})") from None
+    mem = crud.member_get(db, link.member_id)
+    if joined_new:
+        background_tasks.add_task(chat_sync.notify_chat_member_added, link.project_id, link.member_id)
+        p = crud.project_get(db, link.project_id)
+        if p:
+            schedule_api_center_event_fanout(
+                background_tasks,
+                project_id=link.project_id,
+                project_name=p.name,
+                event_type="agile_studio.project.member_added",
+                summary=f"Member {mem.display_name if mem else link.member_id} joined {p.name} (invite)",
+                changed_fields=["project_members"],
+                data={"project_id": link.project_id, "member_id": link.member_id, "role": link.role},
+            )
+    return ProjectMemberOut(
+        project_id=link.project_id,
+        member_id=link.member_id,
+        role=link.role,
+        joined_at=link.joined_at,
+        member=MemberOut.model_validate(mem) if mem else None,
+    )
+
+
 # --- Releases ---
 @router.post("/projects/{project_id}/releases", response_model=ReleaseOut)
 def create_release(
@@ -611,6 +787,302 @@ def create_story(
     return StoryOut.model_validate(out)
 
 
+@router.get("/projects/{project_id}/tasks", response_model=StoryTaskListPage)
+def list_project_tasks(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+    assignee_member_id: Optional[int] = None,
+    task_status: Optional[str] = None,
+    ticket_priority: Optional[str] = None,
+    ticket_type: Optional[str] = None,
+    story_id: Optional[int] = None,
+    q: Optional[str] = None,
+    watched_by_me: bool = False,
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> StoryTaskListPage:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    if task_status is not None and task_status not in crud.TASK_STATUS_VALUES:
+        raise HTTPException(400, "invalid task_status")
+    if ticket_priority is not None and ticket_priority not in crud.TASK_PRIORITY_VALUES:
+        raise HTTPException(400, "invalid ticket_priority")
+    if ticket_type is not None and ticket_type not in crud.TASK_TYPE_VALUES:
+        raise HTTPException(400, "invalid ticket_type")
+    if story_id is not None:
+        s = crud.story_get(db, story_id)
+        if s is None or s.project_id != project_id:
+            raise HTTPException(404, "Story not found")
+    pm = crud.project_member_ids(db, project_id)
+    if assignee_member_id is not None and assignee_member_id not in pm:
+        raise HTTPException(400, "assignee_member_id is not a member of this project")
+    watched_mid = current.member_id if watched_by_me else None
+    rows, total = crud.project_tasks_page_out(
+        db,
+        project_id,
+        assignee_member_id=assignee_member_id,
+        task_status=task_status,
+        ticket_priority=ticket_priority,
+        ticket_type=ticket_type,
+        story_id=story_id,
+        watched_by_member_id=watched_mid,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+    return StoryTaskListPage(
+        items=[StoryTaskOut.model_validate(x) for x in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}", response_model=StoryTaskOut)
+def get_project_story_task(
+    project_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> StoryTaskOut:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    row = crud.story_task_out_for_project_task(db, project_id, task_id)
+    if row is None:
+        raise HTTPException(404, "Ticket not found")
+    return StoryTaskOut.model_validate(row)
+
+
+@router.patch("/projects/{project_id}/tasks/{task_id}", response_model=StoryTaskOut)
+def patch_project_task(
+    project_id: int,
+    task_id: int,
+    body: StoryTaskPatch,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> StoryTaskOut:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Task not found")
+    try:
+        st2 = crud.story_task_patch(db, st, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return StoryTaskOut.model_validate(crud.story_task_to_out(db, st2))
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}", status_code=204)
+def delete_project_task(
+    project_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Task not found")
+    crud.story_task_delete(db, st)
+    return Response(status_code=204)
+
+
+@router.post("/projects/{project_id}/tasks", response_model=StoryTaskOut)
+def create_project_task(
+    project_id: int,
+    body: StoryTaskCreate,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> StoryTaskOut:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    try:
+        st = crud.story_task_create_for_project(db, project_id, body)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return StoryTaskOut.model_validate(crud.story_task_to_out(db, st))
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/watch", status_code=204)
+def watch_project_task(
+    project_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Task not found")
+    try:
+        crud.story_task_watch_add(db, task_id, current.member_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return Response(status_code=204)
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}/watch", status_code=204)
+def unwatch_project_task(
+    project_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Task not found")
+    crud.story_task_watch_remove(db, task_id, current.member_id)
+    return Response(status_code=204)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/comments", response_model=list[TaskCommentOut])
+def list_project_task_comments(
+    project_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> list[models.StoryTaskComment]:
+    _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Ticket not found")
+    return crud.task_comments_list(db, task_id)
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/comments", response_model=TaskCommentOut)
+def create_project_task_comment(
+    project_id: int,
+    task_id: int,
+    comment: CommentCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> models.StoryTaskComment:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Ticket not found")
+    try:
+        c = crud.task_comment_create(db, st, author_member_id=current.member_id, body=comment)
+        db.refresh(c)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=p.id,
+        project_name=p.name,
+        event_type="agile_studio.task_comment.created",
+        summary=f'New comment on ticket "{st.title[:80]}"',
+        changed_fields=["task_comment"],
+        data={
+            "project_id": p.id,
+            "task_id": st.id,
+            "comment_id": c.id,
+            "author_member_id": current.member_id,
+            "story_ids": crud.story_task_story_ids_get(db, st.id),
+            "body_preview": (c.body or "")[:8000],
+            "recipient_hints": crud.recipient_hints_for_task_comment(
+                db,
+                p.id,
+                comment_body=c.body,
+                author_member_id=current.member_id,
+            ),
+        },
+    )
+    return c
+
+
+@router.patch("/projects/{project_id}/tasks/{task_id}/comments/{comment_id}", response_model=TaskCommentOut)
+def patch_project_task_comment(
+    project_id: int,
+    task_id: int,
+    comment_id: int,
+    body: CommentUpdate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> models.StoryTaskComment:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Ticket not found")
+    c = crud.task_comment_get(db, comment_id)
+    if c is None or c.story_task_id != task_id:
+        raise HTTPException(404, "Comment not found")
+    try:
+        crud.task_comment_update(db, c, editor_member_id=current.member_id, body=body)
+        db.refresh(c)
+        schedule_api_center_event_fanout(
+            background_tasks,
+            project_id=p.id,
+            project_name=p.name,
+            event_type="agile_studio.task_comment.updated",
+            summary=f"Comment {c.id} updated on ticket {st.id}",
+            changed_fields=["body"],
+            data={
+                "project_id": p.id,
+                "task_id": st.id,
+                "comment_id": c.id,
+                "story_ids": crud.story_task_story_ids_get(db, st.id),
+                "body_preview": (c.body or "")[:8000],
+                "recipient_hints": crud.recipient_hints_for_task_comment(
+                    db,
+                    p.id,
+                    comment_body=c.body,
+                    author_member_id=current.member_id,
+                ),
+            },
+        )
+        return c
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from e
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}/comments/{comment_id}", status_code=204)
+def delete_project_task_comment(
+    project_id: int,
+    task_id: int,
+    comment_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    p = _project_or_404(db, project_id)
+    _require_project_member(db, project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or st.project_id != project_id:
+        raise HTTPException(404, "Ticket not found")
+    c = crud.task_comment_get(db, comment_id)
+    if c is None or c.story_task_id != task_id:
+        raise HTTPException(404, "Comment not found")
+    cid = c.id
+    try:
+        crud.task_comment_delete(db, c, editor_member_id=current.member_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from e
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=p.id,
+        project_name=p.name,
+        event_type="agile_studio.task_comment.deleted",
+        summary=f"Comment {cid} deleted on ticket {st.id}",
+        changed_fields=["task_comment"],
+        data={"project_id": p.id, "task_id": st.id, "comment_id": cid},
+    )
+    return Response(status_code=204)
+
+
 @router.get("/projects/{project_id}/stories", response_model=list[StoryOut])
 def list_stories(project_id: int, db: Session = Depends(get_db), status: Optional[str] = None) -> list[StoryOut]:
     p = _project_or_404(db, project_id)
@@ -656,7 +1128,7 @@ def patch_story_task(
 ) -> StoryTaskOut:
     _story_or_404(db, story_id)
     st = crud.story_task_get(db, task_id)
-    if st is None or st.story_id != story_id:
+    if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
         raise HTTPException(404, "Task not found")
     try:
         st2 = crud.story_task_patch(db, st, body)
@@ -669,9 +1141,44 @@ def patch_story_task(
 def delete_story_task(story_id: int, task_id: int, db: Session = Depends(get_db)) -> Response:
     _story_or_404(db, story_id)
     st = crud.story_task_get(db, task_id)
-    if st is None or st.story_id != story_id:
+    if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
         raise HTTPException(404, "Task not found")
     crud.story_task_delete(db, st)
+    return Response(status_code=204)
+
+
+@router.post("/stories/{story_id}/tasks/{task_id}/watch", status_code=204)
+def watch_story_task(
+    story_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    s = _story_or_404(db, story_id)
+    _require_project_member(db, s.project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
+        raise HTTPException(404, "Task not found")
+    try:
+        crud.story_task_watch_add(db, task_id, current.member_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return Response(status_code=204)
+
+
+@router.delete("/stories/{story_id}/tasks/{task_id}/watch", status_code=204)
+def unwatch_story_task(
+    story_id: int,
+    task_id: int,
+    db: Session = Depends(get_db),
+    current: models.User = Depends(get_current_user),
+) -> Response:
+    s = _story_or_404(db, story_id)
+    _require_project_member(db, s.project_id, current.member_id)
+    st = crud.story_task_get(db, task_id)
+    if st is None or not crud.story_task_linked_to_story(db, task_id, story_id):
+        raise HTTPException(404, "Task not found")
+    crud.story_task_watch_remove(db, task_id, current.member_id)
     return Response(status_code=204)
 
 
@@ -788,6 +1295,7 @@ def create_comment(
             "story_key": st_key,
             "comment_id": c.id,
             "author_member_id": current.member_id,
+            "body_preview": (c.body or "")[:8000],
             "recipient_hints": crud.recipient_hints_for_story_comment(
                 db,
                 p.id,
@@ -836,6 +1344,7 @@ def patch_comment(
                 "story_id": s.id,
                 "story_key": st_key,
                 "comment_id": c.id,
+                "body_preview": (c.body or "")[:8000],
                 "recipient_hints": crud.recipient_hints_for_story_comment(
                     db,
                     p.id,
@@ -967,6 +1476,7 @@ def wiki_folder_delete_route(
 def wiki_doc_create(
     project_id: int,
     body: WikiDocCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current: models.User = Depends(get_current_user),
 ) -> WikiDocOut:
@@ -976,6 +1486,15 @@ def wiki_doc_create(
         doc = crud.wiki_doc_create(db, project_id, body, current.member_id)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=project_id,
+        project_name=p.name,
+        event_type="agile_studio.wiki_document.created",
+        summary=f'Wiki doc created «{doc.title}»',
+        changed_fields=["wiki_document"],
+        data=wiki_document_webhook_data_dict(doc),
+    )
     return WikiDocOut.model_validate(crud.wiki_doc_to_out(db, doc, project_slug=p.slug))
 
 
@@ -1113,6 +1632,7 @@ def wiki_doc_put(
     project_id: int,
     doc_id: str,
     body: WikiDocPatch,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current: models.User = Depends(get_current_user),
 ) -> WikiDocOut:
@@ -1125,6 +1645,15 @@ def wiki_doc_put(
         doc2 = crud.wiki_doc_patch(db, doc, body)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=project_id,
+        project_name=p.name,
+        event_type="agile_studio.wiki_document.updated",
+        summary=f'Wiki doc updated «{doc2.title}»',
+        changed_fields=["wiki_document"],
+        data=wiki_document_webhook_data_dict(doc2),
+    )
     return WikiDocOut.model_validate(crud.wiki_doc_to_out(db, doc2, project_slug=p.slug))
 
 
@@ -1132,6 +1661,7 @@ def wiki_doc_put(
 def wiki_doc_delete(
     project_id: int,
     doc_id: str,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current: models.User = Depends(get_current_user),
 ) -> Response:
@@ -1140,7 +1670,17 @@ def wiki_doc_delete(
     doc = crud.wiki_doc_get(db, doc_id)
     if doc is None or doc.project_id != project_id:
         raise HTTPException(404, "Document not found")
+    snap = wiki_document_webhook_data_dict(doc)
     crud.wiki_doc_delete(db, doc)
+    schedule_api_center_event_fanout(
+        background_tasks,
+        project_id=project_id,
+        project_name=p.name,
+        event_type="agile_studio.wiki_document.deleted",
+        summary=f'Wiki doc deleted «{snap.get("title", "")}»',
+        changed_fields=["wiki_document"],
+        data=snap,
+    )
     return Response(status_code=204)
 
 
@@ -1294,7 +1834,8 @@ def wiki_comments_patch_route(
                 "doc_title": doc.title,
                 "author_member_id": current.member_id,
                 "status": row2.status,
-                "content_preview": row2.content[:600],
+                "body_preview": (row2.content or "")[:2000],
+                "content_preview": (row2.content or "")[:2000],
             }
         ),
     )

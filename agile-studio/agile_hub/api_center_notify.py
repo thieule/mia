@@ -21,6 +21,23 @@ from . import api_center_client, crud, models
 log = logging.getLogger(__name__)
 
 
+def wiki_document_webhook_data_dict(doc: models.WikiDocument) -> dict[str, Any]:
+    """Payload ``data`` cho Second Brain / fan-out wiki document (preview nội dung markdown)."""
+    prev = (doc.content or "")[:8000]
+    tags = doc.tags_json if isinstance(doc.tags_json, list) else []
+    return {
+        "project_id": doc.project_id,
+        "wiki_document_id": doc.id,
+        "title": doc.title,
+        "slug": doc.slug,
+        "body_preview": prev,
+        "content_preview": prev,
+        "tags": tags,
+        "is_draft": bool(doc.is_draft),
+        "author_member_id": doc.author_member_id,
+    }
+
+
 def wiki_comment_webhook_data_dict(
     db: Session,
     project_id: int,
@@ -29,6 +46,7 @@ def wiki_comment_webhook_data_dict(
     author_member_id: int,
 ) -> dict[str, Any]:
     """Payload ``data`` for ``wiki_comment_*`` webhook / API Center (matches router fanout shape)."""
+    body_prev = (row.content or "")[:2000]
     return {
         "wiki_document_id": doc.id,
         "wiki_comment_id": row.id,
@@ -36,7 +54,8 @@ def wiki_comment_webhook_data_dict(
         "doc_slug": doc.slug,
         "doc_title": doc.title,
         "author_member_id": author_member_id,
-        "content_preview": (row.content or "")[:600],
+        "body_preview": body_prev,
+        "content_preview": body_prev,
         "quote_preview": (row.quote or "")[:400],
         "parent_comment_id": row.parent_id,
         "quoted_comment_id": getattr(row, "quoted_comment_id", None),
@@ -70,6 +89,47 @@ def _dedupe_agent_ids(rows: list[dict[str, Any]]) -> list[str]:
             continue
         seen.add(aid)
         out.append(aid)
+    return out
+
+
+def _member_id_for_catalog_agent(agent_id: str, mmap: dict[str, Any]) -> int | None:
+    aid_norm = str(agent_id).strip().lower()
+    for k, v in mmap.items():
+        if str(k).strip().lower() != aid_norm:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def drop_self_authored_ai_recipients(agent_ids: list[str], data: dict[str, Any]) -> list[str]:
+    """
+    Do not enqueue the same AI that authored the triggering comment —
+    avoids mention-in-reply ping-pong (agent answers, body still tags @agent, webhook loops).
+    """
+    hints = data.get("recipient_hints") if isinstance(data.get("recipient_hints"), dict) else {}
+    raw_author = data.get("author_member_id", hints.get("author_member_id"))
+    try:
+        author_mid = int(raw_author) if raw_author is not None and str(raw_author).strip() != "" else None
+    except (TypeError, ValueError):
+        author_mid = None
+    if author_mid is None or author_mid <= 0:
+        return agent_ids
+    mmap = hints.get("ai_member_ids_by_agent")
+    if not isinstance(mmap, dict) or not mmap:
+        return agent_ids
+    out: list[str] = []
+    skipped = 0
+    for aid in agent_ids:
+        mid = _member_id_for_catalog_agent(str(aid), mmap)
+        if mid is not None and mid == author_mid:
+            skipped += 1
+            continue
+        out.append(aid)
+    if skipped:
+        log.debug("api_center fanout: skipped %s self-authored AI recipient(s)", skipped)
     return out
 
 
@@ -212,6 +272,13 @@ def run_fanout_for_agile_studio_event(
                         et,
                     )
                     return
+            agent_ids = drop_self_authored_ai_recipients(agent_ids, data)
+            if not agent_ids:
+                log.info(
+                    "api_center fanout: %s — no recipients after self-author filter (AI authored this comment)",
+                    et,
+                )
+                return
             payload = _fanout_payload(
                 project_id=project_id,
                 project_name=project_name or p.name,
@@ -244,12 +311,25 @@ def schedule_api_center_event_fanout(
     changed_fields: list[str] | None = None,
     data: dict[str, Any] | None = None,
 ) -> None:
+    cf = changed_fields or []
+    payload_data = data or {}
     background_tasks.add_task(
         run_fanout_for_agile_studio_event,
         project_id,
         project_name,
         event_type,
         summary,
-        changed_fields or [],
-        data or {},
+        cf,
+        payload_data,
+    )
+    from . import second_brain_client
+
+    background_tasks.add_task(
+        second_brain_client.post_agile_event_to_second_brain,
+        event_type=event_type,
+        project_id=project_id,
+        project_name=project_name,
+        summary=summary,
+        changed_fields=cf,
+        data=payload_data,
     )

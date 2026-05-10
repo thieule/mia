@@ -61,6 +61,32 @@ CREATE TABLE IF NOT EXISTS workflow_templates (
   UNIQUE KEY uq_workflow_templates_name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS workspace_roles (
+  id            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  slug          VARCHAR(64)     NOT NULL COMMENT 'khóa lưu trong project_members.role / invites',
+  name          VARCHAR(255)    NOT NULL COMMENT 'nhãn hiển thị',
+  description   TEXT            NULL,
+  sort_order    INT             NOT NULL DEFAULT 0,
+  is_system     TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1 = role seed hệ thống',
+  created_at    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_workspace_roles_slug (slug),
+  KEY idx_workspace_roles_sort (sort_order)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT IGNORE INTO workspace_roles (slug, name, description, sort_order, is_system, created_at, updated_at) VALUES
+('owner', 'Owner', 'Toàn quyền dự án.', 10, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('admin', 'Admin', 'Quản trị thành viên, cấu hình và backlog.', 20, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('member', 'Member', 'Người đóng góp tiêu chuẩn.', 30, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('viewer', 'Viewer', 'Chỉ đọc.', 40, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('product_owner', 'Product Owner', 'Ưu tiên backlog và chấp nhận deliverable.', 50, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('scrum_master', 'Scrum Master', 'Điều phối quy trình, gỡ vướng.', 60, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('developer', 'Developer', 'Phát triển và giao increment.', 70, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('tester', 'Tester / QA', 'Kiểm thử và tiêu chí nghiệm thu.', 80, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('stakeholder', 'Stakeholder', 'Tham vấn; thường phạm vi ghi hạn chế.', 90, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
+('ux_designer', 'UX Designer', 'Thiết kế trải nghiệm và giao diện.', 100, 1, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3));
+
 CREATE TABLE IF NOT EXISTS api_center_connections (
   id               INT UNSIGNED NOT NULL COMMENT 'singleton row id=1',
   endpoint         VARCHAR(2048) NOT NULL,
@@ -76,12 +102,31 @@ CREATE TABLE IF NOT EXISTS api_center_connections (
 CREATE TABLE IF NOT EXISTS project_members (
   project_id  INT UNSIGNED NOT NULL,
   member_id   INT UNSIGNED NOT NULL,
-  role        VARCHAR(64)     NOT NULL DEFAULT 'member' COMMENT 'owner | admin | member | viewer',
+  role        VARCHAR(64)     NOT NULL DEFAULT 'member' COMMENT 'slug trong bảng workspace_roles',
   joined_at   DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (project_id, member_id),
   CONSTRAINT fk_pm_project FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
   CONSTRAINT fk_pm_member FOREIGN KEY (member_id) REFERENCES members (id) ON DELETE CASCADE,
   KEY idx_pm_member (member_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS project_invites (
+  id                   INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  project_id           INT UNSIGNED NOT NULL,
+  email                VARCHAR(320) NOT NULL COMMENT 'normalized lowercase',
+  token                VARCHAR(96)  NOT NULL COMMENT 'opaque URL token',
+  role                 VARCHAR(64)  NOT NULL DEFAULT 'member',
+  invited_by_member_id INT UNSIGNED NULL,
+  created_at           DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  expires_at           DATETIME(3)  NOT NULL,
+  accepted_at          DATETIME(3) NULL,
+  revoked_at           DATETIME(3) NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_project_invites_token (token),
+  KEY idx_pi_project_email (project_id, email),
+  KEY idx_pi_email_pending (email, accepted_at, revoked_at),
+  CONSTRAINT fk_pi_project FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+  CONSTRAINT fk_pi_inviter FOREIGN KEY (invited_by_member_id) REFERENCES members (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -148,19 +193,47 @@ CREATE TABLE IF NOT EXISTS story_status_events (
 
 CREATE TABLE IF NOT EXISTS story_tasks (
   id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
-  story_id    INT UNSIGNED NOT NULL,
+  project_id  INT UNSIGNED NOT NULL,
   title       VARCHAR(500)    NOT NULL,
   body        MEDIUMTEXT      NULL,
   done        TINYINT(1)      NOT NULL DEFAULT 0,
+  task_status       VARCHAR(24)     NOT NULL DEFAULT 'open' COMMENT 'open | in_progress | blocked | done',
+  ticket_priority   VARCHAR(16)     NOT NULL DEFAULT 'medium' COMMENT 'low|medium|high|urgent',
+  ticket_type       VARCHAR(24)     NOT NULL DEFAULT 'task' COMMENT 'task|bug|feature|…',
+  due_at            DATETIME(3)     NULL,
+  acceptance_criteria MEDIUMTEXT    NULL,
   sort_order  INT UNSIGNED    NOT NULL DEFAULT 0,
   reporter_id INT UNSIGNED    NULL,
   created_at  DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at  DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
-  KEY idx_story_tasks_story (story_id),
+  KEY idx_story_tasks_project (project_id),
   KEY idx_story_tasks_reporter (reporter_id),
-  CONSTRAINT fk_story_tasks_story FOREIGN KEY (story_id) REFERENCES stories (id) ON DELETE CASCADE,
+  KEY idx_story_tasks_status (task_status),
+  KEY idx_story_tasks_ticket_priority (ticket_priority),
+  KEY idx_story_tasks_ticket_type (ticket_type),
+  KEY idx_story_tasks_due_at (due_at),
+  CONSTRAINT fk_story_tasks_project FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
   CONSTRAINT fk_story_tasks_reporter FOREIGN KEY (reporter_id) REFERENCES members (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS story_task_stories (
+  task_id   INT UNSIGNED NOT NULL,
+  story_id  INT UNSIGNED NOT NULL,
+  PRIMARY KEY (task_id, story_id),
+  KEY idx_story_task_stories_story (story_id),
+  CONSTRAINT fk_story_task_stories_task FOREIGN KEY (task_id) REFERENCES story_tasks (id) ON DELETE CASCADE,
+  CONSTRAINT fk_story_task_stories_story FOREIGN KEY (story_id) REFERENCES stories (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS story_task_watchers (
+  task_id   INT UNSIGNED NOT NULL,
+  member_id INT UNSIGNED NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (task_id, member_id),
+  KEY idx_story_task_watchers_member (member_id),
+  CONSTRAINT fk_story_task_watchers_task FOREIGN KEY (task_id) REFERENCES story_tasks (id) ON DELETE CASCADE,
+  CONSTRAINT fk_story_task_watchers_member FOREIGN KEY (member_id) REFERENCES members (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS story_task_assignees (
@@ -170,6 +243,19 @@ CREATE TABLE IF NOT EXISTS story_task_assignees (
   KEY idx_story_task_assignees_member (member_id),
   CONSTRAINT fk_story_task_assignees_task FOREIGN KEY (task_id) REFERENCES story_tasks (id) ON DELETE CASCADE,
   CONSTRAINT fk_story_task_assignees_member FOREIGN KEY (member_id) REFERENCES members (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS story_task_comments (
+  id               INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  story_task_id    INT UNSIGNED NOT NULL,
+  author_member_id INT UNSIGNED NOT NULL,
+  body             TEXT            NOT NULL,
+  created_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY idx_stc_task (story_task_id),
+  CONSTRAINT fk_stc_task   FOREIGN KEY (story_task_id)    REFERENCES story_tasks (id) ON DELETE CASCADE,
+  CONSTRAINT fk_stc_author FOREIGN KEY (author_member_id) REFERENCES members   (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Chat (cùng DB; chat-service đọc/ghi qua mysql2)

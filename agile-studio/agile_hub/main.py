@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api.agent_reply_router import router as agent_reply_router
 from .api.auth_router import router as auth_router
+from .api.invite_public_router import router as invite_public_router
 from .api.router import router as api_router
 from .config import get_settings
 from .db import Base, configure_engine, get_engine, wait_for_db_ready
@@ -43,6 +44,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(agent_reply_router, prefix="/api/v1")
+    app.include_router(invite_public_router, prefix="/api/v1")
     app.include_router(api_router, prefix="/api/v1")
     return app
 

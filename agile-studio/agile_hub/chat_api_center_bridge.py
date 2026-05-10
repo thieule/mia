@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from agile_hub import api_center_client, crud
+from agile_hub.config import get_settings
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ def _post_agent_reply_to_chat_service(
     content: str,
 ) -> bool:
     """POST tin agent vào chat-service. Trả False khi không gửi được (caller phải báo lỗi, không giả 200 OK)."""
-    base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
+    base = (get_settings().chat_service_url or os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
     if not base:
         log.warning("chat_api_center_bridge: AGILE_CHAT_SERVICE_URL unset, cannot post agent reply to chat")
         return False

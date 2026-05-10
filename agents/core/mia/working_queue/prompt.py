@@ -30,7 +30,13 @@ _CHAT_HIST_BLOCK_MAX = 9800
 _FALLBACK_AGILE_STUDIO_DATA_NOTIFICATION = """[Agile Studio — DATA NOTIFICATION]
 Workspace file missing: add `{subdir}/{filename}` under your agent workspace (same folder as SOUL.md).
 
-Rules: read Notification text and Context JSON (`event_type`, `data`, `recipient_hints`). Do **not** edit Agile stories, comments, or project settings unless the user **explicitly** asks or workspace approval rules apply. Do **not** call MCP `agile_chat_send` to **project group channels** (e.g. `general`) for automated status/data notifications — only story comments, **wiki doc feedback** (`agile_wiki_comment_create`), or your queue summary. For `agile_studio.comment.*`, reply **on the story** via MCP `agile_comment_create` when the comment asks something of you. For `wiki_comment_created` / `wiki_comment_updated` when you are @mentioned, reply **in the wiki doc feedback thread** via `agile_wiki_comment_create` with `parent_id=wiki_thread_root_id` from the payload — not `agile_comment_create`. No large refactors from notifications alone.
+Rules: read Notification text and Context JSON (`event_type`, `data`, `recipient_hints`). Do **not** edit Agile stories, comments, or project settings unless the user **explicitly** asks or workspace approval rules apply. Do **not** call MCP `agile_chat_send` to **project group channels** (e.g. `general`) for automated status/data notifications — only story comments, **ticket comments** (`agile_task_comment_create`), **wiki doc feedback** (`agile_wiki_comment_create`), or your queue summary.
+
+**@mention is not a mandate to post again.** Reply in the thread (story/ticket/wiki feedback) **only** when the new message needs a substantive answer: explicit question, assignment, or missing info. Skip posting for thanks, ack, emoji-only, pure FYI/ noise, or when you already answered — **silence in the thread is correct** and stops mention loops. Ping-pong quoting @you in every reply is undesirable.
+
+For `agile_studio.comment.*`, when a reply is warranted, use MCP `agile_comment_create` **on the story**. For `agile_studio.task_comment.*` (mention on a **ticket**), use `agile_task_comment_create` — not `agile_comment_create`. For `wiki_comment_*` when @mentioned **and** a reply is warranted, use `agile_wiki_comment_create` with `parent_id=wiki_thread_root_id` — not story comments.
+
+No large refactors from notifications alone.
 """.format(subdir=_PROJECT_PROMPT_SUBDIR, filename=_AGILE_STUDIO_DATA_NOTIFICATION_FILE)
 
 
@@ -193,13 +199,18 @@ def _build_agile_studio_data_notification_prompt(
     if event_type:
         lines.append(f"event_type: {event_type}")
         lines.append("")
+    lines.append(
+        "**When to omit an Agile comment entirely:** thanks/ack/noise/already-covered → do **not** call comment-create tools; "
+        "summarize «no reply needed» in your queue closure only."
+    )
+    lines.append("")
     if event_type in ("wiki_comment_created", "wiki_comment_updated"):
         wd = data.get("wiki_document_id")
         wr = data.get("wiki_thread_root_id")
         if wd and wr:
             lines.append(
                 f"Wiki feedback: doc_id={wd!r}, thread root for replies parent_id={wr!r}. "
-                "Use MCP `agile_wiki_comment_create(project_id, doc_id, author_member_id, content, parent_id=thread_root)`. "
+                "If replying **is** warranted: MCP `agile_wiki_comment_create(project_id, doc_id, author_member_id, content, parent_id=thread_root)`. "
                 "Optional: `quoted_comment_id` / `quoted_text`. List thread with `agile_wiki_comments_list`. "
                 "**Do not** use `agile_comment_create` (stories only)."
             )
@@ -208,8 +219,17 @@ def _build_agile_studio_data_notification_prompt(
         sid = data.get("story_id")
         if sid is not None:
             lines.append(
-                f"story_id={sid} — reply on-thread via MCP `agile_comment_create` "
+                f"story_id={sid} — if a reply **is** warranted: MCP `agile_comment_create` "
                 "(story_id, author_member_id, plus comment text as `body`, `body_text`, or `text`; see Notification text for author_member_id)."
+            )
+            lines.append("")
+    if event_type in ("agile_studio.task_comment.created", "agile_studio.task_comment.updated"):
+        tid = data.get("task_id")
+        pid = data.get("project_id")
+        if tid is not None and pid is not None:
+            lines.append(
+                f"task_id={tid!r}, project_id={pid!r} — if a reply **is** warranted: MCP `agile_task_comment_create` "
+                "(project_id, task_id, author_member_id, plus comment text as `body` / `body_text` / `text`; **not** `agile_comment_create`)."
             )
             lines.append("")
     if hints:
@@ -222,7 +242,8 @@ def _build_agile_studio_data_notification_prompt(
     lines.append(truncate_text(task.message, 120_000))
     lines.append("")
     lines.append(
-        "Close with a few lines: handled or not and why. Do not mention posting to project group chat "
+        "Close with a few lines: handled or not, why, and **whether you posted (or skipped) an Agile thread reply** on purpose. "
+        "If you skipped because no reply was needed, say so clearly. Do not mention posting to project group chat "
         "unless the human explicitly asked for that in this event's thread."
     )
     return "\n".join(lines)

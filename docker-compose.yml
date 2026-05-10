@@ -23,17 +23,93 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: ai_demo_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/secondbrain_local
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p secondbrain_local 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+    container_name: ai_demo_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+
+  second-brain-mcp:
+    build:
+      context: ./second-brain
+      dockerfile: Dockerfile
+    container_name: ai_demo_second_brain_mcp
+    restart: unless-stopped
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: secondbrain_local
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+      MCP_STATELESS_HTTP: "true"
+      MCP_JSON_RESPONSE: "true"
+      SECOND_BRAIN_INGEST_SECRET: secondbrain_ingest_dev
+      LOG_LEVEL: INFO
+      # Embedding Elasticsearch — truyền từ host: export GEMINI_API_KEY=...
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      SECOND_BRAIN_GITHUB_WEBHOOK_SECRET: ${SECOND_BRAIN_GITHUB_WEBHOOK_SECRET:-}
+      SECOND_BRAIN_GITHUB_TOKEN: ${SECOND_BRAIN_GITHUB_TOKEN:-}
+      SECOND_BRAIN_GITHUB_REPO_PROJECT_MAP: ${SECOND_BRAIN_GITHUB_REPO_PROJECT_MAP:-}
+      SECOND_BRAIN_GITHUB_DEFAULT_PROJECT_ID: ${SECOND_BRAIN_GITHUB_DEFAULT_PROJECT_ID:-}
+    ports:
+      - "9122:8000"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
   agile-studio:
     build:
       context: ./agile-studio
       dockerfile: Dockerfile
     container_name: ai_demo_agile_studio
     restart: unless-stopped
+    # Nạp AGILE_AGENT_REPLY_TOKEN, AGILE_JWT_SECRET, … từ agile-studio/.env — các biến dưới `environment` ghi đè (DB + chat URL trong mạng Docker).
+    env_file:
+      - ./agile-studio/.env
     environment:
       AGILE_DATABASE_URL: mysql+pymysql://app:app@mysql:3306/agile_studio
       AGILE_LISTEN_HOST: "0.0.0.0"
       AGILE_LISTEN_PORT: "9120"
+      # Bắt buộc hostname service Docker — không dùng 127.0.0.1 trong container (127.0.0.1 = chính Hub).
       AGILE_CHAT_SERVICE_URL: http://agile-studio-chat:9130
+      AGILE_SECOND_BRAIN_INGEST_URL: http://second-brain-mcp:8000/ingest/agile-event
+      AGILE_SECOND_BRAIN_INGEST_SECRET: secondbrain_ingest_dev
     volumes:
       - ./agile-studio/agile_hub:/app/agile_hub
     ports:
@@ -43,6 +119,8 @@ services:
         condition: service_healthy
       agile-studio-chat:
         condition: service_started
+      second-brain-mcp:
+        condition: service_started
 
   # MCP Agile Studio — streamable HTTP; trong container listen MCP_PORT (8000), host map 9121 → http://127.0.0.1:9121/mcp
   agile-studio-mcp:
@@ -51,10 +129,13 @@ services:
       dockerfile: Dockerfile
     container_name: ai_demo_agile_mcp
     restart: unless-stopped
+    env_file:
+      - ./agile-studio/.env
     environment:
       AGILE_DATABASE_URL: mysql+pymysql://app:app@mysql:3306/agile_studio
       AGILE_CHAT_SERVICE_URL: http://agile-studio-chat:9130
       MCP_TRANSPORT: streamable-http
+      # Ghi đè agile-studio/.env (127.0.0.1) — trong container phải bind 0.0.0.0 mới map được cổng host.
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8000"
       # Avoid HTTP 404 from stale Mcp-Session-Id after Hub/MCP restarts; use JSON responses (SDK-friendly).
@@ -111,3 +192,5 @@ services:
 
 volumes:
   mysql_data:
+  neo4j_data:
+  es_data:

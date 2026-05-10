@@ -8,7 +8,13 @@ import os
 import urllib.error
 import urllib.request
 
+from agile_hub.config import get_settings
+
 logger = logging.getLogger(__name__)
+
+
+def _chat_service_base() -> str:
+    return (get_settings().chat_service_url or os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
 
 
 def notify_chat_project_created(project_id: int) -> None:
@@ -16,7 +22,7 @@ def notify_chat_project_created(project_id: int) -> None:
     Sau khi tạo project: đảm bảo có channel `general`.
     Bỏ qua nếu không cấu hình AGILE_CHAT_SERVICE_URL.
     """
-    base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
+    base = _chat_service_base()
     if not base:
         return
     url = f"{base}/api/chat/internal/channels/ensure-after-project-created"
@@ -45,7 +51,7 @@ def notify_chat_member_added(project_id: int, member_id: int) -> None:
     Sau POST /projects/{id}/members: tạo kênh general (nếu thiếu) + kênh DM với mọi member khác.
     Bỏ qua nếu không cấu hình AGILE_CHAT_SERVICE_URL.
     """
-    base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
+    base = _chat_service_base()
     if not base:
         return
     url = f"{base}/api/chat/internal/channels/ensure-after-member-added"
@@ -74,7 +80,7 @@ def notify_story_chat_event(project_id: int, story_id: int, event_type: str, pay
     Broadcast story activity (comments, …) qua chat-service WebSocket (`chat:event`).
     Clients join room `{projectId}_story_{storyId}` (same mechanism as `chat:join`).
     """
-    base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
+    base = _chat_service_base()
     if not base:
         return
     url = f"{base}/api/chat/internal/story-events/broadcast"
@@ -101,7 +107,7 @@ def notify_story_chat_event(project_id: int, story_id: int, event_type: str, pay
 
 def notify_wiki_doc_chat_event(project_id: int, doc_id: str, event_type: str, payload: dict) -> None:
     """Broadcast wiki feedback (`chat:event`) tới room `{projectId}_wiki_doc_{docId}`."""
-    base = (os.environ.get("AGILE_CHAT_SERVICE_URL") or "").strip().rstrip("/")
+    base = _chat_service_base()
     did = str(doc_id or "").strip()
     if not base or not did:
         return

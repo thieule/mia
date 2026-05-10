@@ -51,6 +51,11 @@ class Session:
         if start:
             sliced = sliced[start:]
 
+        # Gemini (and similar) reject histories whose first model turn is only tool_calls:
+        # "function call turn must come immediately after a user turn or function response".
+        # A sliding window can start at assistant(tool_calls)… with no user inside the slice.
+        sliced = Session._strip_leading_assistant_tool_call_turns(sliced)
+
         out: list[dict[str, Any]] = []
         for message in sliced:
             entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
@@ -65,6 +70,23 @@ class Session:
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()
+
+    @staticmethod
+    def _strip_leading_assistant_tool_call_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop leading assistant(tool_calls) plus following tool messages until a safe head role.
+
+        When *messages* is already orphan-trimmed, the only problematic pattern left at index 0
+        is an assistant message that only requests tools (no prior user in this window).
+        """
+        out = messages
+        while out:
+            head = out[0]
+            if head.get("role") != "assistant" or not head.get("tool_calls"):
+                break
+            out = out[1:]
+            while out and out[0].get("role") == "tool":
+                out = out[1:]
+        return out
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
         """Keep a legal recent suffix, mirroring get_history boundary rules."""

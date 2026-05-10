@@ -43,6 +43,7 @@ def auth_register(body: UserRegister, db: Session = Depends(get_db)) -> TokenRes
         )
     except IntegrityError:
         raise HTTPException(409, "Could not create account (duplicate data)") from None
+    crud.project_invite_try_accept_for_new_user(db, body.invite_token, u)
     token = create_access_token(user_id=u.id, email=u.email)
     return TokenResponse(access_token=token, user=_user_public(u))
 

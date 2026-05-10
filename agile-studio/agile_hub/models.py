@@ -36,6 +36,7 @@ class Member(Base):
     project_links: Mapped[list["ProjectMember"]] = relationship(back_populates="member")
     user: Mapped[Optional["User"]] = relationship(back_populates="member", uselist=False)
     comments_authored: Mapped[list["StoryComment"]] = relationship(back_populates="author")
+    task_comments_authored: Mapped[list["StoryTaskComment"]] = relationship(back_populates="author")
     story_assignments: Mapped[list["StoryAssignee"]] = relationship(back_populates="member", passive_deletes=True)
     wiki_doc_comments_authored: Mapped[list["WikiComment"]] = relationship(back_populates="author")
 
@@ -74,8 +75,10 @@ class Project(Base):
     )
 
     members: Mapped[list["ProjectMember"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    invites: Mapped[list["ProjectInvite"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     stories: Mapped[list["Story"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     releases: Mapped[list["Release"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    tasks: Mapped[list["StoryTask"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class WorkflowTemplate(Base):
@@ -86,6 +89,23 @@ class WorkflowTemplate(Base):
     id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
+    )
+
+
+class WorkspaceRole(Base):
+    """Master data: vai trò trong dự án (slug khớp project_members.role và project_invites.role)."""
+
+    __tablename__ = "workspace_roles"
+
+    id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
@@ -147,6 +167,29 @@ class ProjectMember(Base):
     member: Mapped["Member"] = relationship(back_populates="project_links")
 
 
+class ProjectInvite(Base):
+    """Email invitation to join a project; accepted via token + logged-in user email match."""
+
+    __tablename__ = "project_invites"
+
+    id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    token: Mapped[str] = mapped_column(String(96), nullable=False, unique=True)
+    role: Mapped[str] = mapped_column(String(64), nullable=False, default="member")
+    invited_by_member_id: Mapped[Optional[int]] = mapped_column(
+        MUInt, ForeignKey("members.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False), nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False), nullable=True)
+
+    project: Mapped["Project"] = relationship(back_populates="invites")
+
+
 class Story(Base):
     __tablename__ = "stories"
     __table_args__ = (UniqueConstraint("project_id", "story_number", name="uq_stories_project_num"),)
@@ -192,25 +235,29 @@ class Story(Base):
     assignments: Mapped[list["StoryAssignee"]] = relationship(
         back_populates="story", cascade="all, delete-orphan", passive_deletes=True, order_by="StoryAssignee.member_id"
     )
-    tasks: Mapped[list["StoryTask"]] = relationship(
+    task_story_links: Mapped[list["StoryTaskStory"]] = relationship(
         back_populates="story",
         cascade="all, delete-orphan",
-        order_by="StoryTask.sort_order, StoryTask.id",
     )
 
 
 class StoryTask(Base):
-    """Work tasks under a story (title + body); not separate Kanban cards."""
+    """Ticket / task in a project; optionally linked to one or many stories via ``story_task_stories``."""
 
     __tablename__ = "story_tasks"
 
     id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
-    story_id: Mapped[int] = mapped_column(
-        MUInt, ForeignKey("stories.id", ondelete="CASCADE"), nullable=False
+    project_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
     )
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    task_status: Mapped[str] = mapped_column(String(24), nullable=False, default="open")
+    ticket_priority: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
+    ticket_type: Mapped[str] = mapped_column(String(24), nullable=False, default="task")
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False), nullable=True)
+    acceptance_criteria: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     sort_order: Mapped[int] = mapped_column(MUInt, nullable=False, default=0)
     reporter_id: Mapped[Optional[int]] = mapped_column(
         MUInt, ForeignKey("members.id", ondelete="SET NULL"), nullable=True
@@ -220,12 +267,82 @@ class StoryTask(Base):
         DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
     )
 
-    story: Mapped["Story"] = relationship(back_populates="tasks")
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+    story_links: Mapped[list["StoryTaskStory"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="StoryTaskStory.story_id",
+    )
     assignments: Mapped[list["StoryTaskAssignee"]] = relationship(
         back_populates="task",
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="StoryTaskAssignee.member_id",
+    )
+    watchers: Mapped[list["StoryTaskWatcher"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="StoryTaskWatcher.member_id",
+    )
+    comments: Mapped[list["StoryTaskComment"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="StoryTaskComment.created_at",
+    )
+
+
+class StoryTaskStory(Base):
+    """Many stories can link to the same project ticket; ticket may have zero links (orphan / project-only)."""
+
+    __tablename__ = "story_task_stories"
+
+    task_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("story_tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    story_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("stories.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    task: Mapped["StoryTask"] = relationship(back_populates="story_links")
+    story: Mapped["Story"] = relationship(back_populates="task_story_links")
+
+
+class StoryTaskWatcher(Base):
+    __tablename__ = "story_task_watchers"
+
+    task_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("story_tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    member_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("members.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+
+    task: Mapped["StoryTask"] = relationship(back_populates="watchers")
+
+
+class StoryTaskComment(Base):
+    __tablename__ = "story_task_comments"
+
+    id: Mapped[int] = mapped_column(MUInt, primary_key=True, autoincrement=True)
+    story_task_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("story_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    author_member_id: Mapped[int] = mapped_column(
+        MUInt, ForeignKey("members.id", ondelete="RESTRICT"), nullable=False
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=_utc_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=_utc_naive, onupdate=_utc_naive
+    )
+
+    task: Mapped["StoryTask"] = relationship(back_populates="comments")
+    author: Mapped["Member"] = relationship(
+        back_populates="task_comments_authored", foreign_keys=[author_member_id]
     )
 
 

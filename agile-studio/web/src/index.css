@@ -2412,3 +2412,217 @@ body {
   overflow: auto;
   word-break: break-word;
 }
+
+/* —— Ticket create (full-page form) —— */
+.as-ticket-create {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.as-ticket-create-kicker {
+  letter-spacing: 0.055em;
+}
+
+.as-ticket-create-grid {
+  display: grid;
+  gap: 1.5rem;
+}
+
+@media (min-width: 992px) {
+  .as-ticket-create-grid {
+    grid-template-columns: minmax(0, 1fr) 340px;
+    align-items: start;
+  }
+
+  .as-ticket-fieldset-sticky {
+    position: sticky;
+    top: 1rem;
+  }
+}
+
+.as-ticket-fieldset {
+  background: var(--as-elevated);
+  border: 1px solid var(--as-border);
+  border-radius: 12px;
+  padding: 1.125rem 1.25rem 1.25rem;
+  box-shadow: var(--as-shadow);
+}
+
+.as-ticket-fieldset-title {
+  font-size: 0.9375rem;
+  font-weight: 700;
+  color: var(--as-text);
+  margin: 0 0 0.15rem;
+  letter-spacing: -0.015em;
+}
+
+.as-ticket-fieldset-hint,
+.as-ticket-sublabel {
+  font-size: 0.8125rem;
+  color: var(--as-muted);
+  margin-bottom: 0.65rem;
+}
+
+.as-ticket-label {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--as-muted);
+  margin-bottom: 0.35rem;
+  display: block;
+}
+
+.as-ticket-title-input {
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+}
+
+.as-ticket-subheading {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--as-muted);
+  margin: 0.5rem 0 0.75rem;
+  padding-top: 0.25rem;
+  border-top: 1px solid var(--as-border);
+}
+
+.as-ticket-md .w-md-editor {
+  border-radius: 8px !important;
+  border-color: #e2e8f0 !important;
+}
+
+.as-ticket-modal-kicker {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--as-muted);
+  margin: 0 0 0.75rem;
+}
+
+.as-ticket-modal-body {
+  background: linear-gradient(180deg, #fafbfc 0%, #fff 100%);
+}
+
+/* Tickets list — pagination bar */
+.as-tickets-pager {
+  border-top: 1px solid var(--as-border);
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+}
+
+/* —— Ticket view (read-only detail) —— */
+.as-ticket-view-title {
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+
+.as-ticket-view-card {
+  background: var(--as-elevated);
+  border: 1px solid var(--as-border);
+  border-radius: 12px;
+  padding: 1rem 1.125rem;
+  box-shadow: var(--as-shadow);
+}
+
+.as-ticket-view-card-label {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.055em;
+  color: var(--as-muted);
+  margin-bottom: 0.35rem;
+}
+
+.as-ticket-view-card-value {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--as-text);
+  line-height: 1.45;
+}
+
+.as-ticket-view-section-title {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--as-muted);
+  margin-bottom: 0.65rem;
+}
+
+.as-ticket-view-panel {
+  background: linear-gradient(180deg, #fafbfc 0%, #fff 100%);
+  border: 1px solid var(--as-border);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+}
+
+.as-story-link-picker-dropdown {
+  border-radius: 10px !important;
+  border: 1px solid var(--as-border) !important;
+  overflow: hidden;
+}
+
+/* —— Ticket edit (full page) —— */
+.as-ticket-edit {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.as-ticket-edit-quick {
+  border-left: 4px solid var(--as-accent);
+}
+
+/* Main column (wider): summary + markdown; aside (narrow): triage, assign, stories */
+.as-ticket-edit-layout {
+  display: grid;
+  gap: 1.35rem;
+  align-items: start;
+}
+
+.as-ticket-edit-main > .as-ticket-fieldset:not(:last-child),
+.as-ticket-edit-aside > .as-ticket-fieldset:not(:last-child) {
+  margin-bottom: 1.25rem;
+}
+
+.as-ticket-edit-aside .as-ticket-fieldset:last-child {
+  margin-bottom: 0;
+}
+
+@media (min-width: 992px) {
+  .as-ticket-edit-layout {
+    grid-template-columns: minmax(0, 1.72fr) minmax(260px, 1fr);
+    gap: 1.5rem;
+  }
+
+  .as-ticket-edit-aside {
+    position: sticky;
+    top: 0.75rem;
+  }
+}
+
+.as-ticket-edit-actions {
+  border-top: 1px solid var(--as-border);
+  padding-top: 1.25rem;
+  margin-top: 0.5rem;
+}
+
+/* Ticket page: double-click to edit title / description */
+.as-ticket-inline-edit-target {
+  cursor: text;
+  border-radius: 10px;
+  outline: none;
+}
+
+.as-ticket-inline-edit-target:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.as-ticket-inline-title-target.as-ticket-inline-edit-target:focus-visible {
+  box-shadow: 0 0 0 2px var(--as-accent, #0d6efd);
+}

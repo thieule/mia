@@ -57,6 +57,18 @@ function isPublicAuthPath(path) {
   return path === "/auth/login" || path === "/auth/register";
 }
 
+/** GET without Authorization (public preview endpoints). */
+export async function apiGetPublic(path, fetchInit = {}) {
+  const { headers: extraHeaders = {}, ...rest } = fetchInit;
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...rest,
+    headers: { Accept: "application/json", ...extraHeaders },
+  });
+  const data = await parseJson(res);
+  if (!res.ok) throw new Error(data?.detail || data?.error || JSON.stringify(data));
+  return data;
+}
+
 async function handleResponse(res, path, data) {
   if (res.status === 401 && !isPublicAuthPath(path)) {
     clearAuth();
@@ -88,6 +100,7 @@ export async function apiPost(path, body) {
     headers: jsonHeaders(),
     body: JSON.stringify(body),
   });
+  if (res.status === 204) return handleResponse(res, path, null);
   const data = await parseJson(res);
   return handleResponse(res, path, data);
 }

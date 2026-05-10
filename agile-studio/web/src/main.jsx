@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-route
 import App from "./App.jsx";
 import LoginPage from "./LoginPage.jsx";
 import RegisterPage from "./RegisterPage.jsx";
+import ProjectInvitePage from "./ProjectInvitePage.jsx";
 import { getToken } from "./api.js";
 import "./index.css";
 
@@ -22,6 +23,7 @@ createRoot(document.getElementById("root")).render(
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
+        <Route path="/invite/:token" element={<ProjectInvitePage />} />
         <Route
           path="*"
           element={

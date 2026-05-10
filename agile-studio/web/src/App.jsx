@@ -6,6 +6,8 @@ import KanbanBoard from "./KanbanBoard.jsx";
 import MarkdownEditorField from "./MarkdownEditorField.jsx";
 import { renderMarkdownWithMentions } from "./markdownWithMentions.jsx";
 import ProjectWikiPage from "./ProjectWikiPage.jsx";
+import ProjectTicketsPage from "./ProjectTicketsPage.jsx";
+import TicketPage from "./TicketPage.jsx";
 import StoryDocsTab from "./StoryDocsTab.jsx";
 import { AgileMarkdownProjectContext } from "./agileMarkdownLink.jsx";
 import {
@@ -17,6 +19,12 @@ import {
   textMentionsDisplayName,
 } from "./notifications.js";
 import { replaceTrailingMention } from "./mentionText.jsx";
+import {
+  TICKET_STATUS_OPTIONS,
+  ticketPriorityLabel,
+  ticketTypeLabel,
+} from "./ticketUiConstants.js";
+import TicketCreatePage from "./TicketCreatePage.jsx";
 
 function formatChatMessageTime(iso) {
   if (!iso) return "";
@@ -366,6 +374,7 @@ function formatReleasePeriod(r) {
 /** Workspace tabs — project list lives in the top hub panel. */
 const TABS = {
   board: { id: "board", label: "Board", icon: "bi-columns-gap" },
+  tickets: { id: "tickets", label: "Tickets", icon: "bi-ticket-detailed" },
   team: { id: "team", label: "Team", icon: "bi-people" },
   masterData: { id: "master-data", label: "Master data", icon: "bi-diagram-3" },
   chat: { id: "chat", label: "Chat", icon: "bi-chat-dots" },
@@ -374,15 +383,23 @@ const TABS = {
   settings: { id: "settings", label: "Settings", icon: "bi-gear" },
 };
 
-/** URL sync: `/`, `/team`, `/master-data`, `/p/:id/board|…|wiki|settings`, `/p/:id/story/:storyId`, `/p/:id/wiki/:slug?`. */
+/** URL sync: … `/p/:id/ticket/:ticketId` (optional trailing `/edit` redirects away), story, wiki. */
 function parseWorkspacePath(pathname) {
   const p = (pathname || "/").replace(/\/+$/, "") || "/";
   const sm = p.match(/^\/p\/(\d+)\/story\/(\d+)$/);
   if (sm) return { projectId: Number(sm[1]), tab: "story", storyId: Number(sm[2]) };
   const wm = p.match(/^\/p\/(\d+)\/wiki(?:\/([^/]+))?$/);
   if (wm) return { projectId: Number(wm[1]), tab: "wiki", wikiSlug: wm[2] != null && wm[2] !== "" ? wm[2] : null };
-  const m = p.match(/^\/p\/(\d+)\/(board|team|chat|releases|settings|wiki)$/);
-  if (m) return { projectId: Number(m[1]), tab: m[2] };
+  const tnew = p.match(/^\/p\/(\d+)\/ticket\/new$/);
+  if (tnew) return { projectId: Number(tnew[1]), tab: "ticket-new" };
+  const tk = p.match(/^\/p\/(\d+)\/ticket\/(\d+)(?:\/edit)?$/);
+  if (tk) return { projectId: Number(tk[1]), tab: "ticket", ticketId: Number(tk[2]) };
+  const m = p.match(/^\/p\/(\d+)\/(board|tasks|tickets|team|chat|releases|settings|wiki)$/);
+  if (m) {
+    const raw = m[2];
+    const tab = raw === "tasks" ? "tickets" : raw;
+    return { projectId: Number(m[1]), tab };
+  }
   if (p === "/team") return { projectId: null, tab: "team" };
   if (p === "/master-data") return { projectId: null, tab: "master-data" };
   if (p === "/") return { projectId: null, tab: "board" };
@@ -401,13 +418,13 @@ function StoryDetailBody({
   onPatchStoryDetails,
   onPatchStoryRelease,
   onPatchStoryAssignees,
-  onCreateTask,
   onPatchTask,
-  onDeleteTask,
   onPostComment,
   onPatchComment,
   onDeleteComment,
   setErr,
+  onReloadStory,
+  navigate,
 }) {
   const me = getStoredUser();
   const onProject = me?.member_id != null && projectMembers.some((row) => row.member_id === me.member_id);
@@ -418,12 +435,6 @@ function StoryDetailBody({
   const [editingStoryMeta, setEditingStoryMeta] = useState(false);
   const [storyTitleDraft, setStoryTitleDraft] = useState("");
   const [storyDescDraft, setStoryDescDraft] = useState("");
-  const [taskModalOpen, setTaskModalOpen] = useState(false);
-  const [taskModalEditingId, setTaskModalEditingId] = useState(null);
-  const [taskModalTitle, setTaskModalTitle] = useState("");
-  const [taskModalBody, setTaskModalBody] = useState("");
-  const [taskModalAssigneeIds, setTaskModalAssigneeIds] = useState([]);
-  const [taskModalReporterId, setTaskModalReporterId] = useState("");
   const [storySectionTab, setStorySectionTab] = useState("overview");
   const commentMentionMembers = useMemo(
     () =>
@@ -502,71 +513,8 @@ function StoryDetailBody({
     setEditingStoryMeta(false);
     setStoryTitleDraft("");
     setStoryDescDraft("");
-    setTaskModalOpen(false);
-    setTaskModalEditingId(null);
-    setTaskModalTitle("");
-    setTaskModalBody("");
-    setTaskModalAssigneeIds([]);
-    setTaskModalReporterId("");
     setStorySectionTab("overview");
   }, [storyDetail.id]);
-
-  const openCreateTaskModal = () => {
-    setTaskModalEditingId(null);
-    setTaskModalTitle("");
-    setTaskModalBody("");
-    setTaskModalAssigneeIds([]);
-    setTaskModalReporterId("");
-    setTaskModalOpen(true);
-  };
-
-  const openEditTaskModal = (t) => {
-    const aids = Array.isArray(t.assignee_ids)
-      ? t.assignee_ids
-      : t.assignee_id != null
-        ? [t.assignee_id]
-        : [];
-    setTaskModalEditingId(t.id);
-    setTaskModalTitle(t.title ?? "");
-    setTaskModalBody(t.body ?? "");
-    setTaskModalAssigneeIds(aids);
-    setTaskModalReporterId(t.reporter_id != null ? String(t.reporter_id) : "");
-    setTaskModalOpen(true);
-  };
-
-  const closeTaskModal = () => {
-    setTaskModalOpen(false);
-    setTaskModalEditingId(null);
-    setTaskModalTitle("");
-    setTaskModalBody("");
-    setTaskModalAssigneeIds([]);
-    setTaskModalReporterId("");
-  };
-
-  const submitTaskModal = async (e) => {
-    e.preventDefault();
-    const title = taskModalTitle.trim();
-    if (!title) return;
-    const rawBody = taskModalBody.trim();
-    const body = rawBody.length ? rawBody : null;
-    const assignee_ids = Array.isArray(taskModalAssigneeIds) ? taskModalAssigneeIds.map(Number) : [];
-    const reporter_id = taskModalReporterId === "" ? null : Number(taskModalReporterId);
-    try {
-      if (taskModalEditingId == null) {
-        await onCreateTask(storyDetail.id, { title, body, assignee_ids, reporter_id });
-      } else {
-        await onPatchTask(storyDetail.id, taskModalEditingId, {
-          title,
-          body,
-          assignee_ids,
-          reporter_id,
-        });
-      }
-      closeTaskModal();
-    } catch {
-      /* error surfaced via setErr */
-    }
-  };
 
   const formatTaskMemberNames = (ids) => {
     const list = Array.isArray(ids) ? ids : [];
@@ -585,6 +533,21 @@ function StoryDetailBody({
     return (
       projectMembers.find((r) => r.member_id === rid)?.member?.display_name ?? `Member #${rid}`
     );
+  };
+
+  const toggleTaskWatch = async (t) => {
+    if (me?.member_id == null) return;
+    setErr(null);
+    try {
+      const wids = Array.isArray(t.watcher_member_ids) ? t.watcher_member_ids : [];
+      const watching = wids.includes(me.member_id);
+      if (watching)
+        await apiDelete(`/projects/${storyDetail.project_id}/tasks/${t.id}/watch`);
+      else await apiPost(`/projects/${storyDetail.project_id}/tasks/${t.id}/watch`, {});
+      await onReloadStory?.();
+    } catch (e2) {
+      setErr(e2.message);
+    }
   };
 
   const startEdit = (c) => {
@@ -619,10 +582,10 @@ function StoryDetailBody({
         <li className="nav-item">
           <button
             type="button"
-            className={`nav-link ${storySectionTab === "tasks" ? "active" : ""}`}
-            onClick={() => setStorySectionTab("tasks")}
+            className={`nav-link ${storySectionTab === "tickets" ? "active" : ""}`}
+            onClick={() => setStorySectionTab("tickets")}
           >
-            Tasks
+            Tickets
           </button>
         </li>
         <li className="nav-item">
@@ -642,18 +605,23 @@ function StoryDetailBody({
           onProject={onProject}
           setErr={setErr}
         />
-      ) : storySectionTab === "tasks" ? (
+      ) : storySectionTab === "tickets" ? (
         <>
           <div className="mb-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
-            <h2 className="h6 text-secondary mb-0">Tasks</h2>
+            <h2 className="h6 text-secondary mb-0">Tickets</h2>
             {onProject ? (
-              <button type="button" className="btn btn-link btn-sm p-0" onClick={openCreateTaskModal}>
-                Add task
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => navigate(`/p/${storyDetail.project_id}/ticket/new?story=${storyDetail.id}`)}
+              >
+                <i className="bi bi-plus-lg me-1" aria-hidden />
+                Create ticket
               </button>
             ) : null}
           </div>
           {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : []).length === 0 ? (
-            <p className="small text-secondary fst-italic mb-3">No tasks yet.</p>
+            <p className="small text-secondary fst-italic mb-3">No tickets yet.</p>
           ) : null}
           <ul className="list-unstyled small mb-0">
             {(Array.isArray(storyDetail.tasks) ? storyDetail.tasks : [])
@@ -667,11 +635,16 @@ function StoryDetailBody({
                       className="form-check-input mt-1 flex-shrink-0"
                       checked={!!t.done}
                       disabled={!onProject}
-                      onChange={(e) => onPatchTask(storyDetail.id, t.id, { done: e.target.checked })}
-                      aria-label={t.done ? "Mark task as not done" : "Mark task as done"}
+                      onChange={(e) => onPatchTask(t.id, { done: e.target.checked })}
+                      aria-label={t.done ? "Mark ticket as not done" : "Mark ticket as done"}
                     />
                     <div className="flex-grow-1 min-w-0">
-                      <div className={`fw-semibold ${t.done ? "text-decoration-line-through text-secondary" : ""}`}>{t.title}</div>
+                      <Link
+                        to={`/p/${storyDetail.project_id}/ticket/${t.id}`}
+                        className={`fw-semibold text-decoration-none d-inline-block ${t.done ? "text-decoration-line-through text-secondary" : "text-body"}`}
+                      >
+                        {t.title || "Untitled"}
+                      </Link>
                       {t.body ? (
                         <div className={`as-story-body as-story-desc-md mt-1 small ${t.done ? "text-secondary" : ""}`}>
                           {renderMarkdownWithMentions(t.body, commentMentionIndex)}
@@ -683,36 +656,58 @@ function StoryDetailBody({
                         <span className="text-nowrap"> · Reporter: </span>
                         <span>{formatTaskReporterName(t.reporter_id)}</span>
                       </div>
-                    </div>
-                    {onProject ? (
-                      <div className="d-flex gap-1 flex-shrink-0">
+                      <div className="d-flex flex-wrap align-items-center gap-2 mt-2">
+                        <select
+                          className="form-select form-select-sm"
+                          style={{ maxWidth: 160 }}
+                          value={t.task_status || (t.done ? "done" : "open")}
+                          disabled={!onProject}
+                          onChange={(e) => onPatchTask(t.id, { task_status: e.target.value })}
+                          aria-label="Ticket status"
+                        >
+                          {TICKET_STATUS_OPTIONS.map((o) => (
+                            <option key={o.value} value={o.value}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
                         <button
                           type="button"
-                          className="btn btn-outline-secondary btn-sm p-1 lh-1"
-                          onClick={() => openEditTaskModal(t)}
-                          title="Edit task"
-                          aria-label="Edit task"
+                          className={`btn btn-sm ${
+                            (t.watcher_member_ids || []).includes(me?.member_id) ? "btn-warning" : "btn-outline-secondary"
+                          }`}
+                          disabled={!me?.member_id}
+                          title="Watch / unwatch"
+                          onClick={() => toggleTaskWatch(t)}
                         >
-                          <i className="bi bi-pencil" aria-hidden />
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-outline-danger btn-sm p-1 lh-1"
-                          onClick={() => onDeleteTask(storyDetail.id, t.id)}
-                          title="Delete task"
-                          aria-label="Delete task"
-                        >
-                          <i className="bi bi-trash" aria-hidden />
+                          <i className="bi bi-eye" aria-hidden />
+                          {(t.watcher_member_ids || []).length ? ` ${(t.watcher_member_ids || []).length}` : ""}
                         </button>
                       </div>
-                    ) : null}
+                      <div className="small text-secondary mt-1 d-flex flex-wrap gap-2 align-items-center">
+                        <span className="badge bg-secondary-subtle text-dark">{ticketPriorityLabel(t.ticket_priority)}</span>
+                        <span className="badge bg-info-subtle text-dark">{ticketTypeLabel(t.ticket_type)}</span>
+                        {t.due_at ? (
+                          <span className="text-nowrap" title="Due">
+                            Due:{" "}
+                            {(() => {
+                              try {
+                                return new Date(t.due_at).toLocaleDateString();
+                              } catch {
+                                return String(t.due_at);
+                              }
+                            })()}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
                 </li>
               ))}
           </ul>
           {!onProject && getStoredUser() ? (
             <p className="small text-secondary mt-3 mb-0">
-              Add yourself to the project <strong>Team</strong> to create or update tasks.
+              Add yourself to the project <strong>Team</strong> to create or update tickets.
             </p>
           ) : null}
         </>
@@ -1014,100 +1009,6 @@ function StoryDetailBody({
       </form>
         </>
       )}
-      {taskModalOpen ? (
-        <>
-          <div
-            className="modal fade show d-block"
-            tabIndex={-1}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="as-task-modal-title"
-          >
-            <div className="modal-dialog modal-lg modal-dialog-scrollable">
-              <div className="modal-content">
-                <form onSubmit={submitTaskModal}>
-                  <div className="modal-header">
-                    <h5 className="modal-title" id="as-task-modal-title">
-                      {taskModalEditingId == null ? "Create task" : "Edit task"}
-                    </h5>
-                    <button type="button" className="btn-close" onClick={closeTaskModal} aria-label="Close" />
-                  </div>
-                  <div className="modal-body">
-                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-title-input">
-                      Title
-                    </label>
-                    <input
-                      id="as-task-modal-title-input"
-                      className="form-control mb-3"
-                      value={taskModalTitle}
-                      onChange={(e) => setTaskModalTitle(e.target.value)}
-                      maxLength={500}
-                      required
-                      autoFocus
-                    />
-                    <label className="form-label small text-secondary mb-1">Assignees</label>
-                    <select
-                      className="form-select mb-3"
-                      multiple
-                      size={Math.max(2, Math.min(6, projectMembers.length || 2))}
-                      value={taskModalAssigneeIds.map(String)}
-                      onChange={(e) =>
-                        setTaskModalAssigneeIds(Array.from(e.target.selectedOptions, (o) => Number(o.value)))
-                      }
-                      aria-label="Task assignees"
-                    >
-                      {projectMembers.map((row) => (
-                        <option key={row.member_id} value={row.member_id}>
-                          {row.member?.display_name ?? `Member #${row.member_id}`}
-                          {row.member?.member_type === "ai" ? " (AI)" : ""}
-                        </option>
-                      ))}
-                    </select>
-                    <div className="form-text mb-3">Hold Cmd/Ctrl to select multiple people or AI agents.</div>
-                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-reporter">
-                      Reporter
-                    </label>
-                    <select
-                      id="as-task-modal-reporter"
-                      className="form-select mb-3"
-                      value={taskModalReporterId}
-                      onChange={(e) => setTaskModalReporterId(e.target.value)}
-                      aria-label="Reporter task"
-                    >
-                      <option value="">— None —</option>
-                      {projectMembers.map((row) => (
-                        <option key={row.member_id} value={row.member_id}>
-                          {row.member?.display_name ?? `Member #${row.member_id}`}
-                          {row.member?.member_type === "ai" ? " (AI)" : ""}
-                        </option>
-                      ))}
-                    </select>
-                    <label className="form-label small text-secondary mb-1" htmlFor="as-task-modal-body">
-                      Description
-                    </label>
-                    <MarkdownEditorField
-                      value={taskModalBody}
-                      onChange={setTaskModalBody}
-                      height={220}
-                      placeholder="Markdown (optional)"
-                      textareaProps={{ id: "as-task-modal-body" }}
-                    />
-                  </div>
-                  <div className="modal-footer">
-                    <button type="button" className="btn btn-outline-secondary" onClick={closeTaskModal}>
-                      Cancel
-                    </button>
-                    <button type="submit" className="btn btn-primary" disabled={!taskModalTitle.trim()}>
-                      Save
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          </div>
-          <div className="modal-backdrop fade show" />
-        </>
-      ) : null}
     </>
   );
 }
@@ -1125,7 +1026,13 @@ export default function App() {
   const [stories, setStories] = useState([]);
   const [releases, setReleases] = useState([]);
   const [workflowTemplates, setWorkflowTemplates] = useState([]);
+  const [workspaceRoles, setWorkspaceRoles] = useState([]);
+  const [wrSlug, setWrSlug] = useState("");
+  const [wrName, setWrName] = useState("");
+  const [wrDesc, setWrDesc] = useState("");
+  const [wrSortOrder, setWrSortOrder] = useState("100");
   const [storyId, setStoryId] = useState(null);
+  const [ticketDetail, setTicketDetail] = useState(null);
   const [storyDetail, setStoryDetail] = useState(null);
   const [comments, setComments] = useState([]);
   const [storyStatusEventsById, setStoryStatusEventsById] = useState({});
@@ -1138,6 +1045,11 @@ export default function App() {
   const [mAgent, setMAgent] = useState("");
   const [addMemId, setAddMemId] = useState("");
   const [addRole, setAddRole] = useState("member");
+  const [pendingInvites, setPendingInvites] = useState([]);
+  const [projectEmailInvites, setProjectEmailInvites] = useState([]);
+  const [inviteEmailInput, setInviteEmailInput] = useState("");
+  const [inviteEmailRole, setInviteEmailRole] = useState("member");
+  const [inviteSending, setInviteSending] = useState(false);
   const [stTitle, setStTitle] = useState("");
   const [stDesc, setStDesc] = useState("");
   const [stStatus, setStStatus] = useState("icebox_in_progress");
@@ -1169,6 +1081,8 @@ export default function App() {
   const [wikiRealtimeCommentsBump, setWikiRealtimeCommentsBump] = useState(0);
   const [chatConnected, setChatConnected] = useState(false);
   const [typingByChannel, setTypingByChannel] = useState({});
+  /** API Center WS `chat.agent.progress` — nhãn theo channelId (chỉ khi dispatch qua WebSocket). */
+  const [agentProgressByChannel, setAgentProgressByChannel] = useState({});
 
   const [notifications, setNotifications] = useState(() => loadNotifications());
   const [showNotifPanel, setShowNotifPanel] = useState(false);
@@ -1203,6 +1117,10 @@ export default function App() {
   const agentStopMinDelayTimerRef = useRef(null);
   const stopAgentTypingRef = useRef(() => {});
   const me = getStoredUser();
+  const viewerOnProject = useMemo(
+    () => Boolean(me?.member_id != null && projectMembers.some((row) => row.member_id === me.member_id)),
+    [me?.member_id, projectMembers]
+  );
 
   useEffect(() => {
     projectIdRef.current = projectId;
@@ -1246,15 +1164,30 @@ export default function App() {
 
   const workspace = parseWorkspacePath(location.pathname);
   const isStoryPage = workspace?.tab === "story";
+  const isTicketDetailPage = workspace?.tab === "ticket";
+  const isTicketCreatePage = workspace?.tab === "ticket-new";
   const mainTab =
-    workspace && ["board", "team", "master-data", "chat", "releases", "wiki", "settings"].includes(workspace.tab)
+    workspace && ["board", "tickets", "team", "master-data", "chat", "releases", "wiki", "settings"].includes(workspace.tab)
       ? workspace.tab
-      : "board";
+      : isTicketDetailPage || isTicketCreatePage
+        ? "tickets"
+        : "board";
+
+  useEffect(() => {
+    const m = location.pathname.match(/^\/p\/(\d+)\/ticket\/(\d+)\/edit\/?$/);
+    if (m) navigate(`/p/${m[1]}/ticket/${m[2]}`, { replace: true });
+  }, [location.pathname, navigate]);
 
   const refreshProjects = useCallback(async () => {
     setErr(null);
     const list = await apiGet("/projects");
     setProjects(list);
+    try {
+      const inv = await apiGet("/me/project-invites");
+      setPendingInvites(Array.isArray(inv) ? inv : []);
+    } catch {
+      setPendingInvites([]);
+    }
   }, []);
 
   const refreshMembers = useCallback(async () => {
@@ -1267,6 +1200,12 @@ export default function App() {
     setErr(null);
     const list = await apiGet("/workflow-templates");
     setWorkflowTemplates(Array.isArray(list) ? list : []);
+  }, []);
+
+  const refreshWorkspaceRoles = useCallback(async () => {
+    setErr(null);
+    const list = await apiGet("/workspace-roles");
+    setWorkspaceRoles(Array.isArray(list) ? list : []);
   }, []);
 
   const refreshApiCenterStatus = useCallback(async () => {
@@ -1380,6 +1319,23 @@ export default function App() {
     },
     []
   );
+
+  const reloadStoryIfOpen = useCallback(async () => {
+    if (storyId) await loadStory(storyId);
+  }, [storyId, loadStory]);
+
+  const refreshTicketDetail = useCallback(async () => {
+    const w = parseWorkspacePath(location.pathname);
+    if (w?.tab !== "ticket" || w.ticketId == null) return;
+    if (projectId == null || w.projectId !== projectId) return;
+    try {
+      const row = await apiGet(`/projects/${projectId}/tasks/${w.ticketId}`, { cache: "no-store" });
+      setTicketDetail(row);
+    } catch (e2) {
+      setTicketDetail(null);
+      setErr(e2.message);
+    }
+  }, [location.pathname, projectId]);
 
   const closeStoryDrawer = useCallback(() => {
     setStoryId(null);
@@ -1579,6 +1535,10 @@ export default function App() {
 
   const activeChatMessages = activeChatRoom ? chatMessagesByChannel[activeChatRoom.channelId] || [] : [];
   const activeTypingRows = activeChatRoom ? typingByChannel[activeChatRoom.channelId] || [] : [];
+  const activeAgentProgressLabel =
+    activeChatRoom && agentProgressByChannel[activeChatRoom.channelId]
+      ? agentProgressByChannel[activeChatRoom.channelId]
+      : "";
 
   /** Luôn cuộn tới tin mới nhất (đáy) khi đổi kênh hoặc nội dung / reaction cập nhật. */
   useEffect(() => {
@@ -1721,6 +1681,15 @@ export default function App() {
     const p = agentTypingPayloadRef.current;
     agentTypingPayloadRef.current = null;
     agentTypingTraceRef.current = null;
+    const progCh = p?.room?.channelId;
+    if (progCh) {
+      setAgentProgressByChannel((prev) => {
+        if (!(progCh in prev)) return prev;
+        const next = { ...prev };
+        delete next[progCh];
+        return next;
+      });
+    }
     if (p) postChatTypingHttp({ ...p, isTyping: false }).catch(() => {});
   }, []);
 
@@ -2264,8 +2233,26 @@ export default function App() {
         if (evType === "chat.connected") return;
         if (evType === "chat.agent.error") {
           stopAgentTypingRef.current();
+          const errCh = String(data?.channel_id || data?.channelId || "").trim();
+          if (errCh) {
+            setAgentProgressByChannel((prev) => {
+              if (!(errCh in prev)) return prev;
+              const next = { ...prev };
+              delete next[errCh];
+              return next;
+            });
+          }
           const errMsg = String(data?.error || packet?.error || "").trim();
           if (errMsg) setErr(`API Center chat: ${errMsg}`);
+          return;
+        }
+        if (evType === "chat.agent.progress") {
+          const ch = String(data?.channel_id || data?.channelId || "").trim();
+          const label = String(data?.label || "").trim();
+          if (ch && label) {
+            setAgentProgressByChannel((prev) => ({ ...prev, [ch]: label }));
+            chatDebug("[api-center ws] progress", ch, label);
+          }
           return;
         }
         /** Ack: policy không trả lời → dừng typing (không có `chat.agent.reply`). */
@@ -2477,6 +2464,25 @@ export default function App() {
   }, [refreshProjects]);
 
   useEffect(() => {
+    if (!projectId || mainTab !== "team") {
+      setProjectEmailInvites([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await apiGet(`/projects/${projectId}/invites/pending`);
+        if (!cancelled) setProjectEmailInvites(Array.isArray(rows) ? rows : []);
+      } catch {
+        if (!cancelled) setProjectEmailInvites([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, mainTab]);
+
+  useEffect(() => {
     refreshMembers().catch((e) => setErr(e.message));
   }, [refreshMembers]);
 
@@ -2486,10 +2492,25 @@ export default function App() {
   }, [mainTab, refreshWorkflowTemplates]);
 
   useEffect(() => {
+    if (mainTab !== "master-data" && mainTab !== "team") return;
+    refreshWorkspaceRoles().catch((e) => setErr(e.message));
+  }, [mainTab, refreshWorkspaceRoles]);
+
+  useEffect(() => {
     const p = location.pathname;
     if (p === "/login" || p === "/register") return;
     if (parseWorkspacePath(location.pathname) === null) {
       navigate("/", { replace: true });
+    }
+  }, [location.pathname, navigate]);
+
+  useEffect(() => {
+    const pathname = location.pathname;
+    if (pathname === "/login" || pathname === "/register") return;
+    const normalized = (pathname || "").replace(/\/+$/, "") || "/";
+    const legacyTasks = normalized.match(/^\/p\/(\d+)\/tasks$/);
+    if (legacyTasks) {
+      navigate(`/p/${legacyTasks[1]}/tickets`, { replace: true });
     }
   }, [location.pathname, navigate]);
 
@@ -2508,7 +2529,9 @@ export default function App() {
       return;
     }
     if (projectId !== p.projectId) {
-      loadProject(p.projectId, { preserveStory: p.tab === "story" }).catch((er) => setErr(er.message));
+      loadProject(p.projectId, {
+        preserveStory: p.tab === "story" || p.tab === "ticket" || p.tab === "ticket-new",
+      }).catch((er) => setErr(er.message));
     }
   }, [location.pathname, projectId, loadProject, closeStoryDrawer]);
 
@@ -2521,10 +2544,47 @@ export default function App() {
   }, [location.pathname, storyId, loadStory]);
 
   useEffect(() => {
+    const w = parseWorkspacePath(location.pathname);
+    if (w?.tab === "ticket" || w?.tab === "ticket-new") closeStoryDrawer();
+  }, [location.pathname, closeStoryDrawer]);
+
+  useEffect(() => {
+    const w = parseWorkspacePath(location.pathname);
+    if (w?.tab !== "ticket" || w.ticketId == null) {
+      setTicketDetail(null);
+      return;
+    }
+    if (!projectId || w.projectId !== projectId) return;
+    let cancel = false;
+    (async () => {
+      try {
+        const row = await apiGet(`/projects/${projectId}/tasks/${w.ticketId}`, { cache: "no-store" });
+        if (!cancel) {
+          setTicketDetail(row);
+          setErr(null);
+        }
+      } catch (e2) {
+        if (!cancel) {
+          setTicketDetail(null);
+          setErr(e2.message);
+        }
+      }
+    })();
+    return () => {
+      cancel = true;
+    };
+  }, [location.pathname, projectId]);
+
+  useEffect(() => {
     const onKey = (e) => {
       if (e.key !== "Escape") return;
       if (showNotifPanel) {
         setShowNotifPanel(false);
+        return;
+      }
+      const pw = parseWorkspacePath(window.location.pathname);
+      if ((pw?.tab === "ticket" || pw?.tab === "ticket-new") && pw.projectId != null) {
+        navigate(`/p/${pw.projectId}/tickets`);
         return;
       }
       if (storyDetail) {
@@ -2557,6 +2617,14 @@ export default function App() {
     const pid = Number(v);
     if (cur?.tab === "story") {
       navigate(`/p/${pid}/board`);
+      return;
+    }
+    if (cur?.tab === "ticket-new") {
+      navigate(`/p/${pid}/ticket/new`);
+      return;
+    }
+    if (cur?.tab === "ticket") {
+      navigate(`/p/${pid}/tickets`);
       return;
     }
     if (tab === "master-data") {
@@ -2650,6 +2718,44 @@ export default function App() {
     try {
       await apiDelete(`/projects/${projectId}/members/${mid}`);
       await loadProject(projectId);
+    } catch (e2) {
+      setErr(e2.message);
+    }
+  };
+
+  const onInviteByEmail = async (e) => {
+    e.preventDefault();
+    const em = inviteEmailInput.trim();
+    if (!projectId || !em) return;
+    setErr(null);
+    setInviteSending(true);
+    try {
+      await apiPost(`/projects/${projectId}/invites`, { email: em, role: inviteEmailRole || "member" });
+      setInviteEmailInput("");
+      const rows = await apiGet(`/projects/${projectId}/invites/pending`);
+      setProjectEmailInvites(Array.isArray(rows) ? rows : []);
+      const inv = await apiGet("/me/project-invites");
+      setPendingInvites(Array.isArray(inv) ? inv : []);
+      pushNotif({
+        type: "team",
+        title: "Invitation sent",
+        body: em,
+        link: `/p/${projectId}/team`,
+      });
+    } catch (e2) {
+      setErr(e2.message);
+    } finally {
+      setInviteSending(false);
+    }
+  };
+
+  const onRevokeProjectInvite = async (inviteId) => {
+    if (!projectId || !confirm("Revoke this email invitation?")) return;
+    setErr(null);
+    try {
+      await apiDelete(`/projects/${projectId}/invites/${inviteId}`);
+      const rows = await apiGet(`/projects/${projectId}/invites/pending`);
+      setProjectEmailInvites(Array.isArray(rows) ? rows : []);
     } catch (e2) {
       setErr(e2.message);
     }
@@ -2775,6 +2881,47 @@ export default function App() {
         body: "Master data",
         link: "/master-data",
       });
+    } catch (e2) {
+      setErr(e2.message);
+    }
+  };
+
+  const onCreateWorkspaceRole = async (e) => {
+    e.preventDefault();
+    const slug = wrSlug.trim().toLowerCase().replace(/\s+/g, "_");
+    const name = wrName.trim();
+    if (!slug || !name) return;
+    setErr(null);
+    try {
+      const sortNum = Number.parseInt(String(wrSortOrder).trim(), 10);
+      await apiPost("/workspace-roles", {
+        slug,
+        name,
+        description: wrDesc.trim() || null,
+        sort_order: Number.isFinite(sortNum) ? sortNum : 100,
+      });
+      setWrSlug("");
+      setWrName("");
+      setWrDesc("");
+      setWrSortOrder("100");
+      await refreshWorkspaceRoles();
+      pushNotif({
+        type: "project",
+        title: "Đã tạo vai trò",
+        body: slug,
+        link: "/master-data",
+      });
+    } catch (e2) {
+      setErr(e2.message);
+    }
+  };
+
+  const onDeleteWorkspaceRole = async (roleId, isSystem) => {
+    if (isSystem) return;
+    setErr(null);
+    try {
+      await apiDelete(`/workspace-roles/${roleId}`);
+      await refreshWorkspaceRoles();
     } catch (e2) {
       setErr(e2.message);
     }
@@ -2942,45 +3089,69 @@ export default function App() {
     }
   };
 
-  const onCreateTask = async (sid, { title, body, assignee_ids, reporter_id }) => {
+  const onCreateTask = async ({
+    story_ids = [],
+    title,
+    body,
+    assignee_ids,
+    reporter_id,
+    task_status,
+    ticket_priority,
+    ticket_type,
+    due_at,
+  }) => {
     const t = (title || "").trim();
-    if (!projectId || !sid || !t) return;
+    if (!projectId || !t) return;
+    const sids = Array.isArray(story_ids) ? story_ids.map(Number).filter((x) => Number.isFinite(x)) : [];
     setErr(null);
     try {
-      await apiPost(`/stories/${sid}/tasks`, {
+      await apiPost(`/projects/${projectId}/tasks`, {
         title: t,
         body: body ?? null,
+        story_ids: sids,
         assignee_ids: Array.isArray(assignee_ids) ? assignee_ids : [],
         reporter_id: reporter_id ?? null,
+        task_status: task_status ?? undefined,
+        ticket_priority: ticket_priority ?? undefined,
+        ticket_type: ticket_type ?? undefined,
+        due_at: due_at ?? null,
       });
       await loadProject(projectId, { preserveStory: true });
-      if (storyId === sid) await loadStory(sid);
+      const cur = storyId;
+      if (cur != null && sids.includes(cur)) await loadStory(cur);
     } catch (e2) {
       setErr(e2.message);
       throw e2;
     }
   };
 
-  const onPatchTask = async (sid, taskId, patch) => {
-    if (!projectId || !sid) return;
+  const onPatchTask = async (taskId, patch) => {
+    if (!projectId) return;
     setErr(null);
     try {
-      await apiPatch(`/stories/${sid}/tasks/${taskId}`, patch);
+      await apiPatch(`/projects/${projectId}/tasks/${taskId}`, patch);
       await loadProject(projectId, { preserveStory: true });
-      if (storyId === sid) await loadStory(sid);
+      const sid = storyId;
+      if (sid != null) await loadStory(sid);
+      await refreshTicketDetail();
     } catch (e2) {
       setErr(e2.message);
       throw e2;
     }
   };
 
-  const onDeleteTask = async (sid, taskId) => {
-    if (!projectId || !sid || !window.confirm("Delete this task?")) return;
+  const onDeleteTask = async (taskId) => {
+    if (!projectId || !window.confirm("Delete this ticket?")) return;
     setErr(null);
     try {
-      await apiDelete(`/stories/${sid}/tasks/${taskId}`);
+      await apiDelete(`/projects/${projectId}/tasks/${taskId}`);
+      const pth = parseWorkspacePath(location.pathname);
+      if (pth?.tab === "ticket" && Number(pth.ticketId) === Number(taskId)) {
+        navigate(`/p/${projectId}/tickets`);
+      }
       await loadProject(projectId, { preserveStory: true });
-      if (storyId === sid) await loadStory(sid);
+      const sid = storyId;
+      if (sid != null) await loadStory(sid);
     } catch (e2) {
       setErr(e2.message);
     }
@@ -3089,6 +3260,20 @@ export default function App() {
     for (const r of releases) m[r.id] = r.name;
     return m;
   }, [releases]);
+
+  const roleDisplayBySlug = useMemo(() => {
+    const m = {};
+    for (const r of workspaceRoles) m[r.slug] = r.name;
+    return m;
+  }, [workspaceRoles]);
+
+  useEffect(() => {
+    if (!workspaceRoles.length) return;
+    const slugs = new Set(workspaceRoles.map((r) => r.slug));
+    const fallback = slugs.has("member") ? "member" : workspaceRoles[0].slug;
+    setAddRole((prev) => (slugs.has(prev) ? prev : fallback));
+    setInviteEmailRole((prev) => (slugs.has(prev) ? prev : fallback));
+  }, [workspaceRoles]);
 
   const unreadNotifCount = useMemo(() => notifications.filter((n) => !n.read).length, [notifications]);
 
@@ -3246,6 +3431,29 @@ export default function App() {
         </div>
       </header>
 
+      {pendingInvites.length > 0 && projects.length === 0 ? (
+        <div className="alert alert-primary border-0 rounded-0 mb-0 d-flex flex-wrap align-items-center justify-content-between gap-3 px-3 py-3 shadow-sm">
+          <div className="min-w-0">
+            <strong>Bạn có lời mời tham gia dự án</strong>
+            <span className="d-block small mt-1 opacity-90">
+              Chưa thấy dự án nào trong tài khoản — mở link dưới để chấp nhận (đăng nhập đúng email được mời).
+            </span>
+          </div>
+          <div className="d-flex flex-column align-items-stretch gap-1 flex-shrink-0">
+            {pendingInvites.map((inv) => (
+              <Link
+                key={inv.token}
+                to={`/invite/${encodeURIComponent(inv.token)}`}
+                className="btn btn-sm btn-light text-primary fw-semibold text-start text-nowrap"
+              >
+                <i className="bi bi-envelope-check me-1" aria-hidden />
+                {inv.project_name}
+              </Link>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <AgileMarkdownProjectContext.Provider value={projectId}>
       <div className="as-body">
         <aside className="as-sidenav">
@@ -3258,6 +3466,16 @@ export default function App() {
           >
             <i className={TABS.board.icon} aria-hidden />
             {TABS.board.label}
+          </button>
+          <button
+            type="button"
+            className={`as-nav-btn mb-1 ${mainTab === TABS.tickets.id ? "active" : ""}`}
+            disabled={!projectId}
+            onClick={() => projectId && navigate(`/p/${projectId}/tickets`)}
+            title="All tickets across stories"
+          >
+            <i className={TABS.tickets.icon} aria-hidden />
+            {TABS.tickets.label}
           </button>
           <button
             type="button"
@@ -3386,18 +3604,58 @@ export default function App() {
                         onPatchStoryDetails={onPatchStoryDetails}
                         onPatchStoryRelease={onPatchStoryRelease}
                         onPatchStoryAssignees={onPatchStoryAssignees}
-                        onCreateTask={onCreateTask}
                         onPatchTask={onPatchTask}
-                        onDeleteTask={onDeleteTask}
                         onPostComment={onPostComment}
                         onPatchComment={onPatchComment}
                         onDeleteComment={onDeleteComment}
                         setErr={setErr}
+                        onReloadStory={reloadStoryIfOpen}
+                        navigate={navigate}
                       />
                     </div>
                   </div>
                 </>
               )}
+            </div>
+          ) : isTicketDetailPage ? (
+            <div className="as-ticket-page">
+              {!workspace?.projectId || workspace?.ticketId == null ? (
+                <div className="as-panel">
+                  <div className="as-empty py-5">
+                    <p className="mb-0 text-secondary">Invalid ticket URL.</p>
+                  </div>
+                </div>
+              ) : ticketDetail?.id !== workspace.ticketId ? (
+                <div className="d-flex align-items-center gap-2 text-secondary py-5">
+                  <div className="spinner-border spinner-border-sm" role="status" aria-hidden />
+                  <span>Loading ticket…</span>
+                </div>
+              ) : (
+                <TicketPage
+                  ticket={ticketDetail}
+                  projectId={workspace.projectId}
+                  stories={stories}
+                  projectMembers={projectMembers}
+                  navigate={navigate}
+                  onPatch={(patch) => onPatchTask(ticketDetail.id, patch)}
+                  onDelete={() => onDeleteTask(ticketDetail.id)}
+                  onReload={refreshTicketDetail}
+                  setErr={setErr}
+                  onOpenProjectPicker={() => setShowProjectsHub(true)}
+                />
+              )}
+            </div>
+          ) : isTicketCreatePage ? (
+            <div className="as-ticket-page">
+              <TicketCreatePage
+                projectId={workspace?.projectId ?? null}
+                stories={stories}
+                projectMembers={projectMembers}
+                onCreateTask={onCreateTask}
+                navigate={navigate}
+                setErr={setErr}
+                onOpenProjectPicker={() => setShowProjectsHub(true)}
+              />
             </div>
           ) : (
             <>
@@ -3470,7 +3728,7 @@ export default function App() {
                             value={stDesc}
                             onChange={setStDesc}
                             height={260}
-                            placeholder="Context, acceptance criteria, links... (optional)"
+                            placeholder="Context, links… (optional)"
                             textareaProps={{ id: "as-new-story-desc" }}
                             insertToolbar
                             projectId={projectId}
@@ -3660,7 +3918,9 @@ export default function App() {
                             <li key={row.member_id} className="list-group-item d-flex justify-content-between align-items-center py-3">
                               <span>
                                 <span className="fw-medium">{row.member?.display_name || `#${row.member_id}`}</span>
-                                <span className="text-secondary small ms-2">{row.role}</span>
+                                <span className="text-secondary small ms-2" title={row.role}>
+                                  {roleDisplayBySlug[row.role] || row.role}
+                                </span>
                               </span>
                               <button
                                 type="button"
@@ -3672,6 +3932,67 @@ export default function App() {
                             </li>
                           ))}
                         </ul>
+                        {projectEmailInvites.length > 0 ? (
+                          <div className="as-panel-bd border-top bg-body-secondary bg-opacity-25">
+                            <div className="fw-semibold small mb-2">Pending email invitations</div>
+                            <ul className="list-unstyled small mb-0">
+                              {projectEmailInvites.map((inv) => (
+                                <li key={inv.id} className="d-flex justify-content-between align-items-center gap-2 py-1 border-bottom border-light">
+                                  <span className="text-truncate font-monospace">
+                                    {inv.email}
+                                    <span className="text-secondary ms-1">· {roleDisplayBySlug[inv.role] || inv.role}</span>
+                                  </span>
+                                  <button type="button" className="btn btn-link btn-sm text-danger p-0 flex-shrink-0" onClick={() => onRevokeProjectInvite(inv.id)}>
+                                    Revoke
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null}
+                        <div className="as-panel-bd border-top">
+                          <div className="fw-semibold small mb-3">Invite by email</div>
+                          <p className="small text-secondary mb-2">
+                            Sends an email with a secure link. The person must sign in or register with the same email, then accept on the invite page.
+                          </p>
+                          <form onSubmit={onInviteByEmail} className="vstack gap-2">
+                            <input
+                              type="email"
+                              className="form-control form-control-sm"
+                              placeholder="colleague@company.com"
+                              value={inviteEmailInput}
+                              onChange={(e) => setInviteEmailInput(e.target.value)}
+                              required
+                              disabled={!viewerOnProject || inviteSending}
+                            />
+                            <select
+                              className="form-select form-select-sm"
+                              value={inviteEmailRole}
+                              onChange={(e) => setInviteEmailRole(e.target.value)}
+                              disabled={!viewerOnProject || inviteSending || workspaceRoles.length === 0}
+                            >
+                              {workspaceRoles.length === 0 ? (
+                                <option value="member">Đang tải vai trò…</option>
+                              ) : (
+                                workspaceRoles.map((r) => (
+                                  <option key={r.slug} value={r.slug}>
+                                    {r.name}
+                                  </option>
+                                ))
+                              )}
+                            </select>
+                            <button
+                              className="btn btn-outline-primary btn-sm"
+                              type="submit"
+                              disabled={!viewerOnProject || inviteSending || !inviteEmailInput.trim()}
+                            >
+                              {inviteSending ? "Sending…" : "Send invitation"}
+                            </button>
+                          </form>
+                          {!viewerOnProject && getStoredUser() ? (
+                            <p className="small text-warning mb-0 mt-2">Join this project in Team before sending invites.</p>
+                          ) : null}
+                        </div>
                         <div className="as-panel-bd border-top">
                           <div className="fw-semibold small mb-3">Assign member</div>
                           <form onSubmit={onAddProjectMember} className="vstack gap-2">
@@ -3683,7 +4004,22 @@ export default function App() {
                                 </option>
                               ))}
                             </select>
-                            <input className="form-control form-control-sm" placeholder="Role" value={addRole} onChange={(e) => setAddRole(e.target.value)} />
+                            <select
+                              className="form-select form-select-sm"
+                              value={addRole}
+                              onChange={(e) => setAddRole(e.target.value)}
+                              disabled={workspaceRoles.length === 0}
+                            >
+                              {workspaceRoles.length === 0 ? (
+                                <option value="member">Đang tải vai trò…</option>
+                              ) : (
+                                workspaceRoles.map((r) => (
+                                  <option key={r.slug} value={r.slug}>
+                                    {r.name}
+                                  </option>
+                                ))
+                              )}
+                            </select>
                             <button className="btn btn-primary btn-sm" type="submit" disabled={!addMemId}>
                               Add to project
                             </button>
@@ -3691,6 +4027,23 @@ export default function App() {
                           {apiCenterConnected ? (
                             <form onSubmit={onAddApiAgentToProject} className="vstack gap-2 mt-3 pt-3 border-top">
                               <div className="small fw-semibold">Assign AI agent from API Center</div>
+                              <label className="small text-secondary mb-0">Vai trò trong dự án</label>
+                              <select
+                                className="form-select form-select-sm"
+                                value={addRole}
+                                onChange={(e) => setAddRole(e.target.value)}
+                                disabled={workspaceRoles.length === 0}
+                              >
+                                {workspaceRoles.length === 0 ? (
+                                  <option value="member">Đang tải vai trò…</option>
+                                ) : (
+                                  workspaceRoles.map((r) => (
+                                    <option key={`agent-${r.slug}`} value={r.slug}>
+                                      {r.name}
+                                    </option>
+                                  ))
+                                )}
+                              </select>
                               <select
                                 className="form-select form-select-sm"
                                 value={selectedApiAgentId}
@@ -3931,6 +4284,12 @@ export default function App() {
                             .slice(0, 3)
                             .join(", ")}
                           {" is typing..."}
+                        </div>
+                      ) : null}
+                      {activeAgentProgressLabel ? (
+                        <div className="as-chat-agent-progress px-3 pb-2 small text-primary d-flex align-items-center gap-1">
+                          <i className="bi bi-cpu flex-shrink-0" aria-hidden />
+                          <span>{activeAgentProgressLabel}</span>
                         </div>
                       ) : null}
                     </div>
@@ -4266,6 +4625,19 @@ export default function App() {
             </>
           )}
 
+          {mainTab === "tickets" && (
+            <>
+              <ProjectTicketsPage
+                projectId={projectId}
+                projectMembers={projectMembers}
+                stories={stories}
+                setErr={setErr}
+                navigate={navigate}
+                onOpenProjectPicker={() => setShowProjectsHub(true)}
+              />
+            </>
+          )}
+
           {mainTab === "wiki" && (
             <>
               {!projectId ? (
@@ -4523,13 +4895,106 @@ export default function App() {
             <div className="as-hub-hd">
               <div>
                 <div className="fw-semibold">Master data</div>
-                <div className="small text-secondary">Workflow templates (global, not bound to a project)</div>
+                <div className="small text-secondary">Workflow templates và vai trò thành viên (master data toàn workspace)</div>
               </div>
               <button type="button" className="btn btn-sm btn-outline-secondary" onClick={closeMasterDataHub} aria-label="Close">
                 <i className="bi bi-x-lg" />
               </button>
             </div>
             <div className="as-hub-bd">
+              <div className="as-panel mb-4">
+                <div className="as-panel-hd d-flex align-items-center justify-content-between">
+                  <span>Vai trò (roles)</span>
+                  <span className="badge text-bg-light border">{workspaceRoles.length}</span>
+                </div>
+                <div className="as-panel-bd p-0">
+                  {workspaceRoles.length === 0 ? (
+                    <div className="as-empty border-0 py-4">
+                      <div className="as-empty-icon">
+                        <i className="bi bi-person-badge" />
+                      </div>
+                      Chưa tải được danh sách vai trò — kiểm tra DB đã chạy migrate workspace_roles chưa.
+                    </div>
+                  ) : (
+                    <div className="list-group list-group-flush rounded-0 border-0">
+                      {workspaceRoles.map((r) => (
+                        <div key={r.id} className="list-group-item py-3 px-3">
+                          <div className="d-flex justify-content-between align-items-start gap-2">
+                            <div className="min-w-0">
+                              <div className="fw-semibold">{r.name}</div>
+                              <div className="small font-monospace text-secondary">{r.slug}</div>
+                              <div className="small text-secondary mt-1">{r.description || "—"}</div>
+                              <div className="small text-muted mt-1 d-flex flex-wrap gap-2 align-items-center">
+                                <span>sort {r.sort_order}</span>
+                                {r.is_system ? <span className="badge text-bg-secondary">Hệ thống</span> : null}
+                              </div>
+                            </div>
+                            {!r.is_system ? (
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-outline-danger flex-shrink-0"
+                                onClick={() => onDeleteWorkspaceRole(r.id, r.is_system)}
+                              >
+                                Xóa
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="as-panel mb-4">
+                <div className="as-panel-hd">Tạo vai trò tuỳ chỉnh</div>
+                <div className="as-panel-bd">
+                  <form className="vstack gap-3" onSubmit={onCreateWorkspaceRole}>
+                    <div>
+                      <label className="form-label small text-secondary mb-1">Slug (Latin thường, ví dụ tech_lead)</label>
+                      <input
+                        className="form-control"
+                        value={wrSlug}
+                        onChange={(e) => setWrSlug(e.target.value)}
+                        placeholder="tech_lead"
+                        maxLength={64}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div>
+                      <label className="form-label small text-secondary mb-1">Tên hiển thị</label>
+                      <input
+                        className="form-control"
+                        value={wrName}
+                        onChange={(e) => setWrName(e.target.value)}
+                        placeholder="Tech Lead"
+                        maxLength={255}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label className="form-label small text-secondary mb-1">Mô tả (tuỳ chọn)</label>
+                      <input
+                        className="form-control"
+                        value={wrDesc}
+                        onChange={(e) => setWrDesc(e.target.value)}
+                        placeholder="Ngắn gọn vai trò trong dự án Agile"
+                      />
+                    </div>
+                    <div>
+                      <label className="form-label small text-secondary mb-1">Thứ tự sắp xếp</label>
+                      <input
+                        type="number"
+                        className="form-control"
+                        value={wrSortOrder}
+                        onChange={(e) => setWrSortOrder(e.target.value)}
+                      />
+                    </div>
+                    <button className="btn btn-primary" type="submit" disabled={!wrSlug.trim() || !wrName.trim()}>
+                      Tạo vai trò
+                    </button>
+                  </form>
+                </div>
+              </div>
               <div className="as-panel mb-4">
                 <div className="as-panel-hd d-flex align-items-center justify-content-between">
                   <span>Workflow templates</span>
@@ -4632,13 +5097,13 @@ export default function App() {
                 onPatchStoryDetails={onPatchStoryDetails}
                 onPatchStoryRelease={onPatchStoryRelease}
                 onPatchStoryAssignees={onPatchStoryAssignees}
-                onCreateTask={onCreateTask}
                 onPatchTask={onPatchTask}
-                onDeleteTask={onDeleteTask}
                 onPostComment={onPostComment}
                 onPatchComment={onPatchComment}
                 onDeleteComment={onDeleteComment}
                 setErr={setErr}
+                onReloadStory={reloadStoryIfOpen}
+                navigate={navigate}
               />
             </div>
           </aside>
