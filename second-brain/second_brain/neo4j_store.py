@@ -45,6 +45,15 @@ def ensure_constraints(driver: Driver) -> None:
         "CREATE CONSTRAINT sb_project_ref IF NOT EXISTS FOR (n:Project) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codefile_ref IF NOT EXISTS FOR (n:CodeFile) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codefunction_ref IF NOT EXISTS FOR (n:CodeFunction) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_codecontroller_ref IF NOT EXISTS FOR (n:CodeController) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_codeendpoint_ref IF NOT EXISTS FOR (n:CodeEndpoint) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_codedto_ref IF NOT EXISTS FOR (n:CodeDTO) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_codefield_ref IF NOT EXISTS FOR (n:CodeField) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_codedecorator_ref IF NOT EXISTS FOR (n:CodeDecorator) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_codebusinessrule_ref IF NOT EXISTS FOR (n:BusinessRule) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_databasetable_ref IF NOT EXISTS FOR (n:DatabaseTable) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_kafkatopic_ref IF NOT EXISTS FOR (n:KafkaTopic) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_externalapi_ref IF NOT EXISTS FOR (n:ExternalAPI) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_release_ref IF NOT EXISTS FOR (n:Release) REQUIRE n.ref IS UNIQUE",
     ]
     with driver.session() as session:

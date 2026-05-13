@@ -44,9 +44,9 @@ Do **not** link or assume paths to Agile Studio sources in git — deployment ma
     - Story #3 (Roadmap/Gantt): Status: Backlog. Associated documents set to Draft. Uses frappe-gantt with auto-scheduling.
     - Story #6 (Knowledge Management System): Features Data Ingestion Pipeline (Webhooks/Git), React Force Graph visualization, and MCP Second Brain Server tools.
     - Story #7 (Git Integration): Status: Current.
-    - Story #8 (MCP Server): Status: Started (Implementation Priority). Reporter: Tony.
+    - Story #8 (MCP Server): Status: current_started (Implementation Priority). Reporter: Tony.
     - Story #9 (In-doc Commenting): Uses Text Anchoring (dom-anchor-text-quote) for position maintenance.
-    - Story #10 (Real-time Events): Reporter: Tony. Uses the existing WebSocket mechanism in chat-service.
+    - Story #10 (Real-time Events): Status: Draft. Reporter: Tony. Uses the existing WebSocket mechanism in chat-service. Triggers need integration in `agile_hub/crud.py` and `router.py`.
     - Story #24 (Workflows Automation): Status: Current. Uses an IF-AND-THEN rule engine model.
     - Story #25 (Roadmap/Gantt View): Status: Current.
     - Story #26 (AI Insights): Uses Monte Carlo simulations for forecasting and Sentiment Analysis for comments.
@@ -58,7 +58,18 @@ Do **not** link or assume paths to Agile Studio sources in git — deployment ma
         - Features: Architecture Visualization, Codebase Understanding, Implementation Assistance.
         - Note: Requires explicit approval from @tony before starting implementation tasks.
     - Story #29 (Git Integration): Features Commit Linking, AI PR Review, and Traceability Matrix.
-    - Story #32 (Real-time Events): Uses Redis Pub/Sub and WebSocket/SSE for event broadcasting.
+- Technical Architecture:
+    - `agile_hub` module: `agile-studio/agile_hub/`. Uses custom `MUInt` type for MySQL UNSIGNED compatibility in SQLite.
+    - `StoryStatus` Literal: `icebox`, `backlog`, `current`, `done`.
+    - `chat-service` (NestJS): Uses Socket.io and `ChatGateway` for real-time broadcasts.
+    - Internal event broadcasting: `POST /api/chat/internal/story-events/broadcast`.
+    - `agile_hub/chat_sync.py`: Uses `urllib` with 8s timeout for notifications.
+    - Environment: API port 9120, Web UI port 5175, MySQL `agile_studio` (3306/3307).
+    - Key env vars: `AGILE_DATABASE_URL`, `AGILE_EMBEDDING_HTTP_URL`, `AGILE_EMBEDDING_HTTP_KEY`, `AGILE_JWT_SECRET`.
+    - `SECOND_BRAIN_EMBEDDING_FALLBACK=1`: Local BLAKE2b hashing (384-dim) for deterministic embeddings.
+    - Use FastAPI `BackgroundTasks` for event triggers to avoid blocking API responses.
+    - Extracted `agile_hub` models: Wiki doc "Agile Hub: Models & Schemas" (slug: `agile-hub-models-schemas`).
+    - `mcp_server` directory is NOT at `agile-studio/mcp_server`.
 - API & Validation:
     - Rules: Title length 5-255 chars, auto-generated kebab-case slugs.
     - Error codes: DOC_NOT_FOUND, EMBEDDING_FAILURE, SYNC_CONFLICT.

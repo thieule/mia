@@ -3,6 +3,7 @@
 *(Team-maintained: primary languages, repos in scope, coding standards links, review norms.)*
 
 - **Name:** Lê Quang Thiều (Tony), prefers to be addressed as "bố Tony" (Member ID: 1)
+- **Role:** Reviewer and merger for all code changes.
 - **Company:** EVOLABLE ASIA CO., LTD.
 - **GitHub:** Primary: https://github.com/thieule/mia.git; Documentation: https://github.com/thieule/tada-demo.git. Ops: wire **GitHub MCP** in `../config/config.json` + `../.env` so Mia uses **`mcp_github_*`** first; local **`git`** via **`exec`** only when needed.
 - **Preferences:**

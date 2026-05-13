@@ -105,8 +105,8 @@ Trong repo gốc `mia`, [`docker-compose.yml`](../docker-compose.yml) định ng
 
 - **neo4j** — ports `7474` (Browser), `7687` (Bolt); user/pass mặc định `neo4j` / `secondbrain_local`.
 - **elasticsearch** — port `9200`, single-node dev (security tắt).
-- **second-brain-mcp** — image build từ thư mục `second-brain/`, map host **`9122` → 8000** (MCP + health + ingest).
-- **agile-studio** — đã gán sẵn `AGILE_SECOND_BRAIN_INGEST_URL` và `AGILE_SECOND_BRAIN_INGEST_SECRET` trùng service Second Brain.
+- **second-brain-mcp** — image build từ thư mục `second-brain/`, map host **`9122` → 8000** (MCP + health + ingest); Compose nạp **`second-brain/.env`** (secret ingest/MCP/GitHub webhook đã generate — không commit file này).
+- **agile-studio** — cũng nạp `second-brain/.env` sau `agile-studio/.env` để **`AGILE_SECOND_BRAIN_INGEST_SECRET`** trùng `SECOND_BRAIN_INGEST_SECRET`; URL ingest vẫn trỏ `http://second-brain-mcp:8000/ingest/agile-event`.
 
 **Embedding (Gemini):** trước `docker compose up`, export **`GEMINI_API_KEY`** trên máy host (Compose truyền vào service `second-brain-mcp`). Không có key thì ingest/search gọi embed sẽ lỗi — chỉ dev có thể đặt `SECOND_BRAIN_EMBEDDING_FALLBACK=1` trong environment của service (không khuyến nghị production).
 

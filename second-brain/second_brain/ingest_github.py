@@ -14,6 +14,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+from second_brain.code_semantic_graph import delete_semantic_for_codefile, merge_semantic_for_codefile
 from second_brain.code_static_multilang import EXT_TO_LANG, analyze_code_file
 from second_brain.commit_links import link_commit_tasks_and_stories
 from second_brain.es_store import delete_by_ref, index_chunk
@@ -200,6 +201,7 @@ def _index_code_diff_es(
 
 def _delete_codefile_graph(project_id: int, path: str) -> str:
     fref = node_ref_slug(project_id, "codefile", path)
+    delete_semantic_for_codefile(project_id=project_id, fref=fref, run_write_fn=run_write)
     run_write(
         """
         MATCH (f:CodeFile {ref: $fref})-[:DEFINES]->(x:CodeFunction)
@@ -444,6 +446,14 @@ def _ingest_one_github_commit(
                         "ts": ts,
                     },
                 )
+                run_write(
+                    """
+                    MATCH (c:Commit {ref: $cref}), (fn:CodeFunction {ref: $fq})
+                    WHERE c.project_id = $project_id AND fn.project_id = $project_id
+                    MERGE (c)-[:MODIFIES]->(fn)
+                    """,
+                    {"cref": cref, "fq": fq_ref, "project_id": project_id},
+                )
             for caller_q, callee_q in meta.get("calls") or []:
                 cr = func_refs.get(caller_q)
                 ce = func_refs.get(callee_q)
@@ -458,6 +468,16 @@ def _ingest_one_github_commit(
                     """,
                     {"cr": cr, "ce": ce, "project_id": project_id},
                 )
+
+            merge_semantic_for_codefile(
+                project_id=project_id,
+                fref=fref,
+                path=path,
+                semantic=meta.get("semantic") if isinstance(meta.get("semantic"), dict) else None,
+                func_refs=func_refs,
+                ts=ts,
+                run_write_fn=run_write,
+            )
 
         blob = f"{full_name}\n{path}\n{sha}\n\n{content[:49000]}"
         index_chunk(
