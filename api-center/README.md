@@ -63,7 +63,7 @@ Optional:
 - `API_CENTER_WORKING_QUEUE_SUBDIR` (default: `working_queue`)
 - `API_CENTER_CORE_DIR` (optional, mặc định `../agents/core`)
 - `API_CENTER_ADMIN_SECRET` (optional nhưng **bắt buộc** nếu gọi admin API; thiếu → các route `/v1/admin/*` trả `503`)
-- `API_CENTER_AGENT_DB_URL` hoặc `AGILE_DATABASE_URL` / `MIA_AGENT_SYNC_DATABASE_URL` (MySQL; dùng cho ghi `mia_agents`, `mia_agent_prompts` — xem `docs/AGENT_STATE_DATABASE.md` và `schema/migrate_mia_agent_prompts_skills_mysql.sql`)
+- `MIA_AGENT_DATABASE_URL` hoặc `API_CENTER_AGENT_DB_URL` (MySQL database **`agent`** — không dùng `agile_studio`; xem `docs/AGENT_STATE_DATABASE.md`)
 
 ## Admin API (quản lý agent + DB)
 

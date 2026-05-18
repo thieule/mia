@@ -172,6 +172,41 @@ class WorkingQueueConfig(Base):
         ),
     )
     keep_recent_session_messages: int = 24
+    agent_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("agentId", "agent_id"),
+        description="Mia agent id for MySQL mirror (e.g. mia-ba). Falls back to MIA_AGENT_ID env.",
+    )
+    db_mirror: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("dbMirror", "db_mirror"),
+        description="Dual-write tasks to mia_working_queue_tasks when DB URL is set.",
+    )
+    pending_max: int = Field(
+        default=500,
+        ge=1,
+        validation_alias=AliasChoices("pendingMax", "pending_max"),
+        description="Max pending JSON files; oldest low-priority items expired when exceeded.",
+    )
+    pending_ttl_hours: int = Field(
+        default=72,
+        ge=1,
+        validation_alias=AliasChoices("pendingTtlHours", "pending_ttl_hours"),
+    )
+    done_retention_days: int = Field(
+        default=14,
+        ge=1,
+        validation_alias=AliasChoices("doneRetentionDays", "done_retention_days"),
+    )
+    noop_notification_skip: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("noopNotificationSkip", "noop_notification_skip"),
+        description="Skip LLM for notifications that fail Agile allowlist (e.g. reclaimed noise).",
+    )
+    priority_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("priorityEnabled", "priority_enabled"),
+    )
     # Absolute paths of other agents' *workspace* dirs (where sessions/ lives) that may receive handoff
     # via ``working_queue_submit`` (e.g. ``agents/ai-tech/workspace`` under the repo root).
     handoff_allow_workspace_roots: list[str] = Field(default_factory=list)

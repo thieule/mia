@@ -83,6 +83,7 @@ flowchart TB
   - `brain_search_knowledge` — kNN (`search_mode=vector`) hoặc **hybrid** kNN+BM25 (`search_mode=hybrid`); lọc `scope`, `visibility`, `source_type` (`agile` / `code` / `code_diff`).
   - `brain_github_compare` — Đọc diff GitHub API `compare base...head` (không ghi graph); cần token.
   - `brain_refresh_github_code` — Agent gọi để **cập nhật code space**: repo `owner/repo`, `ref` nhánh hoặc SHA, tuỳ chọn `project_id`, danh sách file (`paths_json`) hoặc quét cây Git (đuôi đã hỗ trợ) + `path_prefix`; cần `SECOND_BRAIN_GITHUB_TOKEN`.
+  - `brain_scan_local_code` — Quét **thư mục trên disk** nơi process Second Brain chạy (cùng phân tích `CodeFile` / `CodeFunction` / ES như GitHub). Bắt buộc `SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS` (allowlist); `project_id` hoặc `SECOND_BRAIN_GITHUB_DEFAULT_PROJECT_ID`. HTTP: `POST /ingest/local-code-scan` JSON `{root, project_id?, paths?, path_prefix?}` + `X-Second-Brain-Secret`.
   - `brain_remember_decision` — ADR/MADR (`:Decision`), `scope`/`visibility`/`tags_json`, optional `DECIDED_IN` → `:Story`.
   - `brain_remember_lesson`, `brain_feedback_create`, `brain_supersede_decision` (cập nhật `old.status = Superseded`),
     `brain_extract_lesson_from_text`, `brain_extract_adr_from_text`.
@@ -91,9 +92,13 @@ flowchart TB
 
 Luồng **ADR do AI**: không tự chạy sau mỗi comment; agent phải **chủ động** gọi `brain_remember_decision` khi được yêu cầu hoặc khi workflow cho phép.
 
+**Tuỳ chọn:** giảm quy mô ingest GitHub bằng `SECOND_BRAIN_GITHUB_MAX_FILES`, `SECOND_BRAIN_GITHUB_MAX_FILE_BYTES`, chỉ map webhook repo cần trace — xem [.env.example](.env.example).
+
 ### 3. Khóa định danh nút (`ref`)
 
 Định dạng: `p{project_id}:{kind}:{agile_id}` (ví dụ `p2:story:15`). Dùng cho MERGE và tra cứu neighborhood.
+
+**Code + nhiều repo / project:** `(Project)-[:HAS_REPOSITORY]->(GitRepository)`; commit/file gắn repo qua `IN_REPOSITORY` / `HAS_CODE_FILE`. Khóa file: `p{pid}:codefile:{repo_key}::{path}` (GitHub: `repo_key` = `owner/repo`; local: `local:{hash}`). Map nhiều repo → một `project_id`: `SECOND_BRAIN_GITHUB_REPO_PROJECT_MAP`.
 
 ---
 
@@ -105,7 +110,7 @@ Trong repo gốc `mia`, [`docker-compose.yml`](../docker-compose.yml) định ng
 
 - **neo4j** — ports `7474` (Browser), `7687` (Bolt); user/pass mặc định `neo4j` / `secondbrain_local`.
 - **elasticsearch** — port `9200`, single-node dev (security tắt).
-- **second-brain-mcp** — image build từ thư mục `second-brain/`, map host **`9122` → 8000** (MCP + health + ingest); Compose nạp **`second-brain/.env`** (secret ingest/MCP/GitHub webhook đã generate — không commit file này).
+- **second-brain-mcp** — image build từ thư mục `second-brain/`, map host **`9122` → 8000** (MCP + health + ingest); Compose nạp **`second-brain/.env`** (secret ingest/MCP/GitHub webhook đã generate — không commit file này). Mount repo gốc `mia` → **`/workspace/mia`** (read-only) để quét local; mặc định `SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS=/workspace/mia` (override trong `second-brain/.env`).
 - **agile-studio** — cũng nạp `second-brain/.env` sau `agile-studio/.env` để **`AGILE_SECOND_BRAIN_INGEST_SECRET`** trùng `SECOND_BRAIN_INGEST_SECRET`; URL ingest vẫn trỏ `http://second-brain-mcp:8000/ingest/agile-event`.
 
 **Embedding (Gemini):** trước `docker compose up`, export **`GEMINI_API_KEY`** trên máy host (Compose truyền vào service `second-brain-mcp`). Không có key thì ingest/search gọi embed sẽ lỗi — chỉ dev có thể đặt `SECOND_BRAIN_EMBEDDING_FALLBACK=1` trong environment của service (không khuyến nghị production).
@@ -182,6 +187,8 @@ Nếu bật **`SECOND_BRAIN_MCP_SECRET`** trên Second Brain, thêm header vào 
 | `MCP_TRANSPORT` | `stdio` hoặc `streamable-http` |
 | `MCP_HOST` / `MCP_PORT` | Bind HTTP MCP |
 | `MCP_STATELESS_HTTP` / `MCP_JSON_RESPONSE` | Khuyến nghị `true` cho client kiểu Cursor/SDK |
+| `SECOND_BRAIN_GITHUB_MAX_FILES` / `SECOND_BRAIN_GITHUB_MAX_FILE_BYTES` | Giới hạn ingest GitHub mỗi push/refresh (áp dụng luôn cho quét local) |
+| `SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS` | Allowlist quét disk (comma-separated, đường dẫn tuyệt đối); rỗng → tắt `brain_scan_local_code` |
 
 Hub (Agile): `AGILE_SECOND_BRAIN_INGEST_URL`, `AGILE_SECOND_BRAIN_INGEST_SECRET` — mô tả trong [`agile_hub/second_brain_client.py`](../agile-studio/agile_hub/second_brain_client.py).
 

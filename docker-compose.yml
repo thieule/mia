@@ -1,4 +1,4 @@
-# DB: MySQL tạo `ai_workflow` (MYSQL_DATABASE) + script docker/mysql-init tạo `agile_studio` cho Hub/MCP/Chat.
+# DB: MySQL — `ai_workflow` (default), `agile_studio` (Hub/MCP), `agent` (mia_* tables: registry, WQ mirror).
 # Init chỉ chạy khi volume trống. Xóa volume và tạo lại: docker compose down -v && docker compose up -d
 
 services:
@@ -86,6 +86,10 @@ services:
       SECOND_BRAIN_GITHUB_TOKEN: ${SECOND_BRAIN_GITHUB_TOKEN:-}
       SECOND_BRAIN_GITHUB_REPO_PROJECT_MAP: ${SECOND_BRAIN_GITHUB_REPO_PROJECT_MAP:-}
       SECOND_BRAIN_GITHUB_DEFAULT_PROJECT_ID: ${SECOND_BRAIN_GITHUB_DEFAULT_PROJECT_ID:-}
+      # Quét code local trong container: mount repo → /workspace/mia và allowlist (xem second-brain/.env).
+      SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS: ${SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS:-/workspace/mia}
+    volumes:
+      - ${SECOND_BRAIN_LOCAL_SCAN_HOST_PATH:-.}:/workspace/mia:ro
     ports:
       - "9122:8000"
     depends_on:

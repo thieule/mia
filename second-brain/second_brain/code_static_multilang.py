@@ -99,6 +99,129 @@ def _java_http_from_mapping(short: str) -> str | None:
     }.get(short)
 
 
+_JAVA_PRIMITIVE_NAMES = frozenset(
+    {
+        "void",
+        "int",
+        "long",
+        "short",
+        "byte",
+        "char",
+        "float",
+        "double",
+        "boolean",
+        "Integer",
+        "Long",
+        "Short",
+        "Byte",
+        "Character",
+        "Float",
+        "Double",
+        "Boolean",
+        "String",
+        "Object",
+        "Void",
+    }
+)
+
+
+def _java_return_dto_name(typ_node: Any, src: bytes) -> str | None:
+    """Tên kiểu DTO trả về (bỏ void/primitive/String); hỗ trợ ResponseEntity<X>, Mono<X>."""
+    if typ_node is None:
+        return None
+    txt = _node_text(typ_node, src).strip()
+    if not txt or txt == "void":
+        return None
+    for pat in (r"ResponseEntity\s*<\s*([^>]+)\s*>", r"Mono\s*<\s*([^>]+)\s*>", r"Flux\s*<\s*([^>]+)\s*>"):
+        m = re.search(pat, txt)
+        if m:
+            inner = m.group(1).strip()
+            inner = re.sub(r"\s+", " ", inner)
+            if "<" in inner:
+                m2 = re.search(r"<([^<>]+)>\s*$", inner)
+                if m2:
+                    inner = m2.group(1).strip()
+            parts = [p.strip() for p in inner.replace(",", " ").split() if p.strip()]
+            cand = parts[-1] if parts else inner
+            cand = cand.split(".")[-1]
+            if cand and cand not in _JAVA_PRIMITIVE_NAMES:
+                return cand
+    if typ_node.type == "type_identifier":
+        n = txt.split(".")[-1]
+        if n not in _JAVA_PRIMITIVE_NAMES:
+            return n
+    if typ_node.type == "generic_type":
+        base = typ_node.child_by_field_name("type")
+        if base and base.type == "type_identifier":
+            n = _node_text(base, src).strip().split(".")[-1]
+            if n in ("List", "Set", "Collection", "Iterable", "Optional", "Page", "Slice"):
+                args = typ_node.child_by_field_name("type_arguments")
+                if args and args.named_children:
+                    first = args.named_children[0]
+                    return _java_return_dto_name(first, src)
+            if n not in _JAVA_PRIMITIVE_NAMES:
+                return n
+    return None
+
+
+def _ts_return_dto_text(method_node: Any, src: bytes) -> str | None:
+    """Trích chuỗi kiểu trả về từ method (type_annotation / return_type)."""
+    rt = method_node.child_by_field_name("return_type")
+    if rt is None:
+        for ch in method_node.children:
+            if ch.type == "type_annotation":
+                rt = ch
+                break
+    if rt is None:
+        return None
+    inner = rt.child_by_field_name("type") if rt.type == "type_annotation" else None
+    if inner is None and rt.named_children:
+        inner = rt.named_children[-1]
+    if inner is None:
+        return None
+    txt = _node_text(inner, src).strip()
+    if not txt:
+        return None
+    m = re.search(r"Promise\s*<\s*([^>]+)\s*>", txt)
+    if m:
+        txt = m.group(1).strip()
+    if txt in ("void", "any", "unknown", "never", "undefined"):
+        return None
+    if txt in ("string", "number", "boolean", "bigint", "symbol"):
+        return None
+    base = txt.split("|")[0].strip()
+    base = re.sub(r"\s*(\[\])?\s*$", "", base)
+    if base.startswith("{"):
+        return None
+    return base.split(".")[-1] if base else None
+
+
+_TS_PRIMITIVEISH = frozenset({"string", "number", "boolean", "void", "any", "unknown", "never", "Date", "object"})
+
+
+def _trace_refs_above_lines(content: str, symbols: list[dict[str, Any]], *, lookback: int = 40) -> list[dict[str, Any]]:
+    """Story/task id từ vùng dòng phía trên khai báo hàm (JSDoc / comment)."""
+    from second_brain.commit_links import parse_story_ids, parse_task_ids
+
+    lines = content.splitlines()
+    out: list[dict[str, Any]] = []
+    for s in symbols:
+        if s.get("kind") != "function":
+            continue
+        ln = int(s.get("lineno") or 1)
+        if ln < 2:
+            continue
+        lo = max(0, ln - 2 - lookback)
+        chunk = "\n".join(lines[lo : ln - 1])
+        if not chunk.strip():
+            continue
+        sids = parse_story_ids(chunk)
+        tids = parse_task_ids(chunk)
+        if sids or tids:
+            out.append({"function": str(s["qualname"]), "story_ids": sids, "task_ids": tids})
+    return out
+
+
 def _join_http_paths(prefix: str, sub: str) -> str:
     p = (prefix or "").strip()
     s = (sub or "").strip()
@@ -298,6 +421,9 @@ def _extract_ts_family(root: Any, src: bytes, lang_id: str, file_path: str = "")
         "field_constraints": [],
         "dto_schemas": [],
         "accepts_bindings": [],
+        "returns_bindings": [],
+        "function_enforces": [],
+        "trace_refs": [],
         "io_edges": [],
     }
     nest_class_prefix: dict[str, str] = {}
@@ -461,18 +587,35 @@ def _extract_ts_family(root: Any, src: bytes, lang_id: str, file_path: str = "")
                 symbols.append({"qualname": qual, "kind": "function", "lineno": _line(node), "end_lineno": _line(node)})
                 defined_short.add(nm)
                 class_qual = ".".join(scope_stack) if scope_stack else ""
+                http_any = False
                 for dn, arg in _ts_decorator_calls(node, src):
                     if len(semantic["decorators"]) < _decor_cap:
                         semantic["decorators"].append(
                             {"name": dn, "target": qual, "lineno": _line(node), "target_kind": "function"}
                         )
+                    if dn in ("UseGuards", "Roles", "SetMetadata", "Throttle", "ApiBearerAuth", "ApiOAuth2", "UseInterceptors"):
+                        semantic["function_enforces"].append(
+                            {"function": qual, "kind": dn, "arg": (arg or "")[:400], "lineno": _line(node)}
+                        )
                     http = _ts_http_from_decorator(dn)
+                    if http:
+                        http_any = True
                     if http and class_qual in nest_controller_classes:
                         sub = (arg or "").strip()
                         full = _join_http_paths(nest_class_prefix.get(class_qual, ""), sub)
                         semantic["endpoints"].append(
                             {"method": http, "path": full, "handler": qual, "lineno": _line(node)}
                         )
+                ret_dto = _ts_return_dto_text(node, src)
+                if (
+                    ret_dto
+                    and ret_dto.lower() not in _TS_PRIMITIVEISH
+                    and class_qual in nest_controller_classes
+                    and http_any
+                ):
+                    semantic["returns_bindings"].append(
+                        {"handler": qual, "dto": ret_dto, "lineno": _line(node)}
+                    )
                 if body:
                     record_calls_inside(qual, body)
                     walk(body)
@@ -522,6 +665,7 @@ def _extract_ts_family(root: Any, src: bytes, lang_id: str, file_path: str = "")
 
     content = src.decode("utf-8", errors="replace")
     semantic["io_edges"].extend(_semantic_io_edges_from_lines(file_path, content, symbols, lang_id))
+    semantic["trace_refs"].extend(_trace_refs_above_lines(content, symbols))
 
     return {"symbols": symbols, "calls": internal_calls, "parse_ok": True, "language": lang_id, "semantic": semantic}
 
@@ -536,6 +680,9 @@ def _extract_java(root: Any, src: bytes, file_path: str = "") -> dict[str, Any]:
         "field_constraints": [],
         "dto_schemas": [],
         "accepts_bindings": [],
+        "returns_bindings": [],
+        "function_enforces": [],
+        "trace_refs": [],
         "io_edges": [],
     }
     java_controller_prefix: dict[str, str] = {}
@@ -609,6 +756,21 @@ def _extract_java(root: Any, src: bytes, file_path: str = "") -> dict[str, Any]:
                         semantic["decorators"].append(
                             {"name": sh, "target": qual, "lineno": _line(node), "target_kind": "function"}
                         )
+                    if sh in (
+                        "Transactional",
+                        "PreAuthorize",
+                        "PostAuthorize",
+                        "RolesAllowed",
+                        "Secured",
+                        "Cacheable",
+                        "CacheEvict",
+                        "CachePut",
+                        "Validated",
+                        "RateLimiter",
+                    ):
+                        semantic["function_enforces"].append(
+                            {"function": qual, "kind": sh, "arg": (sarg or "")[:400], "lineno": _line(node)}
+                        )
                     http = _java_http_from_mapping(sh)
                     if class_key in java_web_classes:
                         if http:
@@ -621,6 +783,14 @@ def _extract_java(root: Any, src: bytes, file_path: str = "") -> dict[str, Any]:
                             semantic["endpoints"].append(
                                 {"method": "GET", "path": full, "handler": qual, "lineno": _line(node)}
                             )
+                rtype = node.child_by_field_name("type")
+                dto_ret = _java_return_dto_name(rtype, src) if class_key in java_web_classes else None
+                if dto_ret and class_key in java_web_classes and any(
+                    ep.get("handler") == qual for ep in semantic["endpoints"]
+                ):
+                    semantic["returns_bindings"].append(
+                        {"handler": qual, "dto": dto_ret, "lineno": _line(node)}
+                    )
                 formal = node.child_by_field_name("parameters")
                 if formal and class_key in java_web_classes:
                     for param in formal.named_children:
@@ -689,6 +859,7 @@ def _extract_java(root: Any, src: bytes, file_path: str = "") -> dict[str, Any]:
     walk(root)
     content = src.decode("utf-8", errors="replace")
     semantic["io_edges"].extend(_semantic_io_edges_from_lines(file_path, content, symbols, "java"))
+    semantic["trace_refs"].extend(_trace_refs_above_lines(content, symbols))
     return {"symbols": symbols, "calls": [], "parse_ok": True, "language": "java", "semantic": semantic}
 
 

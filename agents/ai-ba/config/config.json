@@ -43,7 +43,14 @@
   "working_queue": {
     "enabled": true,
     "interval_s": 3,
-    "max_tasks_per_tick": 2
+    "max_tasks_per_tick": 2,
+    "agentId": "mia-ba",
+    "dbMirror": true,
+    "pendingMax": 500,
+    "pendingTtlHours": 72,
+    "doneRetentionDays": 14,
+    "noopNotificationSkip": true,
+    "priorityEnabled": true
   },
   "tools": {
     "restrictToWorkspace": true,
@@ -96,7 +103,10 @@
       },
       "second-brain": {
         "type": "streamableHttp",
-        "url": "http://127.0.0.1:9122/mcp",
+        "url": "${SECOND_BRAIN_MCP_URL}",
+        "headers": {
+          "Authorization": "Bearer ${SECOND_BRAIN_MCP_SECRET}"
+        },
         "toolTimeout": 45,
         "enabledTools": [
           "*"

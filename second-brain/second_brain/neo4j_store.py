@@ -43,6 +43,7 @@ def ensure_constraints(driver: Driver) -> None:
         "CREATE CONSTRAINT sb_feedback_ref IF NOT EXISTS FOR (n:Feedback) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_commit_ref IF NOT EXISTS FOR (n:Commit) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_project_ref IF NOT EXISTS FOR (n:Project) REQUIRE n.ref IS UNIQUE",
+        "CREATE CONSTRAINT sb_gitrepository_ref IF NOT EXISTS FOR (n:GitRepository) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codefile_ref IF NOT EXISTS FOR (n:CodeFile) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codefunction_ref IF NOT EXISTS FOR (n:CodeFunction) REQUIRE n.ref IS UNIQUE",
         "CREATE CONSTRAINT sb_codecontroller_ref IF NOT EXISTS FOR (n:CodeController) REQUIRE n.ref IS UNIQUE",

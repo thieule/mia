@@ -11,12 +11,21 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
 from second_brain.code_semantic_graph import delete_semantic_for_codefile, merge_semantic_for_codefile
 from second_brain.code_static_multilang import EXT_TO_LANG, analyze_code_file
 from second_brain.commit_links import link_commit_tasks_and_stories
+from second_brain.repo_graph import (
+    codefile_ref,
+    codefunction_ref,
+    link_codefile_to_repository,
+    link_commit_to_repository,
+    merge_git_repository,
+    normalize_github_repo_key,
+)
 from second_brain.es_store import delete_by_ref, index_chunk
 from second_brain.neo4j_store import node_ref, node_ref_slug, run_write
 
@@ -199,8 +208,8 @@ def _index_code_diff_es(
     )
 
 
-def _delete_codefile_graph(project_id: int, path: str) -> str:
-    fref = node_ref_slug(project_id, "codefile", path)
+def _delete_codefile_graph(project_id: int, repo_key: str, path: str) -> str:
+    fref = codefile_ref(project_id, repo_key, path)
     delete_semantic_for_codefile(project_id=project_id, fref=fref, run_write_fn=run_write)
     run_write(
         """
@@ -281,60 +290,29 @@ def _list_tree_code_paths(
     return out[:max_files], False
 
 
-def _ingest_one_github_commit(
+def _process_touched_code_paths(
     *,
     project_id: int,
+    repo_key: str,
+    gref: str,
+    cref: str,
     full_name: str,
-    owner: str,
-    repo_name: str,
-    pref: str,
     sha: str,
-    message: str,
     removed: list[str],
     touched: list[str],
-    token: str,
+    commit_message_line: str,
+    ts: str,
+    es_event_type: str,
     max_files: int,
     max_bytes: int,
-    ts: str,
-    es_event_type: str = "github.push",
+    get_content: Callable[[str], str | None],
+    file_changes: dict[str, dict[str, Any]],
+    fetch_diff: bool,
+    diff_max_patch: int,
+    diff_max_files: int,
+    diff_scope: str,
 ) -> dict[str, int]:
-    fetch_diff, diff_max_patch, diff_max_files, diff_scope = _github_diff_settings()
-    file_changes: dict[str, dict[str, Any]] = {}
-    if token and fetch_diff and diff_max_files > 0:
-        file_changes = _fetch_commit_file_changes(owner, repo_name, sha, token)
-
-    cref = node_ref_slug(project_id, "commit", sha[:40])
-    commit_message_line = (message or "").split("\n", 1)[0].strip()
-
-    run_write(
-        """
-        MERGE (p:Project {ref: $pref})
-        SET p.project_id = $project_id, p.ingested_at = coalesce(p.ingested_at, $ts)
-        MERGE (c:Commit {ref: $cref})
-        SET c.project_id = $project_id, c.sha = $sha, c.message = $msg,
-            c.repo_full_name = $repo_fn, c.ingested_at = $ts, c.source = 'github'
-        MERGE (p)-[:HAS_COMMIT]->(c)
-        """,
-        {
-            "pref": pref,
-            "project_id": project_id,
-            "cref": cref,
-            "sha": sha[:64],
-            "msg": message[:8000],
-            "repo_fn": full_name[:512],
-            "ts": ts,
-        },
-    )
-
-    link_commit_tasks_and_stories(
-        project_id=project_id,
-        pref=pref,
-        cref=cref,
-        message=message,
-        ts=ts,
-        run_write_fn=run_write,
-    )
-
+    """Ghi CodeFile / CodeFunction / ES cho danh sách path (dùng chung GitHub + local scan)."""
     fragment: dict[str, int] = {
         "files_indexed": 0,
         "files_removed": 0,
@@ -367,7 +345,7 @@ def _ingest_one_github_commit(
         diff_budget -= 1
 
     for path in removed:
-        _delete_codefile_graph(project_id, path)
+        _delete_codefile_graph(project_id, repo_key, path)
         fragment["files_removed"] += 1
         _try_index_diff(path)
 
@@ -376,11 +354,8 @@ def _ingest_one_github_commit(
         if file_budget <= 0:
             break
         file_budget -= 1
-        if not token:
-            _log.debug("skip file fetch (no SECOND_BRAIN_GITHUB_TOKEN): %s", path)
-            continue
 
-        content = _fetch_github_file(owner, repo_name, path, sha, token)
+        content = get_content(path)
         if content is None:
             continue
         if len(content.encode("utf-8", errors="ignore")) > max_bytes:
@@ -389,13 +364,13 @@ def _ingest_one_github_commit(
         if "\x00" in content[:8000]:
             continue
 
-        fref = node_ref_slug(project_id, "codefile", path)
+        fref = codefile_ref(project_id, repo_key, path)
         run_write(
             """
             MATCH (c:Commit {ref: $cref})
             MERGE (f:CodeFile {ref: $fref})
-            SET f.project_id = $project_id, f.path = $path, f.repo_full_name = $repo_fn,
-                f.last_commit_sha = $sha, f.ingested_at = $ts
+            SET f.project_id = $project_id, f.path = $path, f.repo_key = $repo_key,
+                f.repo_full_name = $repo_fn, f.last_commit_sha = $sha, f.ingested_at = $ts
             MERGE (c)-[:MODIFIES]->(f)
             """,
             {
@@ -403,10 +378,14 @@ def _ingest_one_github_commit(
                 "fref": fref,
                 "project_id": project_id,
                 "path": path[:2048],
+                "repo_key": repo_key[:256],
                 "repo_fn": full_name[:512],
                 "sha": sha[:64],
                 "ts": ts,
             },
+        )
+        link_codefile_to_repository(
+            project_id=project_id, gref=gref, fref=fref, run_write_fn=run_write
         )
 
         run_write(
@@ -424,7 +403,7 @@ def _ingest_one_github_commit(
                 qn = str(sym.get("qualname") or "")
                 if not qn:
                     continue
-                fq_ref = node_ref_slug(project_id, "codefunction", f"{path}::{qn}")
+                fq_ref = codefunction_ref(project_id, repo_key, path, qn)
                 func_refs[qn] = fq_ref
                 fragment["functions"] += 1
                 run_write(
@@ -502,6 +481,102 @@ def _ingest_one_github_commit(
             _try_index_diff(path)
 
     return fragment
+
+
+def _ingest_one_github_commit(
+    *,
+    project_id: int,
+    full_name: str,
+    owner: str,
+    repo_name: str,
+    pref: str,
+    sha: str,
+    message: str,
+    removed: list[str],
+    touched: list[str],
+    token: str,
+    max_files: int,
+    max_bytes: int,
+    ts: str,
+    es_event_type: str = "github.push",
+) -> dict[str, int]:
+    fetch_diff, diff_max_patch, diff_max_files, diff_scope = _github_diff_settings()
+    file_changes: dict[str, dict[str, Any]] = {}
+    if token and fetch_diff and diff_max_files > 0:
+        file_changes = _fetch_commit_file_changes(owner, repo_name, sha, token)
+
+    cref = node_ref_slug(project_id, "commit", sha[:40])
+    commit_message_line = (message or "").split("\n", 1)[0].strip()
+    repo_key = normalize_github_repo_key(full_name)
+
+    gref = merge_git_repository(
+        project_id=project_id,
+        pref=pref,
+        repo_key=repo_key,
+        repo_full_name=full_name,
+        source="github",
+        ts=ts,
+        run_write_fn=run_write,
+    )
+
+    run_write(
+        """
+        MERGE (c:Commit {ref: $cref})
+        SET c.project_id = $project_id, c.sha = $sha, c.message = $msg,
+            c.repo_key = $repo_key, c.repo_full_name = $repo_fn, c.ingested_at = $ts, c.source = 'github'
+        MERGE (p:Project {ref: $pref})-[:HAS_COMMIT]->(c)
+        """,
+        {
+            "pref": pref,
+            "project_id": project_id,
+            "cref": cref,
+            "sha": sha[:64],
+            "msg": message[:8000],
+            "repo_key": repo_key[:256],
+            "repo_fn": full_name[:512],
+            "ts": ts,
+        },
+    )
+    link_commit_to_repository(
+        project_id=project_id, cref=cref, gref=gref, run_write_fn=run_write
+    )
+
+    link_commit_tasks_and_stories(
+        project_id=project_id,
+        pref=pref,
+        cref=cref,
+        message=message,
+        ts=ts,
+        run_write_fn=run_write,
+    )
+
+    def get_content(path: str) -> str | None:
+        if not token:
+            _log.debug("skip file fetch (no SECOND_BRAIN_GITHUB_TOKEN): %s", path)
+            return None
+        return _fetch_github_file(owner, repo_name, path, sha, token)
+
+    return _process_touched_code_paths(
+        project_id=project_id,
+        repo_key=repo_key,
+        gref=gref,
+        cref=cref,
+        full_name=full_name,
+        sha=sha,
+        removed=removed,
+        touched=touched,
+        commit_message_line=commit_message_line,
+        ts=ts,
+        es_event_type=es_event_type,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        get_content=get_content,
+        file_changes=file_changes,
+        fetch_diff=fetch_diff,
+        diff_max_patch=diff_max_patch,
+        diff_max_files=diff_max_files,
+        diff_scope=diff_scope,
+    )
 
 
 def apply_github_code_refresh(

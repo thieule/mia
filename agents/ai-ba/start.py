@@ -26,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 # Thư mục ``agents/`` gồm ``core``, ``ai-tools`` và các deploy ``ai-*``.
 AGENTS_ROOT = ROOT.parent
+MIA_ROOT = AGENTS_ROOT.parent
 AI_AGENT_ROOT = AGENTS_ROOT / "core"
 AI_TOOLS_ROOT = AGENTS_ROOT / "ai-tools"
 CONFIG = ROOT / "config" / "config.json"
@@ -117,6 +118,36 @@ def _build_github_app_auth_header() -> str:
     return f"Bearer {token}"
 
 
+def _apply_second_brain_mcp_env() -> None:
+    """Default Second Brain MCP URL/secret; hydrate from second-brain/.env when agent .env is empty."""
+    sb_values: dict[str, str] = {}
+    sb_env = MIA_ROOT / "second-brain" / ".env"
+    if sb_env.is_file():
+        for raw in sb_env.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, val = line.partition("=")
+            name = name.strip()
+            if name not in ("SECOND_BRAIN_MCP_SECRET", "SECOND_BRAIN_MCP_URL"):
+                continue
+            val = val.strip()
+            if len(val) >= 2 and val[0] == '"' == val[-1]:
+                val = val[1:-1]
+            if val:
+                sb_values[name] = val
+    if not os.environ.get("SECOND_BRAIN_MCP_SECRET", "").strip() and sb_values.get("SECOND_BRAIN_MCP_SECRET"):
+        os.environ["SECOND_BRAIN_MCP_SECRET"] = sb_values["SECOND_BRAIN_MCP_SECRET"]
+    if not os.environ.get("SECOND_BRAIN_MCP_URL", "").strip() and sb_values.get("SECOND_BRAIN_MCP_URL"):
+        os.environ["SECOND_BRAIN_MCP_URL"] = sb_values["SECOND_BRAIN_MCP_URL"]
+    os.environ.setdefault("SECOND_BRAIN_MCP_URL", "http://127.0.0.1:9122/mcp")
+    os.environ.setdefault("SECOND_BRAIN_MCP_SECRET", "")
+    os.environ.setdefault("MIA_AGENT_ID", "mia-ba")
+    os.environ.setdefault("MIA_AGENT_DATABASE_URL", "mysql+pymysql://app:app@127.0.0.1:3307/agent")
+    if os.environ.get("MIA_AGENT_DATABASE_URL") and not os.environ.get("API_CENTER_AGENT_DB_URL"):
+        os.environ.setdefault("API_CENTER_AGENT_DB_URL", os.environ["MIA_AGENT_DATABASE_URL"])
+
+
 def load_dotenv(path: Path) -> None:
     """Load KEY=VALUE pairs into os.environ (file values win over existing process env)."""
     text = path.read_text(encoding="utf-8")
@@ -151,6 +182,7 @@ def load_dotenv(path: Path) -> None:
         else:
             token = os.environ.get("GITHUB_TOKEN", "").strip()
             os.environ["GITHUB_MCP_AUTH_HEADER"] = f"Bearer {token}" if token else ""
+    _apply_second_brain_mcp_env()
 
 
 def _ensure_test_runs_path() -> None:
@@ -231,6 +263,13 @@ def validate_config() -> None:
     print(
         "  github MCP auth:",
         "set" if gh and gh != "Bearer " else "optional (empty - wire GITHUB_TOKEN or GitHub App)",
+        flush=True,
+    )
+    sb = os.environ.get("SECOND_BRAIN_MCP_SECRET", "").strip()
+    sb_url = os.environ.get("SECOND_BRAIN_MCP_URL", "").strip()
+    print(
+        "  second-brain MCP:",
+        f"{sb_url} (secret {'set' if sb else 'MISSING'})",
         flush=True,
     )
     raw = cfg.model_dump(by_alias=True)

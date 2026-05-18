@@ -897,7 +897,15 @@ def gateway(
     from mia.working_queue.store import WorkingQueueStore
 
     wq_cfg = config.working_queue
-    wq_store = WorkingQueueStore(config.workspace_path / wq_cfg.subdir)
+    wq_store = WorkingQueueStore(
+        config.workspace_path / wq_cfg.subdir,
+        agent_id=wq_cfg.agent_id,
+        db_mirror=wq_cfg.db_mirror,
+        pending_max=wq_cfg.pending_max,
+        pending_ttl_s=float(wq_cfg.pending_ttl_hours) * 3600,
+        done_retention_s=float(wq_cfg.done_retention_days) * 86400,
+        priority_enabled=wq_cfg.priority_enabled,
+    )
 
     async def on_working_queue_notify(response: str) -> None:
         from mia.bus.events import OutboundMessage
@@ -921,6 +929,7 @@ def gateway(
         on_notify=on_working_queue_notify,
         pick_bus_target=_pick_heartbeat_target,
         notify_on_complete_kinds=wq_cfg.notify_on_complete_kinds,
+        noop_notification_skip=wq_cfg.noop_notification_skip,
     )
 
     if channels.enabled_channels:

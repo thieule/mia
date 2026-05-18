@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from second_brain.code_static_multilang import _join_http_paths, _semantic_io_edges_from_lines
+from second_brain.commit_links import parse_story_ids, parse_task_ids
 
 
 def _call_name(node: ast.Call) -> str | None:
@@ -56,6 +57,80 @@ def _router_prefix_from_source(source: str, router_name: str) -> str:
     return pm.group(1).strip() if pm else ""
 
 
+def _python_ann_base_name(ann: ast.expr | None) -> str | None:
+    if ann is None:
+        return None
+    if isinstance(ann, ast.Name):
+        return ann.id
+    if isinstance(ann, ast.Subscript):
+        v = ann.value
+        if isinstance(v, ast.Name):
+            return v.id
+        if isinstance(v, ast.Attribute):
+            return v.attr
+    if isinstance(ann, ast.Attribute):
+        return ann.attr
+    if isinstance(ann, ast.Constant) and ann.value is None:
+        return None
+    return None
+
+
+def _python_skip_return_type(name: str | None) -> bool:
+    if not name:
+        return True
+    n = name.lower()
+    if n in ("none", "any", "no_return", "noreturn"):
+        return True
+    if n in ("str", "int", "float", "bool", "bytes", "dict", "list", "set", "tuple"):
+        return True
+    if n in ("response", "jsonresponse", "streamingresponse", "redirectresponse", "htmlresponse", "plaintextresponse"):
+        return True
+    return False
+
+
+def _response_model_from_route_call(dec: ast.Call) -> str | None:
+    for kw in dec.keywords:
+        if kw.arg == "response_model" and isinstance(kw.value, ast.Name):
+            return kw.value.id
+        if kw.arg == "response_model" and isinstance(kw.value, ast.Attribute):
+            return kw.value.attr
+    return None
+
+
+def _python_raises_http_exception(source: str, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    end = getattr(node, "end_lineno", None) or node.lineno
+    lines = source.splitlines()[node.lineno - 1 : end]
+    return bool(re.search(r"raise\s+HTTPException\b", "\n".join(lines)))
+
+
+def _python_trace_refs(tree: ast.Module, source: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def collect(fn: ast.FunctionDef | ast.AsyncFunctionDef, qual: str) -> None:
+        doc = ast.get_docstring(fn)
+        sids: list[int] = []
+        tids: list[int] = []
+        if doc:
+            sids = parse_story_ids(doc)
+            tids = parse_task_ids(doc)
+        if not sids and not tids and fn.lineno > 1:
+            lo = max(0, fn.lineno - 2 - 28)
+            chunk = "\n".join(source.splitlines()[lo : fn.lineno - 1])
+            sids = parse_story_ids(chunk)
+            tids = parse_task_ids(chunk)
+        if sids or tids:
+            out.append({"function": qual, "story_ids": sids, "task_ids": tids})
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            collect(node, node.name)
+        elif isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    collect(item, f"{node.name}.{item.name}")
+    return out
+
+
 def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: list[dict[str, Any]]) -> dict[str, Any]:
     semantic: dict[str, Any] = {
         "controllers": [],
@@ -64,6 +139,9 @@ def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: 
         "field_constraints": [],
         "dto_schemas": [],
         "accepts_bindings": [],
+        "returns_bindings": [],
+        "function_enforces": [],
+        "trace_refs": [],
         "io_edges": [],
     }
     _decor_cap = 200
@@ -91,6 +169,32 @@ def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: 
             return None
         return m.upper(), path_s
 
+    def return_dto_for_route(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+        for dec in fn.decorator_list:
+            if isinstance(dec, ast.Call):
+                rm = _response_model_from_route_call(dec)
+                if rm:
+                    return rm
+        if fn.returns:
+            n = _python_ann_base_name(fn.returns)
+            if not _python_skip_return_type(n):
+                return n
+        return None
+
+    def pydantic_enforce_name(dec: ast.expr) -> str | None:
+        if not isinstance(dec, ast.Call):
+            return None
+        fnn = dec.func
+        if isinstance(fnn, ast.Name):
+            vn = fnn.id
+        elif isinstance(fnn, ast.Attribute):
+            vn = fnn.attr
+        else:
+            return None
+        if vn in ("field_validator", "model_validator", "root_validator", "validator"):
+            return vn
+        return None
+
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             cqual = qual_class(node)
@@ -116,10 +220,12 @@ def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: 
                 if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 mq = qual_method(node, item)
+                item_has_route = False
                 for dec in item.decorator_list:
                     r = route_from_decorator(dec)
                     if r:
                         has_route_method = True
+                        item_has_route = True
                         method, subp = r
                         full = _join_http_paths("", subp)
                         semantic["endpoints"].append(
@@ -133,6 +239,26 @@ def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: 
                     elif isinstance(dec, ast.Name) and len(semantic["decorators"]) < _decor_cap:
                         semantic["decorators"].append(
                             {"name": dec.id, "target": mq, "lineno": item.lineno, "target_kind": "function"}
+                        )
+                    pv = pydantic_enforce_name(dec)
+                    if pv:
+                        semantic["function_enforces"].append(
+                            {"function": mq, "kind": pv, "arg": "", "lineno": item.lineno}
+                        )
+                if item_has_route:
+                    rd = return_dto_for_route(item)
+                    if rd:
+                        semantic["returns_bindings"].append(
+                            {"handler": mq, "dto": rd, "lineno": item.lineno}
+                        )
+                    if _python_raises_http_exception(source, item):
+                        semantic["function_enforces"].append(
+                            {
+                                "function": mq,
+                                "kind": "HTTPException",
+                                "arg": "",
+                                "lineno": item.lineno,
+                            }
                         )
             if has_route_method:
                 semantic["controllers"].append({"qualname": cqual, "lineno": node.lineno})
@@ -219,6 +345,15 @@ def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: 
                         {"name": dec.id, "target": q, "lineno": node.lineno, "target_kind": "function"}
                     )
             if has_route:
+                rd = return_dto_for_route(node)
+                if rd:
+                    semantic["returns_bindings"].append(
+                        {"handler": q, "dto": rd, "lineno": node.lineno}
+                    )
+                if _python_raises_http_exception(source, node):
+                    semantic["function_enforces"].append(
+                        {"function": q, "kind": "HTTPException", "arg": "", "lineno": node.lineno}
+                    )
                 for arg in node.args.args:
                     if arg.annotation is None:
                         continue
@@ -233,6 +368,7 @@ def _extract_python_semantic(path: str, source: str, tree: ast.Module, symbols: 
                             {"handler": q, "dto": dto_name, "lineno": node.lineno}
                         )
 
+    semantic["trace_refs"] = _python_trace_refs(tree, source)
     semantic["io_edges"] = _semantic_io_edges_from_lines(path, source, symbols, "python")
     return semantic
 

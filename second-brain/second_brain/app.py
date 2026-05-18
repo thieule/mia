@@ -46,6 +46,7 @@ from second_brain.ingest_github import (
     apply_github_push,
     verify_github_signature,
 )
+from second_brain.ingest_local import apply_local_code_scan
 from second_brain import es_store
 from second_brain.lesson_extract import propose_lesson_json
 from second_brain.neo4j_store import close_driver, ensure_constraints, neo4j_driver, node_ref, run_read, run_write
@@ -76,6 +77,9 @@ ALLOWED_REL_TYPES = frozenset(
         "HAS_STORY",
         "HAS_DOCUMENT",
         "HAS_COMMIT",
+        "HAS_REPOSITORY",
+        "HAS_CODE_FILE",
+        "IN_REPOSITORY",
         "IMPLEMENTS",
         "DECIDED_IN",
         "SUPERSEDES",
@@ -95,10 +99,11 @@ mcp = FastMCP(
     host=_MCP_HOST.strip() or "127.0.0.1",
     port=_MCP_PORT,
     instructions="Second Brain: Neo4j knowledge graph + Elasticsearch (vector / hybrid). "
-    "HTTP: /ingest/agile-event, /ingest/github-webhook (push), /ingest/github-compare (diff two refs). "
+    "HTTP: /ingest/agile-event, /ingest/github-webhook (push), /ingest/github-compare (diff two refs), "
+    "/ingest/local-code-scan (filesystem under SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS). "
     "Tools: brain_query_graph, brain_get_neighborhood, brain_upsert_relation, brain_search_knowledge "
     "(mode vector|hybrid), brain_github_compare (GitHub API compare, read-only), "
-    "brain_refresh_github_code (sync repo/branch/commit into graph+ES), "
+    "brain_refresh_github_code (sync repo/branch/commit into graph+ES), brain_scan_local_code, "
     "brain_remember_decision, brain_remember_lesson, brain_extract_lesson_from_text, "
     "brain_extract_adr_from_text, brain_feedback_create, brain_supersede_decision. "
     "Set NEO4J_*, ELASTICSEARCH_URL, GEMINI_API_KEY. Optional SECOND_BRAIN_MCP_SECRET (Bearer / X-Second-Brain-MCP-Secret).",
@@ -268,6 +273,72 @@ def brain_refresh_github_code(
         path_prefix=prefix_arg,
     )
     return json.dumps(out, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def brain_scan_local_code(
+    root: str,
+    project_id: int = 0,
+    paths_json: str = "[]",
+    path_prefix: str = "",
+) -> str:
+    """Quét code trên disk (cùng process Second Brain) vào Neo4j + ES.
+
+    Bắt buộc cấu hình SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS (comma-separated): chỉ index khi `root`
+    nằm trong một trong các gốc đó (an toàn). `project_id` > 0 hoặc dùng SECOND_BRAIN_GITHUB_DEFAULT_PROJECT_ID.
+    paths_json: JSON array đường dẫn tương đối trong root; [] = walk (đuôi giống ingest GitHub, giới hạn SECOND_BRAIN_GITHUB_MAX_FILES).
+    path_prefix: khi walk, chỉ file có path bắt đầu bằng prefix này (vd second_brain/).
+    """
+    try:
+        raw_paths = json.loads(paths_json or "[]")
+        if not isinstance(raw_paths, list):
+            raise ValueError("paths_json phải là JSON array")
+        paths_list = [str(x).strip() for x in raw_paths if str(x).strip()]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"paths_json không hợp lệ: {e}") from e
+
+    paths_arg: list[str] | None = paths_list if paths_list else None
+    prefix_arg = (path_prefix or "").strip() or None
+
+    out = apply_local_code_scan(
+        (root or "").strip(),
+        project_id=int(project_id),
+        paths=paths_arg,
+        path_prefix=prefix_arg,
+    )
+    return json.dumps(out, ensure_ascii=False, default=str)
+
+
+@mcp.custom_route("/ingest/local-code-scan", methods=["POST"])
+async def _ingest_local_code_scan(request: Request) -> JSONResponse:
+    """JSON { \"root\", \"project_id\"?, \"paths\"?, \"path_prefix\"? } + X-Second-Brain-Secret."""
+    if not _ingest_secret_ok(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "expected_object"}, status_code=400)
+    root = str(body.get("root") or "").strip()
+    if not root:
+        return JSONResponse({"ok": False, "error": "root_required"}, status_code=400)
+    try:
+        pid = int(body.get("project_id") or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "bad_project_id"}, status_code=400)
+    paths_raw = body.get("paths")
+    paths_list: list[str] | None = None
+    if isinstance(paths_raw, list) and paths_raw:
+        paths_list = [str(x).strip() for x in paths_raw if str(x).strip()]
+    prefix = str(body.get("path_prefix") or "").strip() or None
+    try:
+        out = apply_local_code_scan(root, project_id=pid, paths=paths_list, path_prefix=prefix)
+        code = 200 if out.get("ok") else 400
+        return JSONResponse(out, status_code=code)
+    except Exception as e:
+        _log.exception("local code scan failed")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @mcp.tool()

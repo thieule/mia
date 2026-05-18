@@ -19,11 +19,29 @@ from urllib.parse import urlparse
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR_DEFAULT = ROOT / "data"
 SESSION_PREFIX = "acs_"
+
+# Vite dev server defaults; override with API_CENTER_CORS_ORIGINS (comma-separated, or *)
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+)
+
+
+def _api_center_cors_origins() -> list[str]:
+    raw = (os.environ.get("API_CENTER_CORS_ORIGINS") or "").strip()
+    if raw == "*":
+        return ["*"]
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return list(_DEFAULT_CORS_ORIGINS)
 
 
 def _chat_debug_enabled() -> bool:
@@ -309,6 +327,14 @@ def _ensure_core_import_path() -> None:
         sys.path.insert(0, str(core_dir))
 
 
+def _wq_dedup_window_s() -> int:
+    raw = (os.environ.get("API_CENTER_WQ_DEDUP_WINDOW_S") or "300").strip()
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        return 300
+
+
 async def _enqueue_agent_queue_item_direct(
     *,
     agent: dict[str, Any],
@@ -323,9 +349,15 @@ async def _enqueue_agent_queue_item_direct(
     _ensure_core_import_path()
     try:
         from mia.working_queue import submit_task
+        from mia.working_queue.policy import (
+            agile_notification_should_enqueue,
+            build_dedupe_key,
+            priority_for_item,
+        )
         from mia.working_queue.store import WorkingQueueStore
     except Exception as e:
         return False, f"direct_import_error:{type(e).__name__}", None
+    agent_id = str(agent.get("id") or "").strip()
     agent_ws = _agent_workspace_path(agent)
     if agent_ws is None or not agent_ws.is_dir():
         _chat_dbg("enqueue_skip", "direct_workspace_not_found", f"agent_workspace={agent.get('workspace')!r}")
@@ -336,17 +368,71 @@ async def _enqueue_agent_queue_item_direct(
     ik = (item_kind or "task").strip().lower()
     if ik not in {"task", "notification"}:
         ik = "task"
+    ctx = dict(context) if isinstance(context, dict) else {}
+    wp = ctx.get("webhook_payload") if isinstance(ctx.get("webhook_payload"), dict) else None
+    if ik == "notification" and wp and str(enqueued_by or "").startswith("api-center:webhooks"):
+        allow, skip_reason = agile_notification_should_enqueue(wp, agent_id)
+        if not allow:
+            _chat_dbg("enqueue_skip", skip_reason, f"agent_id={agent_id}", f"event={wp.get('event_type')!r}")
+            return True, f"skipped:{skip_reason}", None
+
+    dedupe_key: str | None = None
+    if wp:
+        data = wp.get("data") if isinstance(wp.get("data"), dict) else {}
+        dedupe_key = build_dedupe_key(
+            project_id=project_id,
+            event_type=str(wp.get("event_type") or wp.get("eventType") or ""),
+            agent_id=agent_id,
+            data=data,
+        )
+        if dedupe_key:
+            ctx["_dedupe_key"] = dedupe_key
+
     try:
-        store = WorkingQueueStore(queue_dir)
+        store = WorkingQueueStore(
+            queue_dir,
+            agent_id=agent_id,
+            db_mirror=(os.environ.get("API_CENTER_WQ_DB_MIRROR", "1").strip().lower() not in ("0", "false", "no")),
+            pending_max=int(os.environ.get("API_CENTER_WQ_PENDING_MAX", "500")),
+            pending_ttl_s=float(os.environ.get("API_CENTER_WQ_PENDING_TTL_HOURS", "72")) * 3600,
+            done_retention_s=float(os.environ.get("API_CENTER_WQ_DONE_RETENTION_DAYS", "14")) * 86400,
+        )
+        if dedupe_key:
+            existing = store.find_active_by_dedupe(dedupe_key)
+            if existing is None and store._mirror.enabled:
+                existing_id = store._mirror.find_active_by_dedupe(dedupe_key)
+                if existing_id:
+                    for p in store.list_active_paths():
+                        try:
+                            t = store.load(p)
+                            if t.id == existing_id:
+                                existing = (p, t)
+                                break
+                        except Exception:
+                            continue
+            if existing:
+                path, task = existing
+                if path.parent.name == "pending":
+                    age = time.time() - path.stat().st_mtime
+                    if age <= _wq_dedup_window_s():
+                        store.coalesce_pending(path, task, append_message=message)
+                        _chat_dbg("enqueue_coalesce", task.id, dedupe_key)
+                        return True, "coalesced", task.id
+                _chat_dbg("enqueue_deduped", task.id, dedupe_key)
+                return True, "deduped_active", task.id
+
+        pri = priority_for_item(item_kind=ik, source_role=source_role, enqueued_by=enqueued_by)
         task_id = submit_task(
             store,
             project_id=project_id,
             message=message,
             source_role=source_role,
             service=service,
-            context=context,
+            context=ctx,
             enqueued_by=enqueued_by,
             item_kind=ik,
+            priority=pri,
+            dedupe_key=dedupe_key,
         )
         _chat_dbg(
             "enqueue_ok",
@@ -1516,6 +1602,14 @@ def create_app(
     catalog_path: Path,
 ) -> FastAPI:
     app = FastAPI(title="API Center", version="1")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_api_center_cors_origins(),
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
 
     def _base_urls(request: Request) -> tuple[str, str]:
         http_base = _normalize_public_http_base(os.environ.get("API_CENTER_PUBLIC_BASE_URL"), request)
@@ -2025,6 +2119,28 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(e)) from e
         return {"agent_id": aid, "prompts": rows}
 
+    @app.get("/v1/admin/agents/{agent_id}/prompts/item")
+    async def admin_get_prompt_item(
+        agent_id: str,
+        kind: str,
+        label: str,
+        _: None = Depends(_require_admin_secret),
+    ) -> dict[str, Any]:
+        aid = agent_id.strip().lower()
+        k = kind.strip()
+        lb = label.strip()
+        if not k or not lb:
+            raise HTTPException(status_code=400, detail="kind and label query params are required")
+        try:
+            row = _am.db_get_prompt(aid, k, lb)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Database error: {e}") from e
+        if not row:
+            raise HTTPException(status_code=404, detail="Prompt not found")
+        return {"agent_id": aid, "prompt": row}
+
     @app.post("/v1/admin/agents/{agent_id}/prompts", status_code=201)
     async def admin_upsert_prompt(
         agent_id: str,
@@ -2073,6 +2189,12 @@ def create_app(
 def main() -> int:
     args = _parse_args()
     _load_dotenv((args.env or ROOT / ".env").resolve())
+    try:
+        from agent_db import ensure_agent_db_env_defaults
+
+        ensure_agent_db_env_defaults()
+    except ImportError:
+        pass
     try:
         _ = _connect_secret()
     except ValueError as e:

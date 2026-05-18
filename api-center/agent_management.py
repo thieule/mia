@@ -32,50 +32,12 @@ def repo_root_from_api_center(api_center_dir: Path) -> Path:
     return api_center_dir.resolve().parent
 
 
-def parse_mysql_url(url: str) -> dict[str, Any]:
-    u = (url or "").strip()
-    if not u:
-        raise ValueError("empty database url")
-    if "://" in u:
-        _, rest = u.split("://", 1)
-    else:
-        rest = u
-    auth_host, _, db = rest.rpartition("/")
-    db = db.split("?")[0]
-    if "@" in auth_host:
-        auth, hostport = auth_host.rsplit("@", 1)
-    else:
-        auth, hostport = "", auth_host
-    if ":" in auth:
-        user, password = auth.split(":", 1)
-    else:
-        user, password = auth, ""
-    host = hostport
-    port = 3306
-    if hostport.startswith("["):
-        m = re.match(r"^\[([^\]]+)\](?::(\d+))?$", hostport)
-        if m:
-            host = m.group(1)
-            if m.group(2):
-                port = int(m.group(2))
-    elif ":" in hostport:
-        hp, p = hostport.rsplit(":", 1)
-        if p.isdigit():
-            host, port = hp, int(p)
-        else:
-            host = hostport
-    return {"host": host, "port": port, "user": user, "password": password, "database": db}
-
-
-def db_connect_kwargs() -> dict[str, Any]:
-    raw = (
-        os.environ.get("API_CENTER_AGENT_DB_URL", "").strip()
-        or os.environ.get("AGILE_DATABASE_URL", "").strip()
-        or os.environ.get("MIA_AGENT_SYNC_DATABASE_URL", "").strip()
-    )
-    if not raw:
-        raise RuntimeError("Set API_CENTER_AGENT_DB_URL or AGILE_DATABASE_URL for agent DB management.")
-    return parse_mysql_url(raw)
+from agent_db import (  # noqa: E402 — shared Mia agent DB URL (database `agent`)
+    db_connect_kwargs,
+    ensure_agent_db_env_defaults,
+    parse_mysql_url,
+    resolve_agent_database_url,
+)
 
 
 def _sha256(text: str) -> str:
@@ -205,6 +167,37 @@ def db_delete_prompt(agent_id: str, kind: str, label: str) -> int:
                 (agent_id, kind, label),
             )
             return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def db_get_prompt(agent_id: str, kind: str, label: str) -> dict[str, Any] | None:
+    import pymysql
+
+    kw = db_connect_kwargs()
+    conn = pymysql.connect(charset="utf8mb4", autocommit=True, **kw)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, kind, label, content_sha256, content, updated_at
+                FROM mia_agent_prompts
+                WHERE agent_id=%s AND kind=%s AND label=%s
+                LIMIT 1
+                """,
+                (agent_id, kind, label),
+            )
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "kind": r[1],
+            "label": r[2],
+            "content_sha256": r[3],
+            "content": r[4] if r[4] is not None else "",
+            "updated_at": str(r[5]) if r[5] is not None else None,
+        }
     finally:
         conn.close()
 

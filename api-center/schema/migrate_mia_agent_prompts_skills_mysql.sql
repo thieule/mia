@@ -1,8 +1,8 @@
 -- Mia agent state — **toàn bộ schema trên MySQL** (một file duy nhất).
 -- Prompt + skill (nội dung đầy đủ), working queue, state KV.
--- Chạy trên DB hiện có (vd. agile_studio), bảng tiền tố `mia_` để tránh trùng bảng Agile.
+-- Chạy trên database ``agent`` (tách khỏi agile_studio):
 --
---   mysql -h127.0.0.1 -P3307 -uroot -p agile_studio < api-center/schema/migrate_mia_agent_prompts_skills_mysql.sql
+--   mysql -h127.0.0.1 -P3307 -uapp -p agent < api-center/schema/migrate_mia_agent_prompts_skills_mysql.sql
 --
 -- Đồng bộ .md → DB:  python api-center/scripts/sync_agent_prompts_skills_from_workspace.py
 

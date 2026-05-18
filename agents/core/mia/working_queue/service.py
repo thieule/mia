@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 from mia.utils.evaluator import evaluate_response
 from mia.working_queue.models import WorkingQueueTaskPayload
+from mia.working_queue.policy import should_fast_skip_notification
 from mia.working_queue.prompt import build_process_prompt, session_key_for_project
 from mia.working_queue.store import WorkingQueueStore
 
@@ -41,6 +42,7 @@ class WorkingQueueService:
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         pick_bus_target: Callable[[], tuple[str, str]] | None = None,
         notify_on_complete_kinds: list[str] | None = None,
+        noop_notification_skip: bool = True,
     ) -> None:
         self.workspace = workspace
         self.store = store
@@ -57,6 +59,7 @@ class WorkingQueueService:
         self._notify_kinds: set[str] = set(
             notify_on_complete_kinds if notify_on_complete_kinds is not None else ["task"]
         )
+        self.noop_notification_skip = noop_notification_skip
         self._running = False
         self._task: asyncio.Task | None = None
         self._run_lock = asyncio.Lock()
@@ -69,6 +72,13 @@ class WorkingQueueService:
             return
         if self._running:
             return
+        self.store.maintain_queue()
+        reclaimed = self.store.reclaim_processing_on_restart()
+        if reclaimed:
+            logger.info(
+                "Working queue poller: will retry {} reclaimed task(s) after start",
+                len(reclaimed),
+            )
         self._job_sem = asyncio.Semaphore(self.max_tasks_per_tick)
         self._running = True
         self._task = asyncio.create_task(self._loop())
@@ -139,6 +149,18 @@ class WorkingQueueService:
         if not isinstance(wtask, WorkingQueueTaskPayload):
             logger.error("Working queue: unexpected payload type for {}", processing_path.name)
             return
+        if self.noop_notification_skip and should_fast_skip_notification(wtask):
+            logger.info(
+                "Working queue: fast-skip notification {} (policy/no-op)",
+                wtask.id,
+            )
+            self.store.mark_done(
+                processing_path,
+                wtask,
+                result_excerpt="[skipped] Notification did not require agent action (queue policy).",
+            )
+            return
+
         key = session_key_for_project(wtask.project_id)
         user_text = build_process_prompt(wtask, workspace=self.workspace)
         kind = wtask.item_kind

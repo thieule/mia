@@ -42,6 +42,12 @@ class WorkingQueueTaskPayload(BaseModel):
         default="task",
         description="task = do the work. notification = internal/event ping — acknowledge briefly, do not treat as a full execution mandate unless the text explicitly requires action.",
     )
+    priority: int = Field(
+        default=0,
+        ge=0,
+        le=9,
+        description="0 = high (chat / task). Higher = lower precedence when claiming pending items.",
+    )
     # Filled when finished
     completed_at: str | None = None
     error: str | None = None

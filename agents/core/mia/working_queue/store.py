@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from loguru import logger
 
 from mia.utils.helpers import ensure_dir, safe_filename
 
+from mia.working_queue.db_mirror import WorkingQueueDbMirror
 from mia.working_queue.models import (
     QueueItemKind,
     WorkingQueueTaskPayload,
@@ -19,6 +22,7 @@ from mia.working_queue.models import (
     task_to_json,
     utcnow_iso,
 )
+from mia.working_queue.policy import priority_for_item
 
 
 def _write_json_atomic(path: Path, data: Any) -> None:
@@ -48,16 +52,33 @@ class WorkingQueueStore:
             ledger.jsonl   — append-only JSON lines (submitted → processing → done/failed)
     """
 
-    def __init__(self, base: Path) -> None:
+    def __init__(
+        self,
+        base: Path,
+        *,
+        agent_id: str | None = None,
+        db_mirror: bool = True,
+        pending_max: int = 500,
+        pending_ttl_s: float = 72 * 3600,
+        done_retention_s: float = 14 * 86400,
+        priority_enabled: bool = True,
+    ) -> None:
         self.base = base
         self.pending = ensure_dir(base / "pending")
         self.processing = ensure_dir(base / "processing")
         self.done = ensure_dir(base / "done")
         self.failed = ensure_dir(base / "failed")
+        self.archive = ensure_dir(base / "archive")
         self.projects = ensure_dir(base / "projects")
         self.state = ensure_dir(base / "state")
         self.state_items = ensure_dir(self.state / "items")
         self.ledger = self.state / "ledger.jsonl"
+        self.pending_max = max(1, int(pending_max))
+        self.pending_ttl_s = max(60.0, float(pending_ttl_s))
+        self.done_retention_s = max(3600.0, float(done_retention_s))
+        self.priority_enabled = priority_enabled
+        aid = (agent_id or os.environ.get("MIA_AGENT_ID") or "").strip()
+        self._mirror = WorkingQueueDbMirror(agent_id=aid, enabled=db_mirror)
 
     def project_dir(self, project_id: str) -> Path:
         return ensure_dir(self.projects / safe_filename(project_id))
@@ -151,10 +172,211 @@ class WorkingQueueStore:
     def new_id() -> str:
         return uuid.uuid4().hex
 
+    def _pending_sort_key(self, path: Path) -> tuple[int | float, ...]:
+        if not self.priority_enabled:
+            return (path.stat().st_mtime,)
+        try:
+            task = self.load(path)
+            return (int(getattr(task, "priority", 0)), path.stat().st_mtime)
+        except Exception:
+            return (1, path.stat().st_mtime)
+
     def list_pending_paths(self) -> list[Path]:
         files = [p for p in self.pending.iterdir() if p.is_file() and p.suffix.lower() == ".json"]
+        files.sort(key=self._pending_sort_key)
+        return files
+
+    def list_active_paths(self) -> list[Path]:
+        return self.list_pending_paths() + self.list_processing_paths()
+
+    def find_active_by_dedupe(self, dedupe_key: str) -> tuple[Path, WorkingQueueTaskPayload] | None:
+        if not dedupe_key:
+            return None
+        for path in self.list_active_paths():
+            try:
+                task = self.load(path)
+                ctx = task.context if isinstance(task.context, dict) else {}
+                if str(ctx.get("_dedupe_key") or "") == dedupe_key:
+                    return path, task
+            except Exception:
+                continue
+        return None
+
+    def coalesce_pending(
+        self,
+        path: Path,
+        task: WorkingQueueTaskPayload,
+        *,
+        append_message: str,
+    ) -> None:
+        """Merge a duplicate notification into an existing pending/processing file."""
+        extra = (append_message or "").strip()
+        if extra:
+            task.message = f"{task.message.rstrip()}\n\n---\n{extra}"[:120_000]
+        path.write_text(task_to_json(task), encoding="utf-8")
+        loc = "processing" if path.parent.name == "processing" else "pending"
+        self.write_item_status(task, location=loc, file_path=path)
+        dk = (task.context or {}).get("_dedupe_key") if isinstance(task.context, dict) else None
+        self._mirror.record_event(
+            task,
+            location=loc,
+            file_rel=self._rel_to_base(path),
+            event="coalesced",
+            detail={"file": self._rel_to_base(path)},
+            priority=int(getattr(task, "priority", 0)),
+            dedupe_key=str(dk) if dk else None,
+        )
+
+    def maintain_queue(self) -> dict[str, int]:
+        """Expire stale pending, enforce cap, archive old done/failed. Call on poller start."""
+        stats = {
+            "expired_pending": self._expire_stale_pending(),
+            "capped_pending": self._enforce_pending_cap(),
+            "archived_done": self._archive_old_dir(self.done),
+            "archived_failed": self._archive_old_dir(self.failed),
+        }
+        if any(stats.values()):
+            logger.info("Working queue maintenance: {}", stats)
+        return stats
+
+    def _parse_created_ts(self, task: WorkingQueueTaskPayload) -> float | None:
+        raw = (task.created_at or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _expire_stale_pending(self) -> int:
+        now = time.time()
+        n = 0
+        for path in list(self.list_pending_paths()):
+            try:
+                task = self.load(path)
+                ts = self._parse_created_ts(task)
+                if ts is None or (now - ts) <= self.pending_ttl_s:
+                    continue
+                task.status = "failed"
+                task.completed_at = utcnow_iso()
+                task.error = "expired: pending TTL exceeded"
+                self.move_to(path, self.failed)
+                out = self.failed / path.name
+                out.write_text(task_to_json(task), encoding="utf-8")
+                self.write_item_status(task, location="failed", file_path=out)
+                self._append_ledger("expired", task, {"file": self._rel_to_base(out)})
+                self._mirror.upsert_task(
+                    task, location="failed", file_rel=self._rel_to_base(out), priority=int(task.priority)
+                )
+                n += 1
+            except Exception as e:
+                logger.warning("Working queue: expire pending failed for {}: {}", path, e)
+        return n
+
+    def _enforce_pending_cap(self) -> int:
+        paths = self.list_pending_paths()
+        overflow = len(paths) - self.pending_max
+        if overflow <= 0:
+            return 0
+        # Drop oldest among highest priority number (notifications) first
+        by_drop = sorted(paths, key=self._pending_sort_key, reverse=True)
+        n = 0
+        for path in by_drop:
+            if n >= overflow:
+                break
+            try:
+                task = self.load(path)
+                task.status = "failed"
+                task.completed_at = utcnow_iso()
+                task.error = "dropped: pending queue cap exceeded"
+                self.move_to(path, self.failed)
+                out = self.failed / path.name
+                out.write_text(task_to_json(task), encoding="utf-8")
+                self.write_item_status(task, location="failed", file_path=out)
+                self._append_ledger("dropped_cap", task, {"file": self._rel_to_base(out)})
+                self._mirror.upsert_task(
+                    task, location="failed", file_rel=self._rel_to_base(out), priority=int(task.priority)
+                )
+                n += 1
+            except Exception as e:
+                logger.warning("Working queue: cap drop failed for {}: {}", path, e)
+        return n
+
+    def _archive_old_dir(self, src_dir: Path) -> int:
+        now = time.time()
+        n = 0
+        dest_root = self.archive / src_dir.name
+        dest_root.mkdir(parents=True, exist_ok=True)
+        for path in list(src_dir.iterdir()):
+            if not path.is_file() or path.suffix.lower() != ".json":
+                continue
+            age = now - path.stat().st_mtime
+            if age < self.done_retention_s:
+                continue
+            try:
+                dest = dest_root / path.name
+                if dest.exists():
+                    dest.unlink()
+                path.replace(dest)
+                n += 1
+            except Exception as e:
+                logger.warning("Working queue: archive failed for {}: {}", path, e)
+        return n
+
+    def list_processing_paths(self) -> list[Path]:
+        files = [p for p in self.processing.iterdir() if p.is_file() and p.suffix.lower() == ".json"]
         files.sort(key=lambda p: p.stat().st_mtime)
         return files
+
+    def reclaim_processing_on_restart(self, *, reason: str = "restart") -> list[str]:
+        """
+        Move orphaned ``processing/*.json`` back to ``pending/`` after agent restart.
+
+        Tasks left in ``processing/`` when the process exits (crash, SIGTERM, deploy)
+        are never picked up by ``claim_oldest_pending``; reclaim makes them runnable again.
+        """
+        reclaimed: list[str] = []
+        for path in self.list_processing_paths():
+            try:
+                task = self.load(path)
+                pending_dest = self.pending / path.name
+                if pending_dest.exists():
+                    logger.warning(
+                        "Working queue: reclaim skip {} — pending file already exists",
+                        path.name,
+                    )
+                    continue
+                task.status = "pending"
+                task.completed_at = None
+                task.error = None
+                task.result_excerpt = None
+                self.move_to(path, self.pending)
+                pending_dest.write_text(task_to_json(task), encoding="utf-8")
+                self.write_item_status(task, location="pending", file_path=pending_dest)
+                self._append_ledger(
+                    "reclaimed",
+                    task,
+                    {"reason": reason, "file": self._rel_to_base(pending_dest)},
+                )
+                dk = (task.context or {}).get("_dedupe_key") if isinstance(task.context, dict) else None
+                self._mirror.record_event(
+                    task,
+                    location="pending",
+                    file_rel=self._rel_to_base(pending_dest),
+                    event="reclaimed",
+                    detail={"reason": reason, "file": self._rel_to_base(pending_dest)},
+                    priority=int(getattr(task, "priority", 0)),
+                    dedupe_key=str(dk) if dk else None,
+                )
+                reclaimed.append(task.id)
+            except (json.JSONDecodeError, OSError, ValueError) as e:
+                logger.exception("Working queue: reclaim failed for {}: {}", path, e)
+        if reclaimed:
+            logger.info(
+                "Working queue: reclaimed {} orphaned processing task(s) → pending",
+                len(reclaimed),
+            )
+        return reclaimed
 
     def write_pending_atomic(self, task: WorkingQueueTaskPayload) -> Path:
         dest = self.pending / f"{task.id}.json"
@@ -163,6 +385,16 @@ class WorkingQueueStore:
         tmp.replace(dest)
         self.write_item_status(task, location="pending", file_path=dest)
         self._append_ledger("submitted", task, {"file": self._rel_to_base(dest)})
+        dk = (task.context or {}).get("_dedupe_key") if isinstance(task.context, dict) else None
+        self._mirror.record_event(
+            task,
+            location="pending",
+            file_rel=self._rel_to_base(dest),
+            event="submitted",
+            detail={"file": self._rel_to_base(dest)},
+            priority=int(getattr(task, "priority", 0)),
+            dedupe_key=str(dk) if dk else None,
+        )
         return dest
 
     def load(self, path: Path) -> WorkingQueueTaskPayload:
@@ -193,6 +425,16 @@ class WorkingQueueStore:
                 proc.write_text(task_to_json(task), encoding="utf-8")
                 self.write_item_status(task, location="processing", file_path=proc)
                 self._append_ledger("processing", task, {"file": self._rel_to_base(proc)})
+                dk = (task.context or {}).get("_dedupe_key") if isinstance(task.context, dict) else None
+                self._mirror.record_event(
+                    task,
+                    location="processing",
+                    file_rel=self._rel_to_base(proc),
+                    event="processing",
+                    detail={"file": self._rel_to_base(proc)},
+                    priority=int(getattr(task, "priority", 0)),
+                    dedupe_key=str(dk) if dk else None,
+                )
                 return proc, task
             except FileNotFoundError:
                 continue
@@ -223,6 +465,16 @@ class WorkingQueueStore:
         (pdir / "last_done.json").write_text(task_to_json(task), encoding="utf-8")
         self.write_item_status(task, location="done", file_path=out)
         self._append_ledger("done", task, {"file": self._rel_to_base(out)})
+        dk = (task.context or {}).get("_dedupe_key") if isinstance(task.context, dict) else None
+        self._mirror.record_event(
+            task,
+            location="done",
+            file_rel=self._rel_to_base(out),
+            event="done",
+            detail={"file": self._rel_to_base(out)},
+            priority=int(getattr(task, "priority", 0)),
+            dedupe_key=str(dk) if dk else None,
+        )
 
     def mark_failed(
         self,
@@ -238,6 +490,16 @@ class WorkingQueueStore:
         processing_path.unlink(missing_ok=True)
         self.write_item_status(task, location="failed", file_path=out)
         self._append_ledger("failed", task, {"file": self._rel_to_base(out)})
+        dk = (task.context or {}).get("_dedupe_key") if isinstance(task.context, dict) else None
+        self._mirror.record_event(
+            task,
+            location="failed",
+            file_rel=self._rel_to_base(out),
+            event="failed",
+            detail={"file": self._rel_to_base(out), "error": task.error},
+            priority=int(getattr(task, "priority", 0)),
+            dedupe_key=str(dk) if dk else None,
+        )
 
 
 def submit_task(
@@ -250,12 +512,22 @@ def submit_task(
     context: dict[str, Any] | None = None,
     enqueued_by: str | None = None,
     item_kind: str | QueueItemKind = "task",
+    priority: int | None = None,
+    dedupe_key: str | None = None,
 ) -> str:
     """Create a new pending task; returns task id. ``item_kind`` is ``task`` or ``notification``."""
     k = (str(item_kind or "task")).strip()
     if k not in ("task", "notification"):
         k = "task"
     ik: QueueItemKind = k
+    ctx = dict(context or {})
+    if dedupe_key:
+        ctx["_dedupe_key"] = dedupe_key
+    pri = (
+        int(priority)
+        if priority is not None
+        else priority_for_item(item_kind=ik, source_role=source_role, enqueued_by=enqueued_by)
+    )
     task_id = WorkingQueueStore.new_id()
     task = WorkingQueueTaskPayload(
         id=task_id,
@@ -263,9 +535,10 @@ def submit_task(
         message=message,
         source_role=source_role,
         service=service,
-        context=context or {},
+        context=ctx,
         enqueued_by=enqueued_by,
         item_kind=ik,
+        priority=pri,
     )
     store.write_pending_atomic(task)
     return task_id

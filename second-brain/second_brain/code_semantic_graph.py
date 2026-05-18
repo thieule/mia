@@ -7,6 +7,7 @@ import re
 from typing import Any, Callable
 
 from second_brain.neo4j_store import node_ref_slug
+from second_brain.refs import node_ref
 
 
 def _slug(s: str, max_len: int = 96) -> str:
@@ -386,6 +387,116 @@ def merge_semantic_for_codefile(
                 MERGE (fn)-[:INVOKES_EXTERNAL]->(x)
                 """,
                 {"xref": xref, "fref": fref, "project_id": project_id, "tgt": tgt, "fnref": fnref, "ts": ts},
+            )
+
+    for rb in semantic.get("returns_bindings") or []:
+        handler = str(rb.get("handler") or "").strip()
+        dto_name = str(rb.get("dto") or "").strip()
+        if not handler or not dto_name:
+            continue
+        dref = dto_refs.get(dto_name)
+        if not dref:
+            dref = node_ref_slug(project_id, "codedto", f"{path}::{_slug(dto_name, 64)}")
+            dto_refs[dto_name] = dref
+            run_write_fn(
+                """
+                MATCH (f:CodeFile {ref: $fref})
+                MERGE (d:CodeDTO {ref: $dref})
+                SET d.project_id = $project_id, d.codefile_ref = $fref, d.path = $path,
+                    d.qualname = $qn, d.ingested_at = $ts
+                MERGE (f)-[:DECLARES_DTO]->(d)
+                """,
+                {
+                    "fref": fref,
+                    "dref": dref,
+                    "project_id": project_id,
+                    "path": path[:2048],
+                    "qn": dto_name[:512],
+                    "ts": ts,
+                },
+            )
+        eref = ep_ref_by_handler.get(handler)
+        if eref and dref:
+            run_write_fn(
+                """
+                MATCH (e:CodeEndpoint {ref: $eref}), (d:CodeDTO {ref: $dref})
+                WHERE e.project_id = $project_id AND d.project_id = $project_id
+                MERGE (e)-[:RETURNS]->(d)
+                """,
+                {"eref": eref, "dref": dref, "project_id": project_id},
+            )
+        fnref = func_refs.get(handler)
+        if fnref and dref:
+            run_write_fn(
+                """
+                MATCH (fn:CodeFunction {ref: $fnref}), (d:CodeDTO {ref: $dref})
+                WHERE fn.project_id = $project_id AND d.project_id = $project_id
+                MERGE (fn)-[:TRANSFORMS]->(d)
+                """,
+                {"fnref": fnref, "dref": dref, "project_id": project_id},
+            )
+
+    for fe in semantic.get("function_enforces") or []:
+        fn_q = str(fe.get("function") or "").strip()
+        kind = str(fe.get("kind") or "rule").strip()[:128]
+        arg = str(fe.get("arg") or "")[:400]
+        ln = int(fe.get("lineno") or 0)
+        fnref = func_refs.get(fn_q)
+        if not fnref or not kind:
+            continue
+        bref = node_ref_slug(project_id, "businessrule", f"{path}::enf::{_slug(fn_q, 48)}:{_slug(kind, 32)}:{ln}")
+        run_write_fn(
+            """
+            MERGE (br:BusinessRule {ref: $bref})
+            SET br.project_id = $project_id, br.codefile_ref = $fref, br.kind = $kind,
+                br.arg = $arg, br.scope = 'function', br.ingested_at = $ts
+            WITH br
+            MATCH (fn:CodeFunction {ref: $fnref}) WHERE fn.project_id = $project_id
+            MERGE (fn)-[:ENFORCES]->(br)
+            """,
+            {
+                "bref": bref,
+                "project_id": project_id,
+                "fref": fref,
+                "kind": kind,
+                "arg": arg,
+                "fnref": fnref,
+                "ts": ts,
+            },
+        )
+
+    for tr in semantic.get("trace_refs") or []:
+        fn_q = str(tr.get("function") or "").strip()
+        fnref = func_refs.get(fn_q)
+        if not fnref:
+            continue
+        for sid in tr.get("story_ids") or []:
+            try:
+                si = int(sid)
+            except (TypeError, ValueError):
+                continue
+            sref = node_ref(project_id, "story", si)
+            run_write_fn(
+                """
+                MATCH (fn:CodeFunction {ref: $fnref}) WHERE fn.project_id = $project_id
+                MATCH (s:Story {ref: $sref}) WHERE s.project_id = $project_id
+                MERGE (fn)-[:SATISFIES]->(s)
+                """,
+                {"fnref": fnref, "sref": sref, "project_id": project_id},
+            )
+        for tid in tr.get("task_ids") or []:
+            try:
+                ti = int(tid)
+            except (TypeError, ValueError):
+                continue
+            tref = node_ref(project_id, "task", ti)
+            run_write_fn(
+                """
+                MATCH (fn:CodeFunction {ref: $fnref}) WHERE fn.project_id = $project_id
+                MATCH (t:Task {ref: $tref}) WHERE t.project_id = $project_id
+                MERGE (fn)-[:SATISFIES]->(t)
+                """,
+                {"fnref": fnref, "tref": tref, "project_id": project_id},
             )
 
     return maps_ok

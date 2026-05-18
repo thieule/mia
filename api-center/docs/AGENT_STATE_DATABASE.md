@@ -1,77 +1,74 @@
 # Cơ sở dữ liệu quản lý agent, prompt, skill, state và working queue (MySQL)
 
-Toàn bộ DDL nằm trong **một file** chạy trên **MySQL** (cùng kiểu stack với Agile Studio trong repo: `mysql+pymysql://…/agile_studio`).
+Bảng `mia_*` nằm trong database **`agent`** (tách khỏi **`agile_studio`** — Hub/MCP Agile chỉ dùng `AGILE_DATABASE_URL`).
 
-**File DDL duy nhất:** [`../schema/migrate_mia_agent_prompts_skills_mysql.sql`](../schema/migrate_mia_agent_prompts_skills_mysql.sql)
+**DDL:** [`../schema/migrate_mia_agent_prompts_skills_mysql.sql`](../schema/migrate_mia_agent_prompts_skills_mysql.sql)  
+**Working queue v2** (`priority`, `dedupe_key`): [`../schema/migrate_mia_working_queue_v2.sql`](../schema/migrate_mia_working_queue_v2.sql)
 
-## Bối cảnh hiện tại (file-based trong `mia` core)
+Docker: `docker/mysql-init/02-agent.sql` tạo database `agent` khi volume MySQL mới.
+
+## Biến môi trường (URL database `agent`)
+
+| Biến | Vai trò |
+|------|---------|
+| `MIA_AGENT_DATABASE_URL` | **Chuẩn** — vd. `mysql+pymysql://app:app@127.0.0.1:3307/agent` |
+| `API_CENTER_AGENT_DB_URL` | Alias (API Center) |
+| `MIA_AGENT_SYNC_DATABASE_URL` | Alias (script sync prompt/skill) |
+| `MIA_WORKING_QUEUE_DB_URL` | Override chỉ cho WQ mirror (hiếm) |
+
+**Không** dùng `AGILE_DATABASE_URL` cho bảng `mia_*`. Code từ chối nếu URL trỏ nhầm `agile_studio`.
+
+Resolver: [`../agent_db.py`](../agent_db.py) (API Center), `mia.agent_db_url` (gateway).
+
+## Bối cảnh file-based (runtime)
 
 | Thành phần | Vị trí điển hình |
 |------------|------------------|
-| Danh sách agent runtime | `api-center/agents.json` (mỗi `workspace` dạng `agents/ai-*/workspace`) |
+| Danh sách agent runtime | `api-center/agents.json` |
 | Prompt bootstrap | `<workspace>/{AGENTS,SOUL,USER,TOOLS}.md` |
 | Skill | `<workspace>/skills/<name>/SKILL.md` |
-| Session | `<workspace>/sessions/*.json` (chưa đưa vào DDL; payload lớn) |
-| Working queue | `<workspace>/working_queue/**/*.json` |
+| Session | `<workspace>/sessions/*.json` (chưa trong DDL) |
+| Working queue (chạy thật) | `<workspace>/working_queue/**/*.json` |
 
-## Bảng MySQL (tiền tố `mia_`)
+## Bảng MySQL
 
 | Bảng | Mục đích |
 |------|----------|
-| `mia_agents` | Registry agent (`mia-ba`, …), workspace root, config, metadata |
-| `mia_agent_prompts` | Nội dung đầy đủ prompt bootstrap (`kind`, `label`, `content`, hash) |
-| `mia_workspace_skills` | Nội dung đầy đủ `SKILL.md` (`body`, hash), `source` workspace/builtin |
-| `mia_working_queue_tasks` | Task queue (tương lai / mirror `WorkingQueueTaskPayload` + `location`) |
-| `mia_working_queue_events` | Ledger sự kiện (thay `ledger.jsonl`) |
-| `mia_agent_state_kv` | State key-value (`namespace`, `entry_key`, `value` JSON) |
+| `mia_agents` | Registry (`mia-ba`, …), workspace, gateway |
+| `mia_agent_prompts` | Prompt bootstrap đầy đủ |
+| `mia_workspace_skills` | `SKILL.md` workspace + builtin |
+| `mia_working_queue_tasks` | Mirror queue + dedupe |
+| `mia_working_queue_events` | Ledger sự kiện |
+| `mia_agent_state_kv` | State KV theo agent |
 
-## Chạy migration
+## Chạy migration (database `agent`)
 
 ```bash
-mysql -h127.0.0.1 -P3307 -uroot -p agile_studio < api-center/schema/migrate_mia_agent_prompts_skills_mysql.sql
+mysql -h127.0.0.1 -P3307 -uapp -p agent < api-center/schema/migrate_mia_agent_prompts_skills_mysql.sql
+mysql -h127.0.0.1 -P3307 -uapp -p agent < api-center/schema/migrate_mia_working_queue_v2.sql
 ```
 
-## Đồng bộ file `.md` → DB (prompt + skill)
+Nếu DB `agent` đã có schema thủ công (như production hiện tại), chỉ cần bước v2 khi thiếu cột `priority` / `dedupe_key`.
+
+## Đồng bộ file `.md` → DB
+
+Script quét **mọi** `*.md` trong `workspace/` (trừ `skills/`, `working_queue/`, `sessions/`): bootstrap gốc, `policy/`, `project/`, `projects/`, `docs/`, `memory/MEMORY.md`, `HEARTBEAT.md`, v.v. Skills vẫn vào `mia_workspace_skills`.
 
 ```bash
-export AGILE_DATABASE_URL='mysql+pymysql://app:app@127.0.0.1:3307/agile_studio'
-pip install pymysql   # hoặc dùng venv api-center đã có requirements.txt
+export MIA_AGENT_DATABASE_URL='mysql+pymysql://app:app@127.0.0.1:3307/agent'
+pip install pymysql
 python api-center/scripts/sync_agent_prompts_skills_from_workspace.py
-```
-
-Tuỳ chọn: `--dry-run`, `--builtin-skills`.
-
-## Sơ đồ quan hệ
-
-```mermaid
-erDiagram
-  mia_agents ||--o{ mia_agent_prompts : has
-  mia_agents ||--o{ mia_workspace_skills : has
-  mia_agents ||--o{ mia_working_queue_tasks : owns
-  mia_agents ||--o{ mia_agent_state_kv : has
-  mia_working_queue_tasks ||--o{ mia_working_queue_events : logs
+# Tuỳ chọn: xóa prompt DB không còn file trong workspace
+python api-center/scripts/sync_agent_prompts_skills_from_workspace.py --prune-prompts
 ```
 
 ## Working queue trong code
 
-- **Hiện tại** vẫn dùng file JSON (`WorkingQueueStore`).
-- **Bước sau**: dual-write hoặc store SQL — bảng `mia_working_queue_*` đã sẵn trong migration.
+- Poller đọc/ghi **file JSON** trong workspace.
+- **Dual-write** `mia_working_queue_*` khi `MIA_AGENT_DATABASE_URL` + `agentId` / `MIA_AGENT_ID`.
+- API Center: allowlist webhook, dedup (`API_CENTER_WQ_DEDUP_WINDOW_S`).
 
 ## Liên quan Agile Studio
 
-Các bảng `mia_*` đặt trong cùng database `agile_studio` (hoặc DB riêng nếu bạn tách) để dễ vận hành; không đổi schema bảng Agile có sẵn.
-
-## Đổi layout repo (`ai-*` → `agents/ai-*`)
-
-Nếu bạn đã có dòng trong `mia_agents` / prompt với `workspace_root` kiểu `ai-ba/workspace`, cập nhật thủ công (ví dụ):
-
-```sql
-UPDATE mia_agents SET workspace_root = CONCAT('agents/', workspace_root) WHERE workspace_root NOT LIKE 'agents/%';
-UPDATE mia_agents SET config_path = CONCAT('agents/', config_path) WHERE config_path IS NOT NULL AND config_path NOT LIKE 'agents/%';
-```
-
-Điều chỉnh điều kiện `WHERE` cho khớp dữ liệu thực tế trước khi chạy trên production.
-
-## Gói `core` và `ai-tools` trong `agents/`
-
-Mã nguồn mia (`agents/core/`) và MCP cục bộ (`agents/ai-tools/`) nằm cùng cấp với các deploy `agents/ai-*`. Script đồng bộ builtin skill đọc từ `agents/core/mia/skills`.
+- **Agile Studio / MCP:** `AGILE_DATABASE_URL` → database `agile_studio` only.
+- **Mia agents / API Center admin / WQ mirror:** `MIA_AGENT_DATABASE_URL` → database `agent`.

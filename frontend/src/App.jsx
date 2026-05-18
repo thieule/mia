@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { agentChatStream, api } from "./api";
 import MarkdownPromptEditor from "./components/MarkdownPromptEditor";
+import MiaWorkspacePanel from "./components/MiaWorkspacePanel";
 import WorkflowPage from "./components/WorkflowPage";
 
 /** Single allowed model until multi-provider UI returns. */
@@ -90,6 +91,8 @@ export default function App() {
   const [testRuns, setTestRuns] = useState([]);
   const [newAgent, setNewAgent] = useState({ name: "", description: "" });
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
+  /** "lab" = prompt versions (port 8000); "mia" = workspace prompts via API Center */
+  const [agentsViewTab, setAgentsViewTab] = useState("lab");
   const [editAgentModal, setEditAgentModal] = useState(null);
   const [isNewVersionOpen, setIsNewVersionOpen] = useState(false);
   const [expandedVersionId, setExpandedVersionId] = useState(null);
@@ -950,7 +953,32 @@ export default function App() {
       </header>
 
       <div className="container-fluid py-4 px-3 px-md-4 app-page-main">
-        {activeMenu === "agents" && <div className="row g-4">
+        {activeMenu === "agents" && (
+          <>
+            <ul className="nav nav-pills gap-2 mb-3 agents-view-tabs">
+              <li className="nav-item">
+                <button
+                  type="button"
+                  className={`nav-link ${agentsViewTab === "lab" ? "active" : ""}`}
+                  onClick={() => setAgentsViewTab("lab")}
+                >
+                  Prompt Lab
+                </button>
+              </li>
+              <li className="nav-item">
+                <button
+                  type="button"
+                  className={`nav-link ${agentsViewTab === "mia" ? "active" : ""}`}
+                  onClick={() => setAgentsViewTab("mia")}
+                >
+                  Mia workspace
+                </button>
+              </li>
+            </ul>
+            {agentsViewTab === "mia" ? (
+              <MiaWorkspacePanel />
+            ) : (
+        <div className="row g-4">
           <div className="col-12 col-lg-3">
             <div className="card shadow-sm border-0">
               <div className="card-body">
@@ -1471,7 +1499,10 @@ export default function App() {
             </div>
 
           </div>
-        </div>}
+        </div>
+            )}
+          </>
+        )}
 
         {activeMenu === "data" && (
           <div className="row g-4">

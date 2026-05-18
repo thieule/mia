@@ -16,7 +16,7 @@ Khả năng lập chỉ mục và truy vấn tri thức từ **codebase**, **tà
 
 | Thành phần | Mục tiêu thiết kế | Ghi chú triển khai hiện tại (xem mục 7) |
 |------------|-------------------|----------------------------------------|
-| **Git Integration** | Webhook GitHub → đồng bộ mã, diff, commit | **Một phần:** `POST /ingest/github-webhook` (push), `POST /ingest/github-compare`, MCP `brain_github_compare` / `brain_refresh_github_code`; PAT; graph code + ES `code`/`code_diff`; parse commit → task + story (`IMPLEMENTS`). Không clone repo local. |
+| **Git Integration** | Webhook GitHub → đồng bộ mã, diff, commit | **Một phần:** `POST /ingest/github-webhook` (push), `POST /ingest/github-compare`, MCP `brain_github_compare` / `brain_refresh_github_code`; PAT; graph code + ES `code`/`code_diff`; parse commit → task + story (`IMPLEMENTS`). **Bổ sung:** quét filesystem (`brain_scan_local_code`, `POST /ingest/local-code-scan`) khi cấu hình `SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS`. |
 | **Agile Studio Sync** | Story, Task, Comment, Wiki real-time | **Một phần:** Hub → `POST /ingest/agile-event` gồm project create/update, member add/remove, release CRUD, story, comments, task comments, wiki; event khác → skipped + log. |
 | **Processing Layer** | Chunking function/class/đoạn; embedding | **Một phần:** Agile/Wiki theo sự kiện; code GitHub theo **file** + symbol đa ngôn ngữ (Python AST + Tree-sitter); embedding **Gemini** (mục 10). |
 
@@ -55,6 +55,7 @@ Chi tiết vận hành: mục **10**.
 **B. Codebase tĩnh (static analysis)**
 
 - **Đã có:** nhãn `CodeFile`, `CodeFunction`; quan hệ `DEFINES`, `CALLS` (heuristic trong file / Tree-sitter), `MODIFIES` từ commit GitHub; Python (`ast`) + các đuôi phổ biến (React/Angular stack: `.ts`/`.tsx`/`.jsx`, v.v.) qua Tree-sitter khi cài package.
+- **Đã có (multi-repo):** `:GitRepository`, `(Project)-[:HAS_REPOSITORY]->(GitRepository)`, `(Commit)-[:IN_REPOSITORY]->(GitRepository)`, `(GitRepository)-[:HAS_CODE_FILE]->(CodeFile)`; `ref` CodeFile = `repo_key::path` (`repo_graph.py`).
 - **Chưa có:** `Module`/`Service` tự động, `IMPORTS` đồ thị, call-graph đầy đủ liên file.
 
 #### Relational Database (MySQL)
@@ -150,7 +151,8 @@ Ngoài các mục đã nêu, các hạng mục sau **chưa có** trong hoặc ng
 | **Embedding** | **`embeddings.py`** | **Gemini Embedding API** (mặc định); fallback deterministic chỉ khi `SECOND_BRAIN_EMBEDDING_FALLBACK=1` |
 | Lesson / ADR extract (LLM tuỳ chọn) | `lesson_extract.py`, `adr_extract.py` | Hoạt động |
 | GitHub webhook ingest | `ingest_github.py`, `/ingest/github-webhook` | Push + PAT + map repo→project |
-| Static đa ngôn ngữ | `code_static_multilang.py` → `code_static_python.py` (.py) | Trong ingest GitHub |
+| Quét code local | `ingest_local.py`, MCP `brain_scan_local_code`, `POST /ingest/local-code-scan` | Allowlist `SECOND_BRAIN_LOCAL_CODE_SCAN_ROOTS`; cùng pipeline `CodeFile` / ES |
+| Static đa ngôn ngữ | `code_static_multilang.py` → `code_static_python.py` (.py) | Trong ingest GitHub + local |
 | Hybrid ES search | `es_store.search_hybrid` | MCP `search_mode=hybrid` |
 | IMPORT graph liên file | — | **Chưa** |
 | MySQL trong SB | — | **Không có** |

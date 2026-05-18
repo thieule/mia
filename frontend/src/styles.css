@@ -788,3 +788,63 @@ body {
   color: #64748b;
   font-weight: 600;
 }
+
+.agents-view-tabs .nav-link {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #475569;
+}
+
+.agents-view-tabs .nav-link.active {
+  background: #1d4ed8;
+}
+
+.modal-dialog-custom--wide {
+  max-width: 720px;
+}
+
+.prompt-tree-scroll {
+  max-height: min(70vh, 520px);
+}
+
+.prompt-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  color: #0f172a;
+}
+
+.prompt-tree-row:hover {
+  background: #f1f5f9;
+}
+
+.prompt-tree-file-btn.active {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.prompt-tree-chevron {
+  width: 12px;
+  font-size: 0.7rem;
+  color: #94a3b8;
+}
+
+.prompt-tree-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-tree-meta {
+  font-size: 0.68rem;
+  flex-shrink: 0;
+}

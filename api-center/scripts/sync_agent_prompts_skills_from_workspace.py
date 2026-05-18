@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Đồng bộ toàn bộ nội dung prompt bootstrap (AGENTS, SOUL, USER, TOOLS) và skill (SKILL.md)
-từ thư mục workspace vào MySQL (bảng mia_agents, mia_agent_prompts, mia_workspace_skills).
+Đồng bộ toàn bộ file ``*.md`` trong workspace mỗi agent (prompt) và ``skills/*/SKILL.md``
+vào MySQL (``mia_agents``, ``mia_agent_prompts``, ``mia_workspace_skills``).
+
+Prompt: mọi ``.md`` dưới workspace trừ ``skills/``, ``working_queue/``, ``sessions/``.
+``kind`` + ``label`` (đường dẫn tương đối, vd. ``policy/PRE_IMPLEMENTATION_APPROVAL.md``).
+File gốc AGENTS/SOUL/USER/TOOLS vẫn dùng kind ``bootstrap_*`` như trước.
 
 Yêu cầu:
   - Đã chạy migration MySQL (DDL đầy đủ agent + prompt + skill + working queue + state KV):
@@ -9,8 +13,9 @@ Yêu cầu:
   - Cài: pip install pymysql (hoặc dùng venv api-center đã có pymysql)
 
 Biến môi trường (một trong các cách):
-  MIA_AGENT_SYNC_DATABASE_URL   ưu tiên (vd. mysql+pymysql://app:app@127.0.0.1:3307/agile_studio)
-  AGILE_DATABASE_URL            fallback (cùng URL Agile Studio hub)
+  MIA_AGENT_DATABASE_URL        ưu tiên — database ``agent`` (không dùng agile_studio)
+  API_CENTER_AGENT_DB_URL       alias
+  MIA_AGENT_SYNC_DATABASE_URL   alias (sync script)
 
 Chạy từ gốc repo mia:
   python api-center/scripts/sync_agent_prompts_skills_from_workspace.py
@@ -19,6 +24,7 @@ Tuỳ chọn:
   --repo-root PATH       mặc định: cha của thư mục chứa script (…/mia)
   --agents-json PATH     mặc định: <repo-root>/api-center/agents.json
   --builtin-skills       đồng bộ thêm skill built-in từ agents/core/mia/skills (mặc định: chỉ workspace/skills)
+  --prune-prompts        xóa bản ghi mia_agent_prompts không còn file tương ứng trong workspace
   --dry-run              chỉ in thống kê, không ghi DB
 """
 
@@ -33,14 +39,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
-BOOTSTRAP_FILES = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md")
-
 KIND_BY_FILE = {
     "AGENTS.md": "bootstrap_agents",
     "SOUL.md": "bootstrap_soul",
     "USER.md": "bootstrap_user",
     "TOOLS.md": "bootstrap_tools",
 }
+
+# Thư mục không quét prompt (skills → bảng riêng; runtime → không phải prompt tĩnh).
+_PROMPT_SKIP_DIR_NAMES = frozenset({"skills", "working_queue", "sessions", ".git", "__pycache__"})
+
+_MAX_LABEL_LEN = 255
 
 
 def _sha256(text: str) -> str:
@@ -56,7 +65,7 @@ def _parse_database_url(url: str) -> dict[str, Any]:
     """mysql+pymysql://user:pass@host:3306/dbname → connect kwargs for pymysql."""
     u = url.strip()
     if not u:
-        raise SystemExit("Missing database URL (MIA_AGENT_SYNC_DATABASE_URL or AGILE_DATABASE_URL).")
+        raise SystemExit("Missing database URL (set MIA_AGENT_DATABASE_URL to mysql+pymysql://…/agent).")
     # strip sqlalchemy driver
     if "://" in u:
         _, rest = u.split("://", 1)
@@ -90,6 +99,55 @@ def _parse_database_url(url: str) -> dict[str, Any]:
     return {"host": host, "port": port, "user": user, "password": password, "database": db}
 
 
+def _prompt_kind_and_label(workspace: Path, file_path: Path) -> tuple[str, str]:
+    """Map workspace-relative path → (kind, label) for ``mia_agent_prompts``."""
+    rel = file_path.relative_to(workspace).as_posix()
+    name = file_path.name
+    if name in KIND_BY_FILE:
+        return KIND_BY_FILE[name], name
+    if rel.startswith("memory/"):
+        return "memory", rel
+    if rel.startswith("policy/"):
+        return "policy", rel
+    if rel.startswith("project/"):
+        return "project", rel
+    if rel.startswith("projects/"):
+        return "projects", rel
+    if rel.startswith("docs/"):
+        return "docs", rel
+    if rel.startswith("agent/"):
+        return "agent", rel
+    if name == "HEARTBEAT.md":
+        return "heartbeat", rel
+    if rel == "README.md":
+        return "workspace", rel
+    return "other", rel
+
+
+def _label_for_db(label: str) -> str:
+    if len(label) <= _MAX_LABEL_LEN:
+        return label
+    return label[-_MAX_LABEL_LEN:]
+
+
+def _iter_workspace_prompt_files(workspace: Path) -> list[Path]:
+    """All prompt ``*.md`` under workspace except skipped runtime dirs."""
+    if not workspace.is_dir():
+        return []
+    files: list[Path] = []
+    for fp in workspace.rglob("*.md"):
+        if not fp.is_file():
+            continue
+        try:
+            rel = fp.relative_to(workspace)
+        except ValueError:
+            continue
+        if any(part in _PROMPT_SKIP_DIR_NAMES for part in rel.parts):
+            continue
+        files.append(fp)
+    return sorted(files, key=lambda p: p.relative_to(workspace).as_posix())
+
+
 def _iter_workspace_skills(skills_dir: Path) -> list[tuple[str, Path]]:
     out: list[tuple[str, Path]] = []
     if not skills_dir.is_dir():
@@ -117,6 +175,7 @@ def sync(
     connect: dict[str, Any],
     dry_run: bool,
     builtin_skills: bool,
+    prune_prompts: bool,
 ) -> None:
     agents_map = _load_agents(agents_path)
     rows_agents: list[tuple[Any, ...]] = []
@@ -139,16 +198,16 @@ def sync(
             (agent_id, _display_name(agent_id), ws_rel, cfg_path, port_i, meta_json),
         )
 
-        for fname in BOOTSTRAP_FILES:
-            fp = workspace / fname
-            if not fp.is_file():
+        seen_prompt_keys: set[tuple[str, str]] = set()
+        for fp in _iter_workspace_prompt_files(workspace):
+            kind, label = _prompt_kind_and_label(workspace, fp)
+            label = _label_for_db(label)
+            key = (kind, label)
+            if key in seen_prompt_keys:
                 continue
+            seen_prompt_keys.add(key)
             text = fp.read_text(encoding="utf-8")
-            kind = KIND_BY_FILE.get(fname, "other")
-            label = fname
-            rows_prompts.append(
-                (agent_id, kind, label, _sha256(text), text),
-            )
+            rows_prompts.append((agent_id, kind, label, _sha256(text), text))
 
         for name, fp in _iter_workspace_skills(workspace / "skills"):
             text = fp.read_text(encoding="utf-8")
@@ -214,6 +273,22 @@ def sync(
             for row in rows_skills:
                 cur.execute(sql_skill, row)
 
+            if prune_prompts:
+                scanned_by_agent: dict[str, set[tuple[str, str]]] = {}
+                for aid, kind, label, _, _ in rows_prompts:
+                    scanned_by_agent.setdefault(aid, set()).add((kind, label))
+                for aid, scanned in scanned_by_agent.items():
+                    cur.execute(
+                        "SELECT kind, label FROM mia_agent_prompts WHERE agent_id = %s",
+                        (aid,),
+                    )
+                    for kind, label in cur.fetchall():
+                        if (kind, label) not in scanned:
+                            cur.execute(
+                                "DELETE FROM mia_agent_prompts WHERE agent_id=%s AND kind=%s AND label=%s",
+                                (aid, kind, label),
+                            )
+
         conn.commit()
     except Exception:
         conn.rollback()
@@ -235,6 +310,11 @@ def main() -> None:
         action="store_true",
         help="Also load agents/core/mia/skills into mia_workspace_skills per agent (large duplicate).",
     )
+    ap.add_argument(
+        "--prune-prompts",
+        action="store_true",
+        help="Remove mia_agent_prompts rows with no matching workspace file after sync.",
+    )
     args = ap.parse_args()
     repo_root = args.repo_root.resolve()
     agents_path = args.agents_json or (repo_root / "api-center" / "agents.json")
@@ -244,11 +324,12 @@ def main() -> None:
     connect: dict[str, Any] = {}
     if not args.dry_run:
         url = (
-            os.environ.get("MIA_AGENT_SYNC_DATABASE_URL", "").strip()
-            or os.environ.get("AGILE_DATABASE_URL", "").strip()
+            os.environ.get("MIA_AGENT_DATABASE_URL", "").strip()
+            or os.environ.get("MIA_AGENT_SYNC_DATABASE_URL", "").strip()
+            or os.environ.get("API_CENTER_AGENT_DB_URL", "").strip()
         )
         if not url:
-            raise SystemExit("Set MIA_AGENT_SYNC_DATABASE_URL or AGILE_DATABASE_URL (not required with --dry-run).")
+            raise SystemExit("Set MIA_AGENT_DATABASE_URL (database agent; not required with --dry-run).")
         kw = _parse_database_url(url)
         connect = {
             "host": kw["host"],
@@ -264,6 +345,7 @@ def main() -> None:
         connect=connect,
         dry_run=args.dry_run,
         builtin_skills=args.builtin_skills,
+        prune_prompts=args.prune_prompts,
     )
 
 
